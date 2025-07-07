@@ -9166,3 +9166,5254 @@ private:
 This comprehensive compression framework enables DuckDB to achieve exceptional storage efficiency while maintaining fast decompression speeds essential for analytical query performance. The adaptive selection of compression algorithms ensures optimal results across diverse data patterns and workload characteristics.
 
 ---
+
+# 4.3 Buffer Management
+
+## 4.3.1 Intelligent Buffer Pool Architecture
+
+### Adaptive Buffer Management
+
+**Smart Memory Management Framework**
+DuckDB implements a sophisticated buffer management system that automatically adapts to workload characteristics and available system resources. Unlike traditional fixed-size buffer pools, DuckDB's buffer manager dynamically adjusts its behavior based on memory pressure, access patterns, and query characteristics:
+
+```cpp
+class BufferManager {
+public:
+    struct BufferConfiguration {
+        idx_t maximum_memory;
+        idx_t block_size;
+        double eviction_threshold;
+        bool enable_memory_mapping;
+        bool enable_compression;
+        idx_t temporary_directory_size_limit;
+    };
+
+private:
+    // Core buffer pool components
+    unique_ptr<BlockManager> block_manager;
+    unique_ptr<TemporaryDirectoryManager> temp_manager;
+    unordered_map<block_id_t, unique_ptr<BufferHandle>> buffer_pool;
+    
+    // Memory management
+    atomic<idx_t> current_memory_usage;
+    atomic<idx_t> maximum_memory_limit;
+    atomic<idx_t> peak_memory_usage;
+    
+    // Replacement policy
+    unique_ptr<ReplacementPolicy> replacement_policy;
+    shared_mutex buffer_lock;
+    
+    // Statistics and monitoring
+    BufferManagerStatistics statistics;
+    unique_ptr<MemoryTracker> memory_tracker;
+
+public:
+    BufferManager(BufferConfiguration config) 
+        : maximum_memory_limit(config.maximum_memory) {
+        
+        // Initialize block manager
+        block_manager = make_unique<BlockManager>(config.block_size);
+        
+        // Initialize temporary directory manager
+        temp_manager = make_unique<TemporaryDirectoryManager>(
+            config.temporary_directory_size_limit);
+        
+        // Select optimal replacement policy
+        replacement_policy = CreateReplacementPolicy(config);
+        
+        // Initialize memory tracking
+        memory_tracker = make_unique<MemoryTracker>();
+        
+        current_memory_usage = 0;
+        peak_memory_usage = 0;
+    }
+    
+    unique_ptr<BufferHandle> Pin(block_id_t block_id, bool can_destroy = true) {
+        shared_lock<shared_mutex> lock(buffer_lock);
+        
+        // Check if block is already in buffer pool
+        auto it = buffer_pool.find(block_id);
+        if (it != buffer_pool.end()) {
+            // Block found - increment reference count and return
+            return it->second->Pin();
+        }
+        
+        lock.unlock();
+        
+        // Block not in memory - need to load
+        return LoadBlock(block_id, can_destroy);
+    }
+    
+    void Unpin(block_id_t block_id) {
+        shared_lock<shared_mutex> lock(buffer_lock);
+        
+        auto it = buffer_pool.find(block_id);
+        if (it != buffer_pool.end()) {
+            it->second->Unpin();
+            
+            // Check if block can be evicted
+            if (it->second->CanEvict() && ShouldEvict()) {
+                ScheduleEviction(block_id);
+            }
+        }
+    }
+    
+    unique_ptr<BufferHandle> Allocate(idx_t size, bool can_destroy = true,
+                                     unique_ptr<FileBuffer> *buffer = nullptr) {
+        // Check memory pressure
+        if (current_memory_usage + size > maximum_memory_limit) {
+            if (!FreeMemory(size)) {
+                // Cannot free enough memory - spill to disk
+                return AllocateSpilledBuffer(size, can_destroy);
+            }
+        }
+        
+        // Allocate in-memory buffer
+        auto handle = make_unique<BufferHandle>(size);
+        current_memory_usage += size;
+        peak_memory_usage = std::max(peak_memory_usage.load(), current_memory_usage.load());
+        
+        // Track allocation
+        memory_tracker->RegisterAllocation(size);
+        
+        return handle;
+    }
+
+private:
+    unique_ptr<BufferHandle> LoadBlock(block_id_t block_id, bool can_destroy) {
+        unique_lock<shared_mutex> lock(buffer_lock);
+        
+        // Double-check after acquiring exclusive lock
+        auto it = buffer_pool.find(block_id);
+        if (it != buffer_pool.end()) {
+            return it->second->Pin();
+        }
+        
+        // Calculate required memory
+        auto block_size = block_manager->GetBlockSize(block_id);
+        
+        // Ensure sufficient memory is available
+        if (current_memory_usage + block_size > maximum_memory_limit) {
+            if (!FreeMemoryInternal(block_size)) {
+                // Cannot free memory - use memory mapping or temporary files
+                return LoadBlockFromDisk(block_id, can_destroy);
+            }
+        }
+        
+        // Load block into memory
+        auto buffer = block_manager->ReadBlock(block_id);
+        auto handle = make_unique<BufferHandle>(move(buffer), block_id);
+        
+        // Add to buffer pool
+        buffer_pool[block_id] = handle.get();
+        current_memory_usage += block_size;
+        
+        // Update replacement policy
+        replacement_policy->Access(block_id);
+        
+        return handle->Pin();
+    }
+    
+    bool FreeMemory(idx_t required_memory) {
+        // Get eviction candidates from replacement policy
+        auto candidates = replacement_policy->GetEvictionCandidates(required_memory);
+        
+        idx_t freed_memory = 0;
+        for (auto block_id : candidates) {
+            auto it = buffer_pool.find(block_id);
+            if (it != buffer_pool.end() && it->second->CanEvict()) {
+                freed_memory += EvictBlock(block_id);
+                
+                if (freed_memory >= required_memory) {
+                    return true;
+                }
+            }
+        }
+        
+        return freed_memory >= required_memory;
+    }
+    
+    idx_t EvictBlock(block_id_t block_id) {
+        auto it = buffer_pool.find(block_id);
+        if (it == buffer_pool.end()) {
+            return 0;
+        }
+        
+        auto block_size = it->second->GetSize();
+        
+        // Write block to disk if dirty
+        if (it->second->IsDirty()) {
+            block_manager->WriteBlock(block_id, it->second->GetBuffer());
+        }
+        
+        // Remove from buffer pool
+        buffer_pool.erase(it);
+        current_memory_usage -= block_size;
+        
+        // Update statistics
+        statistics.evictions++;
+        statistics.evicted_bytes += block_size;
+        
+        return block_size;
+    }
+};
+```
+
+### Advanced Replacement Policies
+
+**Adaptive LRU with Workload Awareness**
+DuckDB implements sophisticated replacement policies that adapt to different workload patterns:
+
+```cpp
+class AdaptiveLRUReplacementPolicy : public ReplacementPolicy {
+private:
+    // Multi-level LRU structure
+    struct LRULevel {
+        list<block_id_t> access_list;
+        unordered_map<block_id_t, list<block_id_t>::iterator> block_positions;
+        idx_t max_size;
+        idx_t current_size;
+    };
+    
+    vector<LRULevel> lru_levels;
+    unordered_map<block_id_t, uint8_t> block_levels;
+    
+    // Workload pattern detection
+    WorkloadAnalyzer workload_analyzer;
+    ReplacementStrategy current_strategy;
+    
+    // Statistics for adaptation
+    atomic<idx_t> sequential_accesses;
+    atomic<idx_t> random_accesses;
+    atomic<idx_t> total_accesses;
+
+public:
+    AdaptiveLRUReplacementPolicy(idx_t num_levels = 3) {
+        lru_levels.resize(num_levels);
+        
+        // Configure level sizes (exponentially decreasing)
+        idx_t base_size = 1000;
+        for (idx_t i = 0; i < num_levels; i++) {
+            lru_levels[i].max_size = base_size >> i;
+            lru_levels[i].current_size = 0;
+        }
+        
+        current_strategy = ReplacementStrategy::ADAPTIVE_LRU;
+    }
+    
+    void Access(block_id_t block_id) override {
+        total_accesses++;
+        
+        // Analyze access pattern
+        auto pattern = workload_analyzer.AnalyzeAccess(block_id);
+        UpdateAccessStatistics(pattern);
+        
+        // Determine target level based on access frequency
+        auto target_level = DetermineTargetLevel(block_id, pattern);
+        
+        // Move block to appropriate level
+        MoveToLevel(block_id, target_level);
+        
+        // Adapt strategy if needed
+        if (total_accesses % ADAPTATION_INTERVAL == 0) {
+            AdaptStrategy();
+        }
+    }
+    
+    vector<block_id_t> GetEvictionCandidates(idx_t required_memory) override {
+        vector<block_id_t> candidates;
+        idx_t estimated_freed = 0;
+        
+        // Start eviction from lowest level (least recently used)
+        for (int level = lru_levels.size() - 1; level >= 0; level--) {
+            auto& lru_level = lru_levels[level];
+            
+            while (!lru_level.access_list.empty() && 
+                   estimated_freed < required_memory) {
+                
+                auto block_id = lru_level.access_list.back();
+                candidates.push_back(block_id);
+                
+                // Estimate freed memory
+                estimated_freed += EstimateBlockSize(block_id);
+                
+                // Remove from this level
+                RemoveFromLevel(block_id, level);
+            }
+            
+            if (estimated_freed >= required_memory) {
+                break;
+            }
+        }
+        
+        return candidates;
+    }
+
+private:
+    uint8_t DetermineTargetLevel(block_id_t block_id, AccessPattern pattern) {
+        // Determine appropriate level based on access pattern and frequency
+        auto access_frequency = workload_analyzer.GetAccessFrequency(block_id);
+        
+        if (pattern == AccessPattern::SEQUENTIAL && 
+            current_strategy == ReplacementStrategy::SEQUENTIAL_OPTIMIZED) {
+            // For sequential scans, keep in lower levels to avoid cache pollution
+            return std::min(static_cast<uint8_t>(2), 
+                           static_cast<uint8_t>(lru_levels.size() - 1));
+        }
+        
+        // Hot data goes to higher levels
+        if (access_frequency > HOT_THRESHOLD) {
+            return 0; // Top level
+        } else if (access_frequency > WARM_THRESHOLD) {
+            return 1; // Middle level
+        } else {
+            return lru_levels.size() - 1; // Bottom level
+        }
+    }
+    
+    void AdaptStrategy() {
+        double sequential_ratio = static_cast<double>(sequential_accesses) / total_accesses;
+        
+        if (sequential_ratio > 0.8) {
+            // Primarily sequential access - optimize for scans
+            current_strategy = ReplacementStrategy::SEQUENTIAL_OPTIMIZED;
+        } else if (sequential_ratio < 0.2) {
+            // Primarily random access - optimize for hot data
+            current_strategy = ReplacementStrategy::HOT_DATA_OPTIMIZED;
+        } else {
+            // Mixed workload - use adaptive strategy
+            current_strategy = ReplacementStrategy::ADAPTIVE_LRU;
+        }
+    }
+    
+    void MoveToLevel(block_id_t block_id, uint8_t target_level) {
+        // Remove from current level if present
+        auto current_level_it = block_levels.find(block_id);
+        if (current_level_it != block_levels.end()) {
+            RemoveFromLevel(block_id, current_level_it->second);
+        }
+        
+        // Add to target level
+        auto& target_lru = lru_levels[target_level];
+        
+        // Check if level is full
+        if (target_lru.current_size >= target_lru.max_size) {
+            // Evict LRU block from this level to lower level
+            if (target_level + 1 < lru_levels.size()) {
+                auto lru_block = target_lru.access_list.back();
+                RemoveFromLevel(lru_block, target_level);
+                MoveToLevel(lru_block, target_level + 1);
+            }
+        }
+        
+        // Add to front of target level
+        target_lru.access_list.push_front(block_id);
+        target_lru.block_positions[block_id] = target_lru.access_list.begin();
+        target_lru.current_size++;
+        block_levels[block_id] = target_level;
+    }
+    
+    static const idx_t ADAPTATION_INTERVAL = 10000;
+    static const double HOT_THRESHOLD = 0.1;
+    static const double WARM_THRESHOLD = 0.05;
+};
+```
+
+## 4.3.2 Memory-Mapped File Management
+
+### Intelligent Memory Mapping
+
+**Adaptive Memory Mapping Strategy**
+DuckDB employs intelligent memory mapping that adapts to file sizes, access patterns, and system memory availability:
+
+```cpp
+class MemoryMappedFileManager {
+public:
+    struct MappingPolicy {
+        idx_t min_file_size_for_mapping;
+        idx_t max_mapped_memory;
+        bool enable_read_ahead;
+        bool enable_write_behind;
+        MappingStrategy strategy;
+    };
+
+private:
+    // Memory mapping state
+    unordered_map<string, unique_ptr<MemoryMappedFile>> mapped_files;
+    shared_mutex mapping_lock;
+    
+    // Memory usage tracking
+    atomic<idx_t> total_mapped_memory;
+    atomic<idx_t> max_mapped_memory;
+    
+    // Access pattern analysis
+    unique_ptr<AccessPatternAnalyzer> pattern_analyzer;
+    MappingPolicy current_policy;
+
+public:
+    MemoryMappedFileManager(MappingPolicy policy) : current_policy(policy) {
+        total_mapped_memory = 0;
+        max_mapped_memory = policy.max_mapped_memory;
+        pattern_analyzer = make_unique<AccessPatternAnalyzer>();
+    }
+    
+    unique_ptr<FileHandle> OpenFile(const string &file_path, FileFlags flags) {
+        auto file_size = FileSystem::GetFileSize(file_path);
+        
+        // Determine if file should be memory mapped
+        if (ShouldMemoryMap(file_path, file_size, flags)) {
+            return CreateMemoryMappedHandle(file_path, flags);
+        } else {
+            return CreateStandardFileHandle(file_path, flags);
+        }
+    }
+    
+    void OptimizeMapping(const string &file_path, AccessPattern pattern) {
+        shared_lock<shared_mutex> lock(mapping_lock);
+        
+        auto it = mapped_files.find(file_path);
+        if (it == mapped_files.end()) {
+            return;
+        }
+        
+        auto &mapped_file = *it->second;
+        
+        switch (pattern) {
+            case AccessPattern::SEQUENTIAL:
+                mapped_file.EnableSequentialOptimizations();
+                break;
+            case AccessPattern::RANDOM:
+                mapped_file.EnableRandomAccessOptimizations();
+                break;
+            case AccessPattern::WRITE_HEAVY:
+                mapped_file.EnableWriteOptimizations();
+                break;
+        }
+    }
+
+private:
+    bool ShouldMemoryMap(const string &file_path, idx_t file_size, FileFlags flags) {
+        // Don't map very small files
+        if (file_size < current_policy.min_file_size_for_mapping) {
+            return false;
+        }
+        
+        // Check memory availability
+        if (total_mapped_memory + file_size > max_mapped_memory) {
+            return false;
+        }
+        
+        // Analyze access pattern
+        auto expected_pattern = pattern_analyzer->PredictAccessPattern(file_path);
+        
+        // Memory mapping benefits sequential reads and random access
+        return expected_pattern == AccessPattern::SEQUENTIAL ||
+               expected_pattern == AccessPattern::RANDOM;
+    }
+    
+    unique_ptr<FileHandle> CreateMemoryMappedHandle(const string &file_path, FileFlags flags) {
+        unique_lock<shared_mutex> lock(mapping_lock);
+        
+        // Check if already mapped
+        auto it = mapped_files.find(file_path);
+        if (it != mapped_files.end()) {
+            return it->second->CreateHandle();
+        }
+        
+        // Create new memory mapping
+        auto mapped_file = make_unique<MemoryMappedFile>(file_path, flags);
+        auto file_size = mapped_file->GetSize();
+        
+        // Update memory usage tracking
+        total_mapped_memory += file_size;
+        
+        // Store mapping
+        auto handle = mapped_file->CreateHandle();
+        mapped_files[file_path] = move(mapped_file);
+        
+        return handle;
+    }
+};
+
+class MemoryMappedFile {
+private:
+    string file_path;
+    void* mapped_memory;
+    idx_t file_size;
+    int file_descriptor;
+    
+    // Access optimizations
+    bool sequential_access_hint;
+    bool random_access_hint;
+    bool write_optimizations_enabled;
+
+public:
+    MemoryMappedFile(const string &path, FileFlags flags) : file_path(path) {
+        // Open file
+        file_descriptor = open(path.c_str(), TranslateFlags(flags));
+        if (file_descriptor == -1) {
+            throw IOException("Cannot open file: " + path);
+        }
+        
+        // Get file size
+        struct stat file_stat;
+        if (fstat(file_descriptor, &file_stat) == -1) {
+            close(file_descriptor);
+            throw IOException("Cannot stat file: " + path);
+        }
+        file_size = file_stat.st_size;
+        
+        // Create memory mapping
+        int mmap_flags = PROT_READ;
+        if (flags & FileFlags::FILE_FLAGS_WRITE) {
+            mmap_flags |= PROT_WRITE;
+        }
+        
+        mapped_memory = mmap(nullptr, file_size, mmap_flags, MAP_SHARED, file_descriptor, 0);
+        if (mapped_memory == MAP_FAILED) {
+            close(file_descriptor);
+            throw IOException("Cannot memory map file: " + path);
+        }
+        
+        // Initialize optimization state
+        sequential_access_hint = false;
+        random_access_hint = false;
+        write_optimizations_enabled = false;
+    }
+    
+    ~MemoryMappedFile() {
+        if (mapped_memory != MAP_FAILED) {
+            munmap(mapped_memory, file_size);
+        }
+        if (file_descriptor != -1) {
+            close(file_descriptor);
+        }
+    }
+    
+    void EnableSequentialOptimizations() {
+        if (!sequential_access_hint) {
+            madvise(mapped_memory, file_size, MADV_SEQUENTIAL);
+            sequential_access_hint = true;
+            random_access_hint = false;
+        }
+    }
+    
+    void EnableRandomAccessOptimizations() {
+        if (!random_access_hint) {
+            madvise(mapped_memory, file_size, MADV_RANDOM);
+            random_access_hint = true;
+            sequential_access_hint = false;
+        }
+    }
+    
+    void EnableWriteOptimizations() {
+        if (!write_optimizations_enabled) {
+            // Enable asynchronous write-behind
+            madvise(mapped_memory, file_size, MADV_DONTNEED);
+            write_optimizations_enabled = true;
+        }
+    }
+    
+    void PrefetchRange(idx_t offset, idx_t length) {
+        if (offset + length <= file_size) {
+            char* start_addr = static_cast<char*>(mapped_memory) + offset;
+            madvise(start_addr, length, MADV_WILLNEED);
+        }
+    }
+    
+    unique_ptr<FileHandle> CreateHandle() {
+        return make_unique<MemoryMappedFileHandle>(mapped_memory, file_size, file_path);
+    }
+};
+```
+
+## 4.3.3 Temporary File Management
+
+### Intelligent Spilling Strategy
+
+**Adaptive Temporary Storage**
+DuckDB implements sophisticated temporary file management that minimizes disk I/O while handling datasets larger than memory:
+
+```cpp
+class TemporaryFileManager {
+public:
+    struct SpillingPolicy {
+        idx_t memory_threshold_percentage;
+        idx_t min_spill_size;
+        idx_t max_spill_files;
+        bool enable_compression;
+        bool enable_async_writes;
+        TemporaryStorageType preferred_storage;
+    };
+
+private:
+    // Temporary file management
+    vector<unique_ptr<TemporaryFile>> temp_files;
+    unordered_map<string, idx_t> file_index_map;
+    shared_mutex temp_files_lock;
+    
+    // Spilling coordination
+    unique_ptr<SpillCoordinator> spill_coordinator;
+    SpillingPolicy current_policy;
+    
+    // Storage optimization
+    unique_ptr<CompressionManager> compression_manager;
+    unique_ptr<AsyncIOManager> async_io_manager;
+
+public:
+    TemporaryFileManager(SpillingPolicy policy) : current_policy(policy) {
+        spill_coordinator = make_unique<SpillCoordinator>(policy);
+        
+        if (policy.enable_compression) {
+            compression_manager = make_unique<CompressionManager>();
+        }
+        
+        if (policy.enable_async_writes) {
+            async_io_manager = make_unique<AsyncIOManager>();
+        }
+    }
+    
+    unique_ptr<TemporaryFile> CreateTemporaryFile(const string &prefix) {
+        unique_lock<shared_mutex> lock(temp_files_lock);
+        
+        // Generate unique filename
+        auto file_path = GenerateTemporaryFileName(prefix);
+        
+        // Create temporary file
+        auto temp_file = make_unique<TemporaryFile>(file_path, current_policy);
+        
+        // Register file
+        auto file_index = temp_files.size();
+        file_index_map[file_path] = file_index;
+        temp_files.push_back(move(temp_file));
+        
+        return make_unique<TemporaryFile>(file_path, current_policy);
+    }
+    
+    void SpillToDisk(const DataChunk &chunk, const string &spill_identifier) {
+        // Determine optimal spilling strategy
+        auto strategy = spill_coordinator->DetermineSpillStrategy(chunk);
+        
+        // Create or get existing spill file
+        auto spill_file = GetOrCreateSpillFile(spill_identifier);
+        
+        // Apply compression if enabled
+        if (current_policy.enable_compression) {
+            auto compressed_chunk = compression_manager->CompressChunk(chunk);
+            WriteChunkToFile(*spill_file, compressed_chunk, strategy);
+        } else {
+            WriteChunkToFile(*spill_file, chunk, strategy);
+        }
+    }
+    
+    unique_ptr<DataChunk> ReadFromDisk(const string &spill_identifier, idx_t chunk_index) {
+        shared_lock<shared_mutex> lock(temp_files_lock);
+        
+        auto it = file_index_map.find(spill_identifier);
+        if (it == file_index_map.end()) {
+            return nullptr;
+        }
+        
+        auto &spill_file = *temp_files[it->second];
+        auto chunk = ReadChunkFromFile(spill_file, chunk_index);
+        
+        // Decompress if necessary
+        if (current_policy.enable_compression && chunk) {
+            return compression_manager->DecompressChunk(*chunk);
+        }
+        
+        return chunk;
+    }
+
+private:
+    class SpillCoordinator {
+        SpillingPolicy policy;
+        atomic<idx_t> total_spilled_bytes;
+        atomic<idx_t> active_spill_operations;
+        
+    public:
+        SpillCoordinator(SpillingPolicy p) : policy(p), total_spilled_bytes(0), active_spill_operations(0) {}
+        
+        SpillStrategy DetermineSpillStrategy(const DataChunk &chunk) {
+            // Analyze chunk characteristics
+            auto chunk_size = EstimateChunkSize(chunk);
+            auto compression_benefit = EstimateCompressionBenefit(chunk);
+            
+            SpillStrategy strategy;
+            strategy.use_compression = compression_benefit > 0.2; // 20% size reduction
+            strategy.write_priority = CalculateWritePriority(chunk_size);
+            strategy.enable_async = policy.enable_async_writes && 
+                                  active_spill_operations < MAX_CONCURRENT_SPILLS;
+            
+            return strategy;
+        }
+        
+    private:
+        static const idx_t MAX_CONCURRENT_SPILLS = 4;
+    };
+    
+    void WriteChunkToFile(TemporaryFile &file, const DataChunk &chunk, SpillStrategy strategy) {
+        if (strategy.enable_async && async_io_manager) {
+            // Asynchronous write
+            auto write_task = make_unique<AsyncWriteTask>(file, chunk, strategy);
+            async_io_manager->SubmitTask(move(write_task));
+        } else {
+            // Synchronous write
+            file.WriteChunk(chunk);
+        }
+    }
+    
+    string GenerateTemporaryFileName(const string &prefix) {
+        static atomic<idx_t> temp_file_counter{0};
+        
+        auto temp_dir = GetTemporaryDirectory();
+        auto counter = temp_file_counter.fetch_add(1);
+        auto pid = getpid();
+        auto timestamp = chrono::steady_clock::now().time_since_epoch().count();
+        
+        stringstream filename;
+        filename << temp_dir << "/" << prefix << "_" << pid << "_" << timestamp << "_" << counter << ".tmp";
+        
+        return filename.str();
+    }
+};
+
+class TemporaryFile {
+private:
+    string file_path;
+    unique_ptr<FileHandle> file_handle;
+    vector<ChunkMetadata> chunk_metadata;
+    
+    // Performance optimization
+    bool compression_enabled;
+    unique_ptr<FileBuffer> write_buffer;
+    idx_t buffer_offset;
+    
+public:
+    TemporaryFile(const string &path, TemporaryFileManager::SpillingPolicy policy) 
+        : file_path(path), compression_enabled(policy.enable_compression) {
+        
+        // Open file for read/write
+        file_handle = FileSystem::OpenFile(path, 
+            FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_READ);
+        
+        // Initialize write buffer for better I/O performance
+        write_buffer = make_unique<FileBuffer>(FileBuffer::BLOCK_SIZE);
+        buffer_offset = 0;
+    }
+    
+    ~TemporaryFile() {
+        // Flush any remaining buffered data
+        if (buffer_offset > 0) {
+            FlushBuffer();
+        }
+        
+        // Clean up temporary file
+        FileSystem::RemoveFile(file_path);
+    }
+    
+    void WriteChunk(const DataChunk &chunk) {
+        // Serialize chunk
+        auto serialized_data = SerializeChunk(chunk);
+        
+        // Write to buffer or directly to file
+        if (serialized_data.size() + buffer_offset <= write_buffer->GetSize()) {
+            // Fits in buffer
+            memcpy(write_buffer->GetData() + buffer_offset, 
+                   serialized_data.data(), serialized_data.size());
+            buffer_offset += serialized_data.size();
+        } else {
+            // Flush buffer and write directly
+            if (buffer_offset > 0) {
+                FlushBuffer();
+            }
+            file_handle->Write(serialized_data.data(), serialized_data.size());
+        }
+        
+        // Update metadata
+        ChunkMetadata metadata;
+        metadata.offset = file_handle->GetPosition() - serialized_data.size();
+        metadata.size = serialized_data.size();
+        metadata.row_count = chunk.size();
+        chunk_metadata.push_back(metadata);
+    }
+    
+    unique_ptr<DataChunk> ReadChunk(idx_t chunk_index) {
+        if (chunk_index >= chunk_metadata.size()) {
+            return nullptr;
+        }
+        
+        auto &metadata = chunk_metadata[chunk_index];
+        
+        // Read chunk data
+        vector<uint8_t> buffer(metadata.size);
+        file_handle->Seek(metadata.offset);
+        file_handle->Read(buffer.data(), metadata.size);
+        
+        // Deserialize chunk
+        return DeserializeChunk(buffer, metadata.row_count);
+    }
+
+private:
+    void FlushBuffer() {
+        if (buffer_offset > 0) {
+            file_handle->Write(write_buffer->GetData(), buffer_offset);
+            buffer_offset = 0;
+        }
+    }
+    
+    vector<uint8_t> SerializeChunk(const DataChunk &chunk) {
+        // Implement efficient chunk serialization
+        BinarySerializer serializer;
+        
+        // Write chunk header
+        serializer.Write<uint32_t>(CHUNK_SERIALIZATION_VERSION);
+        serializer.Write<idx_t>(chunk.size());
+        serializer.Write<idx_t>(chunk.ColumnCount());
+        
+        // Write column types
+        for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
+            serializer.WriteString(chunk.GetTypes()[i].ToString());
+        }
+        
+        // Write column data
+        for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
+            SerializeVector(serializer, chunk.data[i]);
+        }
+        
+        return serializer.GetData();
+    }
+    
+    static const uint32_t CHUNK_SERIALIZATION_VERSION = 1;
+};
+```
+
+This comprehensive buffer management system enables DuckDB to efficiently handle datasets larger than memory while maintaining excellent performance. The combination of intelligent replacement policies, adaptive memory mapping, and sophisticated temporary file management ensures optimal resource utilization across diverse workload scenarios.
+
+---
+
+# 4.4 Index Structures
+
+## 4.4.1 Adaptive Indexing Framework
+
+### Intelligent Index Selection and Management
+
+**Automatic Index Creation and Optimization**
+DuckDB implements an adaptive indexing framework that automatically creates, maintains, and optimizes indexes based on query patterns and data characteristics. Unlike traditional systems requiring manual index management, DuckDB's approach provides transparent performance improvements:
+
+```cpp
+class AdaptiveIndexManager {
+public:
+    struct IndexConfiguration {
+        bool enable_auto_indexing;
+        idx_t max_memory_for_indexes;
+        double index_creation_threshold;
+        idx_t min_table_size_for_indexing;
+        bool enable_partial_indexes;
+        bool enable_expression_indexes;
+    };
+
+private:
+    // Index management
+    unordered_map<table_id_t, vector<unique_ptr<Index>>> table_indexes;
+    shared_mutex index_lock;
+    
+    // Query pattern analysis
+    unique_ptr<QueryPatternAnalyzer> pattern_analyzer;
+    unique_ptr<IndexBenefitEstimator> benefit_estimator;
+    
+    // Resource management
+    atomic<idx_t> total_index_memory;
+    IndexConfiguration config;
+    
+    // Statistics and monitoring
+    IndexStatistics statistics;
+
+public:
+    AdaptiveIndexManager(IndexConfiguration configuration) : config(configuration) {
+        pattern_analyzer = make_unique<QueryPatternAnalyzer>();
+        benefit_estimator = make_unique<IndexBenefitEstimator>();
+        total_index_memory = 0;
+    }
+    
+    void AnalyzeQuery(const LogicalOperator &query_plan) {
+        // Extract indexable expressions from query
+        auto indexable_expressions = ExtractIndexableExpressions(query_plan);
+        
+        // Analyze access patterns
+        for (const auto &expr : indexable_expressions) {
+            pattern_analyzer->RecordAccess(expr);
+        }
+        
+        // Check if new indexes should be created
+        if (config.enable_auto_indexing) {
+            ConsiderIndexCreation(indexable_expressions);
+        }
+    }
+    
+    vector<unique_ptr<Index>> GetApplicableIndexes(table_id_t table_id, 
+                                                  const Expression &condition) {
+        shared_lock<shared_mutex> lock(index_lock);
+        
+        vector<unique_ptr<Index>> applicable_indexes;
+        
+        auto it = table_indexes.find(table_id);
+        if (it == table_indexes.end()) {
+            return applicable_indexes;
+        }
+        
+        for (const auto &index : it->second) {
+            if (index->CanUseForCondition(condition)) {
+                applicable_indexes.push_back(index->Clone());
+            }
+        }
+        
+        return applicable_indexes;
+    }
+    
+    void CreateIndex(table_id_t table_id, const string &index_name,
+                    const vector<unique_ptr<Expression>> &expressions,
+                    IndexType index_type) {
+        unique_lock<shared_mutex> lock(index_lock);
+        
+        // Estimate index cost and benefit
+        auto cost_estimate = EstimateIndexCost(table_id, expressions, index_type);
+        auto benefit_estimate = benefit_estimator->EstimateBenefit(table_id, expressions);
+        
+        if (benefit_estimate > cost_estimate * config.index_creation_threshold) {
+            // Create index
+            auto index = CreateIndexInstance(table_id, index_name, expressions, index_type);
+            
+            // Build index from existing data
+            BuildIndexFromTable(*index, table_id);
+            
+            // Add to index collection
+            table_indexes[table_id].push_back(move(index));
+            
+            // Update memory usage
+            total_index_memory += cost_estimate.memory_usage;
+        }
+    }
+
+private:
+    void ConsiderIndexCreation(const vector<IndexableExpression> &expressions) {
+        for (const auto &expr : expressions) {
+            auto access_frequency = pattern_analyzer->GetAccessFrequency(expr);
+            
+            if (access_frequency > config.index_creation_threshold) {
+                // High-frequency access - consider creating index
+                auto optimal_index_type = DetermineOptimalIndexType(expr);
+                
+                if (ShouldCreateIndex(expr, optimal_index_type)) {
+                    ScheduleIndexCreation(expr, optimal_index_type);
+                }
+            }
+        }
+    }
+    
+    IndexType DetermineOptimalIndexType(const IndexableExpression &expr) {
+        // Analyze expression characteristics
+        if (expr.type == ExpressionType::EQUALITY) {
+            return IndexType::HASH;
+        } else if (expr.type == ExpressionType::RANGE) {
+            return IndexType::BTREE;
+        } else if (expr.is_column_reference && IsNumericType(expr.column_type)) {
+            return IndexType::ADAPTIVE_RADIX_TREE;
+        } else {
+            return IndexType::BTREE; // Default fallback
+        }
+    }
+    
+    bool ShouldCreateIndex(const IndexableExpression &expr, IndexType index_type) {
+        // Check memory constraints
+        auto estimated_memory = EstimateIndexMemoryUsage(expr, index_type);
+        if (total_index_memory + estimated_memory > config.max_memory_for_indexes) {
+            return false;
+        }
+        
+        // Check table size constraints
+        auto table_size = GetTableSize(expr.table_id);
+        if (table_size < config.min_table_size_for_indexing) {
+            return false;
+        }
+        
+        return true;
+    }
+};
+```
+
+### Advanced B+ Tree Implementation
+
+**Adaptive B+ Tree with Compression**
+DuckDB implements a highly optimized B+ tree that adapts its structure based on data characteristics and access patterns:
+
+```cpp
+class AdaptiveBPlusTree : public Index {
+public:
+    struct BPlusTreeConfiguration {
+        idx_t node_size;
+        bool enable_compression;
+        bool enable_prefix_compression;
+        bool enable_bulk_loading;
+        double fill_factor;
+    };
+
+private:
+    // Tree structure
+    unique_ptr<BPlusTreeNode> root;
+    BPlusTreeConfiguration config;
+    
+    // Adaptive features
+    bool compression_enabled;
+    CompressionType key_compression;
+    
+    // Statistics
+    atomic<idx_t> tree_height;
+    atomic<idx_t> total_nodes;
+    atomic<idx_t> total_keys;
+
+public:
+    AdaptiveBPlusTree(const vector<LogicalType> &key_types, 
+                     BPlusTreeConfiguration configuration) 
+        : config(configuration) {
+        
+        // Analyze key types to determine optimal compression
+        key_compression = AnalyzeKeyCompression(key_types);
+        compression_enabled = config.enable_compression && 
+                            key_compression != CompressionType::UNCOMPRESSED;
+        
+        // Create root node
+        root = make_unique<BPlusTreeLeafNode>(config);
+        tree_height = 1;
+        total_nodes = 1;
+        total_keys = 0;
+    }
+    
+    bool Insert(const DataChunk &keys, const DataChunk &values) override {
+        // Bulk insert optimization
+        if (keys.size() > BULK_INSERT_THRESHOLD && config.enable_bulk_loading) {
+            return BulkInsert(keys, values);
+        }
+        
+        // Individual insert
+        for (idx_t i = 0; i < keys.size(); i++) {
+            auto key = ExtractKey(keys, i);
+            auto value = ExtractValue(values, i);
+            
+            if (!InsertKeyValue(key, value)) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    unique_ptr<IndexScanState> InitializeScan(const Value &lower_bound,
+                                            const Value &upper_bound,
+                                            bool lower_inclusive,
+                                            bool upper_inclusive) override {
+        auto scan_state = make_unique<BPlusTreeScanState>();
+        
+        // Find starting position
+        auto leaf_node = FindLeafNode(lower_bound);
+        scan_state->current_node = leaf_node;
+        scan_state->current_position = FindKeyPosition(*leaf_node, lower_bound, lower_inclusive);
+        scan_state->upper_bound = upper_bound;
+        scan_state->upper_inclusive = upper_inclusive;
+        
+        return move(scan_state);
+    }
+    
+    bool Scan(IndexScanState &state, Vector &result, idx_t &result_count) override {
+        auto &btree_state = static_cast<BPlusTreeScanState&>(state);
+        result_count = 0;
+        
+        while (result_count < STANDARD_VECTOR_SIZE && btree_state.current_node) {
+            auto &leaf = static_cast<BPlusTreeLeafNode&>(*btree_state.current_node);
+            
+            // Scan keys from current position
+            while (btree_state.current_position < leaf.key_count && 
+                   result_count < STANDARD_VECTOR_SIZE) {
+                
+                auto key = leaf.GetKey(btree_state.current_position);
+                
+                // Check upper bound
+                if (!IsWithinBounds(key, btree_state.upper_bound, btree_state.upper_inclusive)) {
+                    return result_count > 0;
+                }
+                
+                // Add to result
+                SetVectorValue(result, result_count, key);
+                result_count++;
+                btree_state.current_position++;
+            }
+            
+            // Move to next leaf if current is exhausted
+            if (btree_state.current_position >= leaf.key_count) {
+                btree_state.current_node = leaf.next_leaf;
+                btree_state.current_position = 0;
+            }
+        }
+        
+        return result_count > 0;
+    }
+
+private:
+    class BPlusTreeNode {
+    public:
+        bool is_leaf;
+        idx_t key_count;
+        idx_t node_capacity;
+        unique_ptr<CompressedKeys> keys;
+        
+        virtual ~BPlusTreeNode() = default;
+        
+    protected:
+        BPlusTreeNode(bool leaf, const BPlusTreeConfiguration &config) 
+            : is_leaf(leaf), key_count(0) {
+            node_capacity = CalculateNodeCapacity(config.node_size, leaf);
+        }
+    };
+    
+    class BPlusTreeLeafNode : public BPlusTreeNode {
+    public:
+        vector<row_t> row_ids;
+        BPlusTreeLeafNode* next_leaf;
+        BPlusTreeLeafNode* prev_leaf;
+        
+        BPlusTreeLeafNode(const BPlusTreeConfiguration &config) 
+            : BPlusTreeNode(true, config), next_leaf(nullptr), prev_leaf(nullptr) {
+            row_ids.reserve(node_capacity);
+        }
+        
+        bool InsertKeyValue(const Key &key, row_t row_id) {
+            if (key_count >= node_capacity) {
+                return false; // Node full
+            }
+            
+            // Find insertion position
+            auto position = FindInsertPosition(key);
+            
+            // Insert key and row_id
+            keys->Insert(position, key);
+            row_ids.insert(row_ids.begin() + position, row_id);
+            key_count++;
+            
+            return true;
+        }
+        
+        Key GetKey(idx_t position) const {
+            return keys->GetKey(position);
+        }
+        
+    private:
+        idx_t FindInsertPosition(const Key &key) const {
+            // Binary search for insertion position
+            idx_t left = 0, right = key_count;
+            
+            while (left < right) {
+                idx_t mid = (left + right) / 2;
+                auto mid_key = keys->GetKey(mid);
+                
+                if (CompareKeys(mid_key, key) < 0) {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
+            }
+            
+            return left;
+        }
+    };
+    
+    class BPlusTreeInternalNode : public BPlusTreeNode {
+    public:
+        vector<unique_ptr<BPlusTreeNode>> children;
+        
+        BPlusTreeInternalNode(const BPlusTreeConfiguration &config) 
+            : BPlusTreeNode(false, config) {
+            children.reserve(node_capacity + 1);
+        }
+        
+        BPlusTreeNode* FindChild(const Key &key) const {
+            // Find appropriate child for key
+            for (idx_t i = 0; i < key_count; i++) {
+                if (CompareKeys(key, keys->GetKey(i)) < 0) {
+                    return children[i].get();
+                }
+            }
+            return children[key_count].get(); // Rightmost child
+        }
+    };
+    
+    bool BulkInsert(const DataChunk &keys, const DataChunk &values) {
+        // Sort keys and values for efficient bulk loading
+        auto sorted_data = SortKeyValuePairs(keys, values);
+        
+        // Rebuild tree with sorted data for optimal structure
+        auto new_root = BuildOptimalTree(sorted_data);
+        
+        // Replace current tree
+        root = move(new_root);
+        
+        return true;
+    }
+    
+    bool InsertKeyValue(const Key &key, row_t row_id) {
+        // Find leaf node for insertion
+        auto leaf = FindLeafNodeForInsertion(key);
+        
+        if (leaf->InsertKeyValue(key, row_id)) {
+            total_keys++;
+            return true;
+        } else {
+            // Leaf is full - split
+            return SplitAndInsert(*leaf, key, row_id);
+        }
+    }
+    
+    bool SplitAndInsert(BPlusTreeLeafNode &full_leaf, const Key &key, row_t row_id) {
+        // Create new leaf node
+        auto new_leaf = make_unique<BPlusTreeLeafNode>(config);
+        
+        // Determine split point
+        auto split_point = full_leaf.key_count / 2;
+        
+        // Move half the keys to new leaf
+        for (idx_t i = split_point; i < full_leaf.key_count; i++) {
+            auto move_key = full_leaf.GetKey(i);
+            auto move_row_id = full_leaf.row_ids[i];
+            new_leaf->InsertKeyValue(move_key, move_row_id);
+        }
+        
+        // Update counts
+        full_leaf.key_count = split_point;
+        
+        // Link leaf nodes
+        new_leaf->next_leaf = full_leaf.next_leaf;
+        new_leaf->prev_leaf = &full_leaf;
+        if (full_leaf.next_leaf) {
+            full_leaf.next_leaf->prev_leaf = new_leaf.get();
+        }
+        full_leaf.next_leaf = new_leaf.get();
+        
+        // Insert new key in appropriate leaf
+        auto middle_key = new_leaf->GetKey(0);
+        if (CompareKeys(key, middle_key) < 0) {
+            full_leaf.InsertKeyValue(key, row_id);
+        } else {
+            new_leaf->InsertKeyValue(key, row_id);
+        }
+        
+        // Propagate split upward
+        return PropagateInternalSplit(middle_key, move(new_leaf));
+    }
+    
+    CompressionType AnalyzeKeyCompression(const vector<LogicalType> &key_types) {
+        // Analyze key characteristics to determine optimal compression
+        if (key_types.size() == 1) {
+            switch (key_types[0].id()) {
+                case LogicalTypeId::INTEGER:
+                case LogicalTypeId::BIGINT:
+                    return CompressionType::DICTIONARY; // Good for integer keys
+                case LogicalTypeId::VARCHAR:
+                    return CompressionType::PREFIX; // Good for string keys
+                case LogicalTypeId::TIMESTAMP:
+                    return CompressionType::DELTA; // Good for temporal keys
+                default:
+                    return CompressionType::UNCOMPRESSED;
+            }
+        } else {
+            // Composite keys - use general compression
+            return CompressionType::DICTIONARY;
+        }
+    }
+    
+    static const idx_t BULK_INSERT_THRESHOLD = 1000;
+};
+```
+
+## 4.4.2 Hash Index Implementation
+
+### High-Performance Hash Indexing
+
+**Adaptive Hash Index with Dynamic Resizing**
+DuckDB implements sophisticated hash indexes that automatically adapt to data distribution and size:
+
+```cpp
+class AdaptiveHashIndex : public Index {
+public:
+    struct HashIndexConfiguration {
+        idx_t initial_size;
+        double max_load_factor;
+        double resize_factor;
+        bool enable_cuckoo_hashing;
+        bool enable_robin_hood;
+        HashFunction hash_function;
+    };
+
+private:
+    // Hash table structure
+    vector<unique_ptr<HashBucket>> buckets;
+    idx_t bucket_count;
+    idx_t element_count;
+    
+    // Configuration and adaptation
+    HashIndexConfiguration config;
+    unique_ptr<HashFunction> hash_func;
+    
+    // Performance optimization
+    bool robin_hood_enabled;
+    atomic<double> current_load_factor;
+    
+    // Statistics
+    atomic<idx_t> collision_count;
+    atomic<idx_t> probe_distance_sum;
+
+public:
+    AdaptiveHashIndex(const vector<LogicalType> &key_types,
+                     HashIndexConfiguration configuration) 
+        : config(configuration), element_count(0) {
+        
+        bucket_count = config.initial_size;
+        buckets.resize(bucket_count);
+        
+        // Initialize buckets
+        for (idx_t i = 0; i < bucket_count; i++) {
+            buckets[i] = make_unique<HashBucket>();
+        }
+        
+        // Select optimal hash function based on key types
+        hash_func = CreateOptimalHashFunction(key_types);
+        
+        robin_hood_enabled = config.enable_robin_hood;
+        current_load_factor = 0.0;
+        collision_count = 0;
+        probe_distance_sum = 0;
+    }
+    
+    bool Insert(const DataChunk &keys, const DataChunk &values) override {
+        for (idx_t i = 0; i < keys.size(); i++) {
+            auto key = ExtractKey(keys, i);
+            auto value = ExtractValue(values, i);
+            
+            if (!InsertKeyValue(key, value)) {
+                return false;
+            }
+        }
+        
+        // Check if resize is needed
+        UpdateLoadFactor();
+        if (current_load_factor > config.max_load_factor) {
+            ResizeHashTable();
+        }
+        
+        return true;
+    }
+    
+    bool Lookup(const Key &key, vector<row_t> &result_rows) override {
+        auto hash_value = hash_func->Hash(key);
+        auto bucket_index = hash_value % bucket_count;
+        
+        if (robin_hood_enabled) {
+            return RobinHoodLookup(key, hash_value, bucket_index, result_rows);
+        } else {
+            return StandardLookup(key, bucket_index, result_rows);
+        }
+    }
+    
+    void Delete(const Key &key) override {
+        auto hash_value = hash_func->Hash(key);
+        auto bucket_index = hash_value % bucket_count;
+        
+        auto &bucket = *buckets[bucket_index];
+        bucket.Remove(key);
+        element_count--;
+        
+        UpdateLoadFactor();
+    }
+
+private:
+    class HashBucket {
+    public:
+        struct BucketEntry {
+            Key key;
+            vector<row_t> row_ids;
+            hash_t hash_value;
+            uint8_t probe_distance;
+        };
+        
+        vector<BucketEntry> entries;
+        shared_mutex bucket_lock;
+        
+    public:
+        bool Insert(const Key &key, row_t row_id, hash_t hash_value, uint8_t probe_distance = 0) {
+            unique_lock<shared_mutex> lock(bucket_lock);
+            
+            // Check if key already exists
+            for (auto &entry : entries) {
+                if (KeysEqual(entry.key, key)) {
+                    entry.row_ids.push_back(row_id);
+                    return true;
+                }
+            }
+            
+            // Add new entry
+            BucketEntry new_entry;
+            new_entry.key = key;
+            new_entry.row_ids.push_back(row_id);
+            new_entry.hash_value = hash_value;
+            new_entry.probe_distance = probe_distance;
+            
+            entries.push_back(move(new_entry));
+            return true;
+        }
+        
+        bool Lookup(const Key &key, vector<row_t> &result_rows) {
+            shared_lock<shared_mutex> lock(bucket_lock);
+            
+            for (const auto &entry : entries) {
+                if (KeysEqual(entry.key, key)) {
+                    result_rows.insert(result_rows.end(), 
+                                     entry.row_ids.begin(), entry.row_ids.end());
+                    return true;
+                }
+            }
+            return false;
+        }
+        
+        bool Remove(const Key &key) {
+            unique_lock<shared_mutex> lock(bucket_lock);
+            
+            auto it = std::find_if(entries.begin(), entries.end(),
+                [&key](const BucketEntry &entry) {
+                    return KeysEqual(entry.key, key);
+                });
+            
+            if (it != entries.end()) {
+                entries.erase(it);
+                return true;
+            }
+            return false;
+        }
+        
+        bool IsEmpty() const {
+            shared_lock<shared_mutex> lock(bucket_lock);
+            return entries.empty();
+        }
+        
+        idx_t Size() const {
+            shared_lock<shared_mutex> lock(bucket_lock);
+            return entries.size();
+        }
+    };
+    
+    bool InsertKeyValue(const Key &key, row_t row_id) {
+        auto hash_value = hash_func->Hash(key);
+        
+        if (robin_hood_enabled) {
+            return RobinHoodInsert(key, row_id, hash_value);
+        } else {
+            auto bucket_index = hash_value % bucket_count;
+            return buckets[bucket_index]->Insert(key, row_id, hash_value);
+        }
+    }
+    
+    bool RobinHoodInsert(const Key &key, row_t row_id, hash_t hash_value) {
+        auto bucket_index = hash_value % bucket_count;
+        uint8_t probe_distance = 0;
+        
+        Key current_key = key;
+        row_t current_row_id = row_id;
+        hash_t current_hash = hash_value;
+        
+        while (true) {
+            auto &bucket = *buckets[bucket_index];
+            
+            if (bucket.IsEmpty()) {
+                // Empty bucket - insert here
+                bucket.Insert(current_key, current_row_id, current_hash, probe_distance);
+                element_count++;
+                probe_distance_sum += probe_distance;
+                return true;
+            } else {
+                // Check if we should displace existing entry
+                auto existing_entries = bucket.entries;
+                if (!existing_entries.empty()) {
+                    auto &existing_entry = existing_entries[0];
+                    
+                    if (probe_distance > existing_entry.probe_distance) {
+                        // Current entry has traveled farther - displace existing
+                        bucket.Remove(existing_entry.key);
+                        bucket.Insert(current_key, current_row_id, current_hash, probe_distance);
+                        
+                        // Continue with displaced entry
+                        current_key = existing_entry.key;
+                        current_row_id = existing_entry.row_ids[0]; // Simplified
+                        current_hash = existing_entry.hash_value;
+                        probe_distance = existing_entry.probe_distance;
+                    }
+                }
+            }
+            
+            // Move to next bucket
+            bucket_index = (bucket_index + 1) % bucket_count;
+            probe_distance++;
+            
+            if (probe_distance > MAX_PROBE_DISTANCE) {
+                // Probe distance too high - resize needed
+                return false;
+            }
+        }
+    }
+    
+    bool RobinHoodLookup(const Key &key, hash_t hash_value, idx_t start_bucket,
+                        vector<row_t> &result_rows) {
+        auto bucket_index = start_bucket;
+        uint8_t probe_distance = 0;
+        
+        while (probe_distance <= MAX_PROBE_DISTANCE) {
+            auto &bucket = *buckets[bucket_index];
+            
+            if (bucket.IsEmpty()) {
+                return false; // Key not found
+            }
+            
+            if (bucket.Lookup(key, result_rows)) {
+                return true; // Found
+            }
+            
+            // Continue probing
+            bucket_index = (bucket_index + 1) % bucket_count;
+            probe_distance++;
+        }
+        
+        return false;
+    }
+    
+    void ResizeHashTable() {
+        // Calculate new size
+        auto new_bucket_count = bucket_count * config.resize_factor;
+        
+        // Save current buckets
+        auto old_buckets = move(buckets);
+        auto old_bucket_count = bucket_count;
+        
+        // Initialize new bucket array
+        bucket_count = new_bucket_count;
+        buckets.clear();
+        buckets.resize(bucket_count);
+        
+        for (idx_t i = 0; i < bucket_count; i++) {
+            buckets[i] = make_unique<HashBucket>();
+        }
+        
+        // Rehash all elements
+        element_count = 0;
+        for (const auto &old_bucket : old_buckets) {
+            for (const auto &entry : old_bucket->entries) {
+                for (auto row_id : entry.row_ids) {
+                    InsertKeyValue(entry.key, row_id);
+                }
+            }
+        }
+        
+        UpdateLoadFactor();
+    }
+    
+    void UpdateLoadFactor() {
+        current_load_factor = static_cast<double>(element_count) / bucket_count;
+    }
+    
+    static const uint8_t MAX_PROBE_DISTANCE = 64;
+};
+```
+
+## 4.4.3 Specialized Analytical Indexes
+
+### Zone Maps and Bloom Filters
+
+**Lightweight Filtering Indexes**
+DuckDB implements lightweight indexes specifically designed for analytical workloads:
+
+```cpp
+class ZoneMapIndex : public Index {
+public:
+    struct ZoneMapEntry {
+        Value min_value;
+        Value max_value;
+        idx_t null_count;
+        idx_t row_count;
+        idx_t zone_start;
+        idx_t zone_end;
+    };
+
+private:
+    vector<ZoneMapEntry> zone_entries;
+    idx_t zone_size;
+    LogicalType indexed_type;
+
+public:
+    ZoneMapIndex(LogicalType type, idx_t zone_size_param = 8192) 
+        : indexed_type(type), zone_size(zone_size_param) {}
+    
+    bool CanSkipZone(idx_t zone_index, const TableFilter &filter) const {
+        if (zone_index >= zone_entries.size()) {
+            return false;
+        }
+        
+        const auto &zone = zone_entries[zone_index];
+        
+        switch (filter.comparison_type) {
+            case ComparisonType::EQUAL_TO:
+                return filter.constant < zone.min_value || filter.constant > zone.max_value;
+            case ComparisonType::GREATER_THAN:
+                return zone.max_value <= filter.constant;
+            case ComparisonType::LESS_THAN:
+                return zone.min_value >= filter.constant;
+            case ComparisonType::GREATER_THAN_OR_EQUAL_TO:
+                return zone.max_value < filter.constant;
+            case ComparisonType::LESS_THAN_OR_EQUAL_TO:
+                return zone.min_value > filter.constant;
+            default:
+                return false; // Conservative approach
+        }
+    }
+    
+    void UpdateZoneMap(idx_t zone_index, const Vector &data, idx_t start_row) {
+        if (zone_index >= zone_entries.size()) {
+            zone_entries.resize(zone_index + 1);
+        }
+        
+        auto &zone = zone_entries[zone_index];
+        zone.zone_start = start_row;
+        zone.zone_end = start_row + data.count;
+        zone.row_count = data.count;
+        zone.null_count = 0;
+        
+        // Calculate min/max values
+        bool first_valid = true;
+        for (idx_t i = 0; i < data.count; i++) {
+            if (!data.validity.RowIsValid(i)) {
+                zone.null_count++;
+                continue;
+            }
+            
+            auto value = data.GetValue(i);
+            
+            if (first_valid) {
+                zone.min_value = value;
+                zone.max_value = value;
+                first_valid = false;
+            } else {
+                if (value < zone.min_value) {
+                    zone.min_value = value;
+                }
+                if (value > zone.max_value) {
+                    zone.max_value = value;
+                }
+            }
+        }
+    }
+};
+
+class BloomFilterIndex : public Index {
+private:
+    vector<uint64_t> bit_array;
+    idx_t bit_count;
+    idx_t hash_function_count;
+    atomic<idx_t> element_count;
+    
+    // Hash functions
+    vector<unique_ptr<HashFunction>> hash_functions;
+
+public:
+    BloomFilterIndex(idx_t expected_elements, double false_positive_rate = 0.01) {
+        // Calculate optimal bit array size and hash function count
+        bit_count = CalculateOptimalBitCount(expected_elements, false_positive_rate);
+        hash_function_count = CalculateOptimalHashCount(bit_count, expected_elements);
+        
+        // Initialize bit array
+        auto array_size = (bit_count + 63) / 64; // Round up to nearest 64-bit word
+        bit_array.resize(array_size, 0);
+        
+        // Initialize hash functions
+        hash_functions.reserve(hash_function_count);
+        for (idx_t i = 0; i < hash_function_count; i++) {
+            hash_functions.push_back(CreateHashFunction(i));
+        }
+        
+        element_count = 0;
+    }
+    
+    void Insert(const Key &key) {
+        for (const auto &hash_func : hash_functions) {
+            auto hash_value = hash_func->Hash(key);
+            auto bit_index = hash_value % bit_count;
+            
+            // Set bit atomically
+            auto word_index = bit_index / 64;
+            auto bit_offset = bit_index % 64;
+            
+            uint64_t mask = 1ULL << bit_offset;
+            
+            // Use atomic OR to set bit
+            atomic<uint64_t> &word = reinterpret_cast<atomic<uint64_t>&>(bit_array[word_index]);
+            word.fetch_or(mask, memory_order_relaxed);
+        }
+        
+        element_count++;
+    }
+    
+    bool MightContain(const Key &key) const {
+        for (const auto &hash_func : hash_functions) {
+            auto hash_value = hash_func->Hash(key);
+            auto bit_index = hash_value % bit_count;
+            
+            auto word_index = bit_index / 64;
+            auto bit_offset = bit_index % 64;
+            
+            uint64_t mask = 1ULL << bit_offset;
+            
+            if ((bit_array[word_index] & mask) == 0) {
+                return false; // Definitely not present
+            }
+        }
+        
+        return true; // Might be present
+    }
+    
+    double GetCurrentFalsePositiveRate() const {
+        auto bits_set = CountSetBits();
+        auto current_elements = element_count.load();
+        
+        // Estimate false positive rate based on current state
+        double ratio = static_cast<double>(bits_set) / bit_count;
+        return pow(ratio, hash_function_count);
+    }
+
+private:
+    static idx_t CalculateOptimalBitCount(idx_t expected_elements, double false_positive_rate) {
+        return static_cast<idx_t>(-expected_elements * log(false_positive_rate) / (log(2) * log(2)));
+    }
+    
+    static idx_t CalculateOptimalHashCount(idx_t bit_count, idx_t expected_elements) {
+        return static_cast<idx_t>((static_cast<double>(bit_count) / expected_elements) * log(2));
+    }
+    
+    idx_t CountSetBits() const {
+        idx_t count = 0;
+        for (auto word : bit_array) {
+            count += __builtin_popcountll(word);
+        }
+        return count;
+    }
+};
+```
+
+This comprehensive indexing framework enables DuckDB to automatically optimize query performance through intelligent index selection and maintenance. The combination of adaptive B+ trees, hash indexes, and specialized analytical indexes provides efficient access patterns for diverse query workloads while maintaining the system's commitment to operational simplicity.
+
+---
+
+# Phase 5: Transaction Management and Concurrency
+
+## 5.1 ACID Properties Support
+
+### 5.1.1 Atomicity Implementation
+
+**Transaction Boundary Management**
+DuckDB ensures atomicity through comprehensive transaction boundary management that guarantees all-or-nothing execution semantics. The system implements sophisticated rollback mechanisms that can undo partial changes across complex query plans:
+
+```cpp
+class TransactionManager {
+public:
+    struct TransactionConfiguration {
+        IsolationLevel default_isolation_level;
+        bool enable_optimistic_concurrency;
+        idx_t max_active_transactions;
+        bool enable_write_ahead_logging;
+        idx_t checkpoint_interval_ms;
+    };
+
+private:
+    // Transaction state management
+    unordered_map<transaction_t, unique_ptr<Transaction>> active_transactions;
+    shared_mutex transaction_lock;
+    
+    // Global transaction coordination
+    atomic<transaction_t> next_transaction_id;
+    atomic<transaction_t> latest_start_timestamp;
+    atomic<transaction_t> latest_commit_timestamp;
+    
+    // Write-ahead logging
+    unique_ptr<WriteAheadLog> wal;
+    TransactionConfiguration config;
+    
+    // Conflict detection and resolution
+    unique_ptr<ConflictDetector> conflict_detector;
+    unique_ptr<DeadlockDetector> deadlock_detector;
+
+public:
+    TransactionManager(TransactionConfiguration configuration) : config(configuration) {
+        next_transaction_id = 1;
+        latest_start_timestamp = 0;
+        latest_commit_timestamp = 0;
+        
+        if (config.enable_write_ahead_logging) {
+            wal = make_unique<WriteAheadLog>();
+        }
+        
+        conflict_detector = make_unique<ConflictDetector>();
+        deadlock_detector = make_unique<DeadlockDetector>();
+    }
+    
+    unique_ptr<Transaction> BeginTransaction(IsolationLevel isolation = IsolationLevel::DEFAULT) {
+        unique_lock<shared_mutex> lock(transaction_lock);
+        
+        // Generate new transaction ID
+        auto transaction_id = next_transaction_id.fetch_add(1);
+        auto start_timestamp = GetCurrentTimestamp();
+        
+        // Create transaction object
+        auto transaction = make_unique<Transaction>(
+            transaction_id, 
+            start_timestamp, 
+            isolation == IsolationLevel::DEFAULT ? config.default_isolation_level : isolation
+        );
+        
+        // Initialize transaction state
+        transaction->status = TransactionStatus::ACTIVE;
+        transaction->undo_buffer = make_unique<UndoBuffer>();
+        transaction->lock_manager = make_unique<TransactionLockManager>();
+        
+        // Register transaction
+        active_transactions[transaction_id] = transaction.get();
+        
+        // Update global timestamp
+        latest_start_timestamp = std::max(latest_start_timestamp.load(), start_timestamp);
+        
+        return transaction;
+    }
+    
+    bool CommitTransaction(Transaction &transaction) {
+        // Phase 1: Validate transaction can commit
+        if (!ValidateCommit(transaction)) {
+            return RollbackTransaction(transaction);
+        }
+        
+        // Phase 2: Write commit record to WAL
+        if (wal && transaction.HasWrites()) {
+            auto commit_lsn = wal->WriteCommitRecord(transaction);
+            transaction.commit_lsn = commit_lsn;
+        }
+        
+        // Phase 3: Apply changes atomically
+        if (!ApplyTransactionChanges(transaction)) {
+            return RollbackTransaction(transaction);
+        }
+        
+        // Phase 4: Release locks and cleanup
+        return FinalizeCommit(transaction);
+    }
+    
+    bool RollbackTransaction(Transaction &transaction) {
+        // Phase 1: Undo all changes
+        UndoTransactionChanges(transaction);
+        
+        // Phase 2: Write abort record to WAL
+        if (wal) {
+            wal->WriteAbortRecord(transaction);
+        }
+        
+        // Phase 3: Release locks and cleanup
+        return FinalizeRollback(transaction);
+    }
+
+private:
+    bool ValidateCommit(Transaction &transaction) {
+        // Check for conflicts with concurrent transactions
+        if (config.enable_optimistic_concurrency) {
+            return conflict_detector->ValidateOptimisticTransaction(transaction);
+        } else {
+            // Pessimistic concurrency - already validated through locking
+            return true;
+        }
+    }
+    
+    bool ApplyTransactionChanges(Transaction &transaction) {
+        // Apply all buffered changes atomically
+        for (const auto &change : transaction.write_set) {
+            if (!ApplyChange(change)) {
+                return false; // Triggers rollback
+            }
+        }
+        
+        // Update transaction status
+        transaction.status = TransactionStatus::COMMITTED;
+        transaction.commit_timestamp = GetCurrentTimestamp();
+        
+        // Update global commit timestamp
+        latest_commit_timestamp = std::max(latest_commit_timestamp.load(), 
+                                          transaction.commit_timestamp);
+        
+        return true;
+    }
+    
+    void UndoTransactionChanges(Transaction &transaction) {
+        // Undo changes in reverse order
+        auto &undo_buffer = *transaction.undo_buffer;
+        
+        while (!undo_buffer.Empty()) {
+            auto undo_record = undo_buffer.PopRecord();
+            ApplyUndoRecord(undo_record);
+        }
+        
+        transaction.status = TransactionStatus::ABORTED;
+    }
+    
+    bool FinalizeCommit(Transaction &transaction) {
+        unique_lock<shared_mutex> lock(transaction_lock);
+        
+        // Release all locks held by transaction
+        transaction.lock_manager->ReleaseAllLocks();
+        
+        // Remove from active transactions
+        active_transactions.erase(transaction.transaction_id);
+        
+        return true;
+    }
+    
+    bool FinalizeRollback(Transaction &transaction) {
+        unique_lock<shared_mutex> lock(transaction_lock);
+        
+        // Release all locks held by transaction
+        transaction.lock_manager->ReleaseAllLocks();
+        
+        // Remove from active transactions
+        active_transactions.erase(transaction.transaction_id);
+        
+        return true;
+    }
+};
+
+class Transaction {
+public:
+    transaction_t transaction_id;
+    transaction_t start_timestamp;
+    transaction_t commit_timestamp;
+    IsolationLevel isolation_level;
+    TransactionStatus status;
+    
+    // Transaction state
+    unique_ptr<UndoBuffer> undo_buffer;
+    unique_ptr<TransactionLockManager> lock_manager;
+    vector<WriteOperation> write_set;
+    vector<ReadOperation> read_set;
+    
+    // Write-ahead logging
+    lsn_t commit_lsn;
+    
+public:
+    Transaction(transaction_t id, transaction_t start_ts, IsolationLevel isolation)
+        : transaction_id(id), start_timestamp(start_ts), isolation_level(isolation) {
+        commit_timestamp = INVALID_TIMESTAMP;
+        status = TransactionStatus::ACTIVE;
+        commit_lsn = INVALID_LSN;
+    }
+    
+    void RecordWrite(const WriteOperation &write_op) {
+        // Record write operation for conflict detection
+        write_set.push_back(write_op);
+        
+        // Create undo record for atomicity
+        auto undo_record = CreateUndoRecord(write_op);
+        undo_buffer->AddRecord(undo_record);
+    }
+    
+    void RecordRead(const ReadOperation &read_op) {
+        // Record read operation for isolation validation
+        read_set.push_back(read_op);
+    }
+    
+    bool HasWrites() const {
+        return !write_set.empty();
+    }
+    
+    bool RequiresValidation() const {
+        return isolation_level == IsolationLevel::SERIALIZABLE ||
+               isolation_level == IsolationLevel::REPEATABLE_READ;
+    }
+
+private:
+    UndoRecord CreateUndoRecord(const WriteOperation &write_op) {
+        UndoRecord undo_record;
+        undo_record.operation_type = GetUndoOperationType(write_op.type);
+        undo_record.table_id = write_op.table_id;
+        undo_record.row_id = write_op.row_id;
+        
+        switch (write_op.type) {
+            case WriteOperationType::INSERT:
+                undo_record.operation_type = UndoOperationType::DELETE;
+                break;
+            case WriteOperationType::DELETE:
+                undo_record.operation_type = UndoOperationType::INSERT;
+                undo_record.old_data = write_op.old_data;
+                break;
+            case WriteOperationType::UPDATE:
+                undo_record.operation_type = UndoOperationType::UPDATE;
+                undo_record.old_data = write_op.old_data;
+                break;
+        }
+        
+        return undo_record;
+    }
+};
+```
+
+### 5.1.2 Consistency Enforcement
+
+**Constraint Validation and Integrity Checking**
+DuckDB maintains data consistency through comprehensive constraint validation and integrity checking mechanisms:
+
+```cpp
+class ConsistencyManager {
+public:
+    struct ConsistencyConfiguration {
+        bool enable_foreign_key_checks;
+        bool enable_unique_constraint_checks;
+        bool enable_check_constraint_validation;
+        bool enable_deferred_constraint_checking;
+        ConstraintViolationAction default_violation_action;
+    };
+
+private:
+    // Constraint management
+    unordered_map<table_id_t, vector<unique_ptr<Constraint>>> table_constraints;
+    unordered_map<constraint_id_t, unique_ptr<ConstraintIndex>> constraint_indexes;
+    shared_mutex constraint_lock;
+    
+    // Validation state
+    ConsistencyConfiguration config;
+    unique_ptr<ConstraintValidator> validator;
+
+public:
+    ConsistencyManager(ConsistencyConfiguration configuration) : config(configuration) {
+        validator = make_unique<ConstraintValidator>(config);
+    }
+    
+    bool ValidateTransaction(Transaction &transaction) {
+        // Validate all constraints affected by transaction
+        for (const auto &write_op : transaction.write_set) {
+            if (!ValidateWriteOperation(write_op, transaction)) {
+                return false;
+            }
+        }
+        
+        // Validate referential integrity
+        if (config.enable_foreign_key_checks) {
+            if (!ValidateReferentialIntegrity(transaction)) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    bool ValidateWriteOperation(const WriteOperation &write_op, Transaction &transaction) {
+        auto table_id = write_op.table_id;
+        
+        shared_lock<shared_mutex> lock(constraint_lock);
+        auto it = table_constraints.find(table_id);
+        if (it == table_constraints.end()) {
+            return true; // No constraints to validate
+        }
+        
+        // Validate each constraint
+        for (const auto &constraint : it->second) {
+            if (!ValidateConstraint(*constraint, write_op, transaction)) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+
+private:
+    bool ValidateConstraint(const Constraint &constraint, 
+                          const WriteOperation &write_op,
+                          Transaction &transaction) {
+        switch (constraint.type) {
+            case ConstraintType::UNIQUE:
+                return ValidateUniqueConstraint(
+                    static_cast<const UniqueConstraint&>(constraint), write_op, transaction);
+            case ConstraintType::FOREIGN_KEY:
+                return ValidateForeignKeyConstraint(
+                    static_cast<const ForeignKeyConstraint&>(constraint), write_op, transaction);
+            case ConstraintType::CHECK:
+                return ValidateCheckConstraint(
+                    static_cast<const CheckConstraint&>(constraint), write_op, transaction);
+            case ConstraintType::NOT_NULL:
+                return ValidateNotNullConstraint(
+                    static_cast<const NotNullConstraint&>(constraint), write_op, transaction);
+            default:
+                return true; // Unknown constraint type - assume valid
+        }
+    }
+    
+    bool ValidateUniqueConstraint(const UniqueConstraint &constraint,
+                                const WriteOperation &write_op,
+                                Transaction &transaction) {
+        if (write_op.type == WriteOperationType::DELETE) {
+            return true; // Deletes don't violate uniqueness
+        }
+        
+        // Extract key values from the write operation
+        auto key_values = ExtractKeyValues(write_op.new_data, constraint.columns);
+        
+        // Check if key already exists
+        auto constraint_index_it = constraint_indexes.find(constraint.constraint_id);
+        if (constraint_index_it != constraint_indexes.end()) {
+            auto &index = *constraint_index_it->second;
+            
+            vector<row_t> existing_rows;
+            if (index.Lookup(key_values, existing_rows)) {
+                // Key exists - check if it's the same row (for updates)
+                if (write_op.type == WriteOperationType::UPDATE && 
+                    std::find(existing_rows.begin(), existing_rows.end(), write_op.row_id) != existing_rows.end()) {
+                    return true; // Updating same row with same key
+                }
+                
+                return false; // Unique constraint violation
+            }
+        }
+        
+        return true;
+    }
+    
+    bool ValidateForeignKeyConstraint(const ForeignKeyConstraint &constraint,
+                                    const WriteOperation &write_op,
+                                    Transaction &transaction) {
+        if (write_op.type == WriteOperationType::DELETE) {
+            // Check if any child records reference this record
+            return ValidateReferenceExists(constraint, write_op, transaction);
+        } else {
+            // Check if referenced record exists in parent table
+            return ValidateParentExists(constraint, write_op, transaction);
+        }
+    }
+    
+    bool ValidateCheckConstraint(const CheckConstraint &constraint,
+                               const WriteOperation &write_op,
+                               Transaction &transaction) {
+        if (write_op.type == WriteOperationType::DELETE) {
+            return true; // Deletes don't need check validation
+        }
+        
+        // Evaluate check expression against new data
+        auto expression_executor = make_unique<ExpressionExecutor>();
+        auto result = expression_executor->Execute(constraint.expression, write_op.new_data);
+        
+        // Check constraint is satisfied if expression evaluates to true
+        return result.IsTrue();
+    }
+    
+    bool ValidateNotNullConstraint(const NotNullConstraint &constraint,
+                                 const WriteOperation &write_op,
+                                 Transaction &transaction) {
+        if (write_op.type == WriteOperationType::DELETE) {
+            return true; // Deletes don't violate NOT NULL
+        }
+        
+        // Check if the column value is NULL
+        auto column_value = ExtractColumnValue(write_op.new_data, constraint.column_index);
+        return !column_value.IsNull();
+    }
+    
+    bool ValidateReferentialIntegrity(Transaction &transaction) {
+        // Check all foreign key constraints across the transaction
+        for (const auto &write_op : transaction.write_set) {
+            auto table_id = write_op.table_id;
+            
+            // Get all foreign key constraints for this table
+            auto foreign_keys = GetForeignKeyConstraints(table_id);
+            
+            for (const auto &fk_constraint : foreign_keys) {
+                if (!ValidateForeignKeyConstraint(*fk_constraint, write_op, transaction)) {
+                    return false;
+                }
+            }
+        }
+        
+        return true;
+    }
+};
+```
+
+### 5.1.3 Isolation Level Implementation
+
+**Multi-Version Concurrency Control Foundation**
+DuckDB implements sophisticated isolation levels through an optimized MVCC system designed for analytical workloads:
+
+```cpp
+class IsolationManager {
+public:
+    enum class IsolationLevel {
+        READ_UNCOMMITTED,
+        READ_COMMITTED,
+        REPEATABLE_READ,
+        SERIALIZABLE
+    };
+
+private:
+    // Version management
+    unordered_map<row_id_t, vector<unique_ptr<RowVersion>>> row_versions;
+    shared_mutex version_lock;
+    
+    // Timestamp management
+    atomic<timestamp_t> global_timestamp;
+    unordered_map<transaction_t, timestamp_t> transaction_snapshots;
+    
+    // Conflict detection
+    unique_ptr<SerializationGraphDetector> serialization_detector;
+
+public:
+    IsolationManager() {
+        global_timestamp = 0;
+        serialization_detector = make_unique<SerializationGraphDetector>();
+    }
+    
+    unique_ptr<DataChunk> ReadWithIsolation(table_id_t table_id, 
+                                           const vector<column_t> &column_ids,
+                                           Transaction &transaction) {
+        switch (transaction.isolation_level) {
+            case IsolationLevel::READ_UNCOMMITTED:
+                return ReadUncommitted(table_id, column_ids, transaction);
+            case IsolationLevel::READ_COMMITTED:
+                return ReadCommitted(table_id, column_ids, transaction);
+            case IsolationLevel::REPEATABLE_READ:
+                return RepeatableRead(table_id, column_ids, transaction);
+            case IsolationLevel::SERIALIZABLE:
+                return SerializableRead(table_id, column_ids, transaction);
+            default:
+                throw InternalException("Unknown isolation level");
+        }
+    }
+    
+    bool WriteWithIsolation(const WriteOperation &write_op, Transaction &transaction) {
+        // Check for write-write conflicts
+        if (!ValidateWriteOperation(write_op, transaction)) {
+            return false;
+        }
+        
+        // Create new version for MVCC
+        auto new_version = CreateRowVersion(write_op, transaction);
+        
+        // Add version to version chain
+        AddRowVersion(write_op.row_id, move(new_version));
+        
+        return true;
+    }
+
+private:
+    unique_ptr<DataChunk> ReadUncommitted(table_id_t table_id,
+                                         const vector<column_t> &column_ids,
+                                         Transaction &transaction) {
+        // Read most recent version regardless of commit status
+        return ReadLatestVersions(table_id, column_ids);
+    }
+    
+    unique_ptr<DataChunk> ReadCommitted(table_id_t table_id,
+                                       const vector<column_t> &column_ids,
+                                       Transaction &transaction) {
+        // Read most recent committed version at statement start
+        auto statement_timestamp = GetCurrentTimestamp();
+        return ReadVersionsAsOf(table_id, column_ids, statement_timestamp, true);
+    }
+    
+    unique_ptr<DataChunk> RepeatableRead(table_id_t table_id,
+                                        const vector<column_t> &column_ids,
+                                        Transaction &transaction) {
+        // Read consistent snapshot from transaction start
+        auto snapshot_timestamp = GetTransactionSnapshot(transaction.transaction_id);
+        return ReadVersionsAsOf(table_id, column_ids, snapshot_timestamp, true);
+    }
+    
+    unique_ptr<DataChunk> SerializableRead(table_id_t table_id,
+                                          const vector<column_t> &column_ids,
+                                          Transaction &transaction) {
+        // Read with full serialization conflict detection
+        auto result = RepeatableRead(table_id, column_ids, transaction);
+        
+        // Record read operation for serialization validation
+        RecordSerializableRead(table_id, column_ids, transaction);
+        
+        return result;
+    }
+    
+    unique_ptr<DataChunk> ReadVersionsAsOf(table_id_t table_id,
+                                          const vector<column_t> &column_ids,
+                                          timestamp_t as_of_timestamp,
+                                          bool only_committed) {
+        auto result = make_unique<DataChunk>();
+        result->Initialize(column_ids);
+        
+        // Scan all rows and find appropriate versions
+        auto table_scan = CreateTableScan(table_id);
+        
+        while (table_scan->HasNext()) {
+            auto row_id = table_scan->GetNextRowId();
+            auto visible_version = FindVisibleVersion(row_id, as_of_timestamp, only_committed);
+            
+            if (visible_version) {
+                auto row_data = ExtractRowData(*visible_version, column_ids);
+                result->Append(row_data);
+            }
+        }
+        
+        return result;
+    }
+    
+    RowVersion* FindVisibleVersion(row_id_t row_id, 
+                                  timestamp_t as_of_timestamp,
+                                  bool only_committed) {
+        shared_lock<shared_mutex> lock(version_lock);
+        
+        auto it = row_versions.find(row_id);
+        if (it == row_versions.end()) {
+            return nullptr;
+        }
+        
+        // Find the most recent version that satisfies visibility criteria
+        for (auto &version : it->second) {
+            if (IsVersionVisible(*version, as_of_timestamp, only_committed)) {
+                return version.get();
+            }
+        }
+        
+        return nullptr;
+    }
+    
+    bool IsVersionVisible(const RowVersion &version, 
+                         timestamp_t as_of_timestamp,
+                         bool only_committed) {
+        // Version must be created before the as-of timestamp
+        if (version.create_timestamp > as_of_timestamp) {
+            return false;
+        }
+        
+        // If version has been deleted, check delete timestamp
+        if (version.delete_timestamp != INVALID_TIMESTAMP &&
+            version.delete_timestamp <= as_of_timestamp) {
+            return false;
+        }
+        
+        // If only committed versions are visible, check commit status
+        if (only_committed && !version.is_committed) {
+            return false;
+        }
+        
+        return true;
+    }
+    
+    unique_ptr<RowVersion> CreateRowVersion(const WriteOperation &write_op, 
+                                           Transaction &transaction) {
+        auto version = make_unique<RowVersion>();
+        version->row_id = write_op.row_id;
+        version->transaction_id = transaction.transaction_id;
+        version->create_timestamp = transaction.start_timestamp;
+        version->delete_timestamp = INVALID_TIMESTAMP;
+        version->is_committed = false;
+        
+        switch (write_op.type) {
+            case WriteOperationType::INSERT:
+                version->data = write_op.new_data;
+                break;
+            case WriteOperationType::UPDATE:
+                version->data = write_op.new_data;
+                // Mark previous version as deleted
+                MarkVersionDeleted(write_op.row_id, transaction.start_timestamp);
+                break;
+            case WriteOperationType::DELETE:
+                MarkVersionDeleted(write_op.row_id, transaction.start_timestamp);
+                return nullptr; // No new version for deletes
+        }
+        
+        return version;
+    }
+    
+    void MarkVersionDeleted(row_id_t row_id, timestamp_t delete_timestamp) {
+        unique_lock<shared_mutex> lock(version_lock);
+        
+        auto it = row_versions.find(row_id);
+        if (it != row_versions.end()) {
+            // Find the most recent uncommitted version and mark it deleted
+            for (auto &version : it->second) {
+                if (!version->is_committed && version->delete_timestamp == INVALID_TIMESTAMP) {
+                    version->delete_timestamp = delete_timestamp;
+                    break;
+                }
+            }
+        }
+    }
+    
+    void RecordSerializableRead(table_id_t table_id,
+                               const vector<column_t> &column_ids,
+                               Transaction &transaction) {
+        // Record read for serialization conflict detection
+        serialization_detector->RecordRead(transaction.transaction_id, table_id, column_ids);
+    }
+    
+    timestamp_t GetTransactionSnapshot(transaction_t transaction_id) {
+        auto it = transaction_snapshots.find(transaction_id);
+        if (it != transaction_snapshots.end()) {
+            return it->second;
+        }
+        
+        // Create new snapshot
+        auto snapshot_timestamp = global_timestamp.fetch_add(1);
+        transaction_snapshots[transaction_id] = snapshot_timestamp;
+        return snapshot_timestamp;
+    }
+};
+```
+
+This comprehensive ACID implementation ensures that DuckDB maintains data integrity and consistency while providing optimal performance for analytical workloads. The system's sophisticated transaction management enables reliable concurrent access patterns essential for modern data processing applications.
+
+---
+
+## 5.2 MVCC Implementation
+
+### 5.2.1 Analytics-Optimized MVCC Architecture
+
+**Column-Based Version Management**
+DuckDB implements a specialized MVCC system optimized for analytical workloads, using columnar version storage and efficient bulk operations:
+
+```cpp
+class AnalyticalMVCC {
+public:
+    struct MVCCConfiguration {
+        bool enable_version_compaction;
+        idx_t max_version_chain_length;
+        idx_t undo_buffer_size_limit;
+        bool enable_bulk_version_creation;
+        double compaction_threshold;
+        bool enable_version_statistics;
+    };
+
+private:
+    // Version storage
+    unordered_map<table_id_t, unique_ptr<TableVersionManager>> table_versions;
+    shared_mutex version_manager_lock;
+    
+    // Global version coordination
+    atomic<version_t> global_version_counter;
+    atomic<timestamp_t> version_cleanup_timestamp;
+    
+    // Undo management
+    unique_ptr<UndoBufferManager> undo_manager;
+    MVCCConfiguration config;
+    
+    // Performance optimization
+    unique_ptr<VersionCompactor> version_compactor;
+    unique_ptr<BulkVersionManager> bulk_version_manager;
+
+public:
+    AnalyticalMVCC(MVCCConfiguration configuration) : config(configuration) {
+        global_version_counter = 1;
+        version_cleanup_timestamp = 0;
+        
+        undo_manager = make_unique<UndoBufferManager>(config.undo_buffer_size_limit);
+        
+        if (config.enable_version_compaction) {
+            version_compactor = make_unique<VersionCompactor>(config);
+        }
+        
+        if (config.enable_bulk_version_creation) {
+            bulk_version_manager = make_unique<BulkVersionManager>();
+        }
+    }
+    
+    bool WriteVersion(table_id_t table_id, const DataChunk &data, 
+                     const vector<row_t> &row_ids, Transaction &transaction) {
+        auto version_manager = GetTableVersionManager(table_id);
+        
+        // Create version entries for modified data
+        vector<unique_ptr<VersionEntry>> version_entries;
+        
+        for (idx_t i = 0; i < row_ids.size(); i++) {
+            auto version_entry = CreateVersionEntry(data, i, row_ids[i], transaction);
+            version_entries.push_back(move(version_entry));
+        }
+        
+        // Apply versions atomically
+        return version_manager->ApplyVersions(version_entries, transaction);
+    }
+    
+    unique_ptr<DataChunk> ReadVersion(table_id_t table_id, 
+                                     const vector<column_t> &column_ids,
+                                     timestamp_t read_timestamp,
+                                     Transaction &transaction) {
+        auto version_manager = GetTableVersionManager(table_id);
+        
+        // Read visible versions for the given timestamp
+        return version_manager->ReadVisibleVersions(column_ids, read_timestamp, transaction);
+    }
+    
+    bool CommitVersions(Transaction &transaction) {
+        // Mark all transaction versions as committed
+        for (const auto &write_op : transaction.write_set) {
+            auto version_manager = GetTableVersionManager(write_op.table_id);
+            version_manager->CommitTransactionVersions(transaction.transaction_id, 
+                                                      transaction.commit_timestamp);
+        }
+        
+        // Schedule version compaction if needed
+        if (config.enable_version_compaction && ShouldCompactVersions()) {
+            version_compactor->ScheduleCompaction();
+        }
+        
+        return true;
+    }
+    
+    bool AbortVersions(Transaction &transaction) {
+        // Remove all uncommitted versions for this transaction
+        for (const auto &write_op : transaction.write_set) {
+            auto version_manager = GetTableVersionManager(write_op.table_id);
+            version_manager->AbortTransactionVersions(transaction.transaction_id);
+        }
+        
+        return true;
+    }
+
+private:
+    TableVersionManager* GetTableVersionManager(table_id_t table_id) {
+        shared_lock<shared_mutex> lock(version_manager_lock);
+        
+        auto it = table_versions.find(table_id);
+        if (it != table_versions.end()) {
+            return it->second.get();
+        }
+        
+        lock.unlock();
+        
+        // Create new version manager
+        unique_lock<shared_mutex> write_lock(version_manager_lock);
+        
+        // Double-check after acquiring write lock
+        auto it2 = table_versions.find(table_id);
+        if (it2 != table_versions.end()) {
+            return it2->second.get();
+        }
+        
+        auto version_manager = make_unique<TableVersionManager>(table_id, config);
+        auto result = version_manager.get();
+        table_versions[table_id] = move(version_manager);
+        
+        return result;
+    }
+    
+    unique_ptr<VersionEntry> CreateVersionEntry(const DataChunk &data, idx_t chunk_index,
+                                               row_t row_id, Transaction &transaction) {
+        auto version_entry = make_unique<VersionEntry>();
+        version_entry->version_id = global_version_counter.fetch_add(1);
+        version_entry->transaction_id = transaction.transaction_id;
+        version_entry->row_id = row_id;
+        version_entry->create_timestamp = transaction.start_timestamp;
+        version_entry->commit_timestamp = INVALID_TIMESTAMP;
+        version_entry->is_committed = false;
+        
+        // Extract row data from chunk
+        version_entry->column_data = ExtractRowData(data, chunk_index);
+        
+        return version_entry;
+    }
+    
+    bool ShouldCompactVersions() {
+        // Check if version chain lengths exceed threshold
+        auto total_version_count = GetTotalVersionCount();
+        auto active_version_count = GetActiveVersionCount();
+        
+        double compaction_ratio = static_cast<double>(active_version_count) / total_version_count;
+        return compaction_ratio < config.compaction_threshold;
+    }
+};
+
+class TableVersionManager {
+private:
+    table_id_t table_id;
+    
+    // Column-based version storage
+    unordered_map<column_t, unique_ptr<ColumnVersionChain>> column_versions;
+    shared_mutex column_lock;
+    
+    // Row version metadata
+    unordered_map<row_t, unique_ptr<RowVersionMetadata>> row_metadata;
+    shared_mutex row_metadata_lock;
+    
+    // Version chain management
+    AnalyticalMVCC::MVCCConfiguration config;
+    atomic<idx_t> total_versions;
+    atomic<idx_t> committed_versions;
+
+public:
+    TableVersionManager(table_id_t id, AnalyticalMVCC::MVCCConfiguration configuration) 
+        : table_id(id), config(configuration) {
+        total_versions = 0;
+        committed_versions = 0;
+    }
+    
+    bool ApplyVersions(vector<unique_ptr<VersionEntry>> &version_entries, 
+                      Transaction &transaction) {
+        // Group versions by column for efficient storage
+        unordered_map<column_t, vector<VersionEntry*>> column_grouped_versions;
+        
+        for (auto &version_entry : version_entries) {
+            for (auto &column_data : version_entry->column_data) {
+                column_grouped_versions[column_data.column_id].push_back(version_entry.get());
+            }
+        }
+        
+        // Apply versions column by column
+        for (const auto &[column_id, column_versions] : column_grouped_versions) {
+            if (!ApplyColumnVersions(column_id, column_versions, transaction)) {
+                return false;
+            }
+        }
+        
+        // Update row metadata
+        for (auto &version_entry : version_entries) {
+            UpdateRowMetadata(version_entry->row_id, *version_entry, transaction);
+        }
+        
+        total_versions += version_entries.size();
+        return true;
+    }
+    
+    unique_ptr<DataChunk> ReadVisibleVersions(const vector<column_t> &column_ids,
+                                            timestamp_t read_timestamp,
+                                            Transaction &transaction) {
+        auto result = make_unique<DataChunk>();
+        result->Initialize(column_ids);
+        
+        // Read each column's visible versions
+        for (auto column_id : column_ids) {
+            auto column_data = ReadColumnVersions(column_id, read_timestamp, transaction);
+            result->SetColumn(column_id, move(column_data));
+        }
+        
+        return result;
+    }
+    
+    void CommitTransactionVersions(transaction_t transaction_id, timestamp_t commit_timestamp) {
+        // Update commit timestamp for all versions created by this transaction
+        shared_lock<shared_mutex> lock(column_lock);
+        
+        for (auto &[column_id, column_chain] : column_versions) {
+            column_chain->CommitVersions(transaction_id, commit_timestamp);
+        }
+        
+        // Update statistics
+        committed_versions = CalculateCommittedVersions();
+    }
+    
+    void AbortTransactionVersions(transaction_t transaction_id) {
+        // Remove all uncommitted versions for this transaction
+        unique_lock<shared_mutex> lock(column_lock);
+        
+        for (auto &[column_id, column_chain] : column_versions) {
+            column_chain->AbortVersions(transaction_id);
+        }
+        
+        // Clean up row metadata
+        CleanupAbortedRowMetadata(transaction_id);
+    }
+
+private:
+    bool ApplyColumnVersions(column_t column_id, 
+                           const vector<VersionEntry*> &versions,
+                           Transaction &transaction) {
+        auto column_chain = GetColumnVersionChain(column_id);
+        
+        // Sort versions by row_id for efficient storage
+        vector<VersionEntry*> sorted_versions = versions;
+        std::sort(sorted_versions.begin(), sorted_versions.end(),
+            [](const VersionEntry* a, const VersionEntry* b) {
+                return a->row_id < b->row_id;
+            });
+        
+        // Apply versions to column chain
+        return column_chain->AddVersions(sorted_versions, transaction);
+    }
+    
+    ColumnVersionChain* GetColumnVersionChain(column_t column_id) {
+        shared_lock<shared_mutex> lock(column_lock);
+        
+        auto it = column_versions.find(column_id);
+        if (it != column_versions.end()) {
+            return it->second.get();
+        }
+        
+        lock.unlock();
+        
+        // Create new column version chain
+        unique_lock<shared_mutex> write_lock(column_lock);
+        
+        // Double-check after acquiring write lock
+        auto it2 = column_versions.find(column_id);
+        if (it2 != column_versions.end()) {
+            return it2->second.get();
+        }
+        
+        auto column_chain = make_unique<ColumnVersionChain>(column_id, config);
+        auto result = column_chain.get();
+        column_versions[column_id] = move(column_chain);
+        
+        return result;
+    }
+    
+    unique_ptr<Vector> ReadColumnVersions(column_t column_id, 
+                                        timestamp_t read_timestamp,
+                                        Transaction &transaction) {
+        auto column_chain = GetColumnVersionChain(column_id);
+        return column_chain->ReadVisibleVersions(read_timestamp, transaction);
+    }
+    
+    void UpdateRowMetadata(row_t row_id, const VersionEntry &version_entry,
+                          Transaction &transaction) {
+        unique_lock<shared_mutex> lock(row_metadata_lock);
+        
+        auto it = row_metadata.find(row_id);
+        if (it == row_metadata.end()) {
+            auto metadata = make_unique<RowVersionMetadata>();
+            metadata->row_id = row_id;
+            metadata->latest_version_id = version_entry.version_id;
+            metadata->version_count = 1;
+            metadata->first_version_timestamp = version_entry.create_timestamp;
+            metadata->latest_version_timestamp = version_entry.create_timestamp;
+            
+            row_metadata[row_id] = move(metadata);
+        } else {
+            auto &metadata = *it->second;
+            metadata.latest_version_id = version_entry.version_id;
+            metadata.version_count++;
+            metadata.latest_version_timestamp = version_entry.create_timestamp;
+        }
+    }
+};
+```
+
+### 5.2.2 Undo Buffer Management
+
+**Efficient Undo Storage for Analytics**
+DuckDB implements sophisticated undo buffer management optimized for analytical workloads with large batch operations:
+
+```cpp
+class UndoBufferManager {
+public:
+    struct UndoConfiguration {
+        idx_t buffer_size_limit;
+        bool enable_compression;
+        bool enable_lazy_undo_creation;
+        idx_t max_undo_chain_length;
+        bool enable_bulk_undo_operations;
+    };
+
+private:
+    // Undo buffer storage
+    vector<unique_ptr<UndoSegment>> undo_segments;
+    shared_mutex undo_lock;
+    
+    // Memory management
+    atomic<idx_t> total_undo_size;
+    atomic<idx_t> buffer_size_limit;
+    
+    // Transaction mapping
+    unordered_map<transaction_t, vector<UndoChunkInfo>> transaction_undo_chunks;
+    UndoConfiguration config;
+    
+    // Optimization components
+    unique_ptr<UndoCompressor> undo_compressor;
+    unique_ptr<BulkUndoProcessor> bulk_processor;
+
+public:
+    UndoBufferManager(idx_t size_limit) : buffer_size_limit(size_limit) {
+        total_undo_size = 0;
+        
+        config.buffer_size_limit = size_limit;
+        config.enable_compression = true;
+        config.enable_lazy_undo_creation = true;
+        config.max_undo_chain_length = 1000;
+        config.enable_bulk_undo_operations = true;
+        
+        if (config.enable_compression) {
+            undo_compressor = make_unique<UndoCompressor>();
+        }
+        
+        if (config.enable_bulk_undo_operations) {
+            bulk_processor = make_unique<BulkUndoProcessor>();
+        }
+    }
+    
+    bool CreateUndoRecord(transaction_t transaction_id, const WriteOperation &write_op) {
+        // Check memory pressure
+        if (total_undo_size >= buffer_size_limit) {
+            if (!FreeUndoMemory()) {
+                return false; // Cannot create undo record
+            }
+        }
+        
+        // Create undo record based on operation type
+        auto undo_record = CreateUndoRecordForOperation(write_op);
+        
+        // Apply compression if enabled
+        if (config.enable_compression) {
+            undo_record = undo_compressor->CompressUndoRecord(move(undo_record));
+        }
+        
+        // Store undo record
+        return StoreUndoRecord(transaction_id, move(undo_record));
+    }
+    
+    bool CreateBulkUndoRecords(transaction_t transaction_id, 
+                             const vector<WriteOperation> &write_ops) {
+        if (config.enable_bulk_undo_operations && bulk_processor) {
+            return bulk_processor->CreateBulkUndoRecords(transaction_id, write_ops, *this);
+        } else {
+            // Fall back to individual record creation
+            for (const auto &write_op : write_ops) {
+                if (!CreateUndoRecord(transaction_id, write_op)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+    
+    bool ApplyUndoRecords(transaction_t transaction_id) {
+        unique_lock<shared_mutex> lock(undo_lock);
+        
+        auto it = transaction_undo_chunks.find(transaction_id);
+        if (it == transaction_undo_chunks.end()) {
+            return true; // No undo records for this transaction
+        }
+        
+        // Apply undo records in reverse order
+        auto &undo_chunks = it->second;
+        for (auto chunk_it = undo_chunks.rbegin(); chunk_it != undo_chunks.rend(); ++chunk_it) {
+            if (!ApplyUndoChunk(*chunk_it)) {
+                return false;
+            }
+        }
+        
+        // Clean up undo records
+        CleanupTransactionUndoRecords(transaction_id);
+        return true;
+    }
+    
+    void CleanupTransactionUndoRecords(transaction_t transaction_id) {
+        unique_lock<shared_mutex> lock(undo_lock);
+        
+        auto it = transaction_undo_chunks.find(transaction_id);
+        if (it != transaction_undo_chunks.end()) {
+            // Calculate freed memory
+            idx_t freed_size = 0;
+            for (const auto &chunk_info : it->second) {
+                freed_size += chunk_info.size;
+            }
+            
+            // Remove undo chunks and update memory usage
+            transaction_undo_chunks.erase(it);
+            total_undo_size -= freed_size;
+        }
+    }
+
+private:
+    unique_ptr<UndoRecord> CreateUndoRecordForOperation(const WriteOperation &write_op) {
+        auto undo_record = make_unique<UndoRecord>();
+        undo_record->operation_id = write_op.operation_id;
+        undo_record->table_id = write_op.table_id;
+        undo_record->row_id = write_op.row_id;
+        undo_record->timestamp = GetCurrentTimestamp();
+        
+        switch (write_op.type) {
+            case WriteOperationType::INSERT:
+                undo_record->undo_type = UndoType::DELETE_ROW;
+                // No data needed for insert undo (just delete the row)
+                break;
+                
+            case WriteOperationType::DELETE:
+                undo_record->undo_type = UndoType::INSERT_ROW;
+                undo_record->undo_data = write_op.old_data; // Restore deleted data
+                break;
+                
+            case WriteOperationType::UPDATE:
+                undo_record->undo_type = UndoType::UPDATE_ROW;
+                undo_record->undo_data = write_op.old_data; // Restore old values
+                undo_record->updated_columns = write_op.updated_columns;
+                break;
+        }
+        
+        return undo_record;
+    }
+    
+    bool StoreUndoRecord(transaction_t transaction_id, unique_ptr<UndoRecord> undo_record) {
+        unique_lock<shared_mutex> lock(undo_lock);
+        
+        // Find or create undo segment
+        auto undo_segment = GetAvailableUndoSegment(undo_record->GetSize());
+        if (!undo_segment) {
+            // Create new segment
+            undo_segment = CreateUndoSegment();
+            undo_segments.push_back(move(undo_segment));
+            undo_segment = undo_segments.back().get();
+        }
+        
+        // Store undo record in segment
+        auto chunk_info = undo_segment->StoreUndoRecord(move(undo_record));
+        
+        // Update transaction mapping
+        transaction_undo_chunks[transaction_id].push_back(chunk_info);
+        total_undo_size += chunk_info.size;
+        
+        return true;
+    }
+    
+    UndoSegment* GetAvailableUndoSegment(idx_t required_size) {
+        for (auto &segment : undo_segments) {
+            if (segment->HasSpace(required_size)) {
+                return segment.get();
+            }
+        }
+        return nullptr;
+    }
+    
+    unique_ptr<UndoSegment> CreateUndoSegment() {
+        static const idx_t UNDO_SEGMENT_SIZE = 1024 * 1024; // 1MB segments
+        return make_unique<UndoSegment>(UNDO_SEGMENT_SIZE);
+    }
+    
+    bool ApplyUndoChunk(const UndoChunkInfo &chunk_info) {
+        // Read undo records from segment
+        auto undo_records = ReadUndoChunk(chunk_info);
+        
+        // Apply each undo record
+        for (auto &undo_record : undo_records) {
+            if (!ApplyUndoRecord(*undo_record)) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    vector<unique_ptr<UndoRecord>> ReadUndoChunk(const UndoChunkInfo &chunk_info) {
+        auto segment = undo_segments[chunk_info.segment_index].get();
+        return segment->ReadUndoRecords(chunk_info.offset, chunk_info.size);
+    }
+    
+    bool ApplyUndoRecord(const UndoRecord &undo_record) {
+        switch (undo_record.undo_type) {
+            case UndoType::DELETE_ROW:
+                return DeleteRow(undo_record.table_id, undo_record.row_id);
+            case UndoType::INSERT_ROW:
+                return InsertRow(undo_record.table_id, undo_record.row_id, undo_record.undo_data);
+            case UndoType::UPDATE_ROW:
+                return UpdateRow(undo_record.table_id, undo_record.row_id, 
+                               undo_record.undo_data, undo_record.updated_columns);
+            default:
+                return false;
+        }
+    }
+    
+    bool FreeUndoMemory() {
+        // Try to free memory by cleaning up old committed transactions
+        // This is a simplified implementation
+        return total_undo_size < buffer_size_limit * 0.9; // Aim for 90% usage
+    }
+};
+
+class BulkUndoProcessor {
+public:
+    bool CreateBulkUndoRecords(transaction_t transaction_id, 
+                             const vector<WriteOperation> &write_ops,
+                             UndoBufferManager &undo_manager) {
+        // Group operations by type for efficient processing
+        auto grouped_operations = GroupOperationsByType(write_ops);
+        
+        // Process each group
+        for (const auto &[operation_type, operations] : grouped_operations) {
+            if (!ProcessOperationGroup(transaction_id, operation_type, operations, undo_manager)) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+
+private:
+    unordered_map<WriteOperationType, vector<WriteOperation>> 
+    GroupOperationsByType(const vector<WriteOperation> &write_ops) {
+        unordered_map<WriteOperationType, vector<WriteOperation>> grouped;
+        
+        for (const auto &write_op : write_ops) {
+            grouped[write_op.type].push_back(write_op);
+        }
+        
+        return grouped;
+    }
+    
+    bool ProcessOperationGroup(transaction_t transaction_id,
+                             WriteOperationType operation_type,
+                             const vector<WriteOperation> &operations,
+                             UndoBufferManager &undo_manager) {
+        switch (operation_type) {
+            case WriteOperationType::INSERT:
+                return ProcessBulkInsertUndo(transaction_id, operations, undo_manager);
+            case WriteOperationType::DELETE:
+                return ProcessBulkDeleteUndo(transaction_id, operations, undo_manager);
+            case WriteOperationType::UPDATE:
+                return ProcessBulkUpdateUndo(transaction_id, operations, undo_manager);
+            default:
+                return false;
+        }
+    }
+    
+    bool ProcessBulkInsertUndo(transaction_t transaction_id,
+                             const vector<WriteOperation> &inserts,
+                             UndoBufferManager &undo_manager) {
+        // For bulk inserts, create a single undo record with row ID ranges
+        auto bulk_undo_record = make_unique<BulkUndoRecord>();
+        bulk_undo_record->undo_type = UndoType::DELETE_ROW_RANGE;
+        bulk_undo_record->transaction_id = transaction_id;
+        
+        // Extract row ID ranges
+        for (const auto &insert_op : inserts) {
+            bulk_undo_record->row_ranges.push_back({insert_op.row_id, insert_op.row_id + 1});
+        }
+        
+        // Merge adjacent ranges for efficiency
+        MergeRowRanges(bulk_undo_record->row_ranges);
+        
+        return undo_manager.StoreBulkUndoRecord(transaction_id, move(bulk_undo_record));
+    }
+    
+    void MergeRowRanges(vector<std::pair<row_t, row_t>> &ranges) {
+        if (ranges.empty()) return;
+        
+        std::sort(ranges.begin(), ranges.end());
+        
+        vector<std::pair<row_t, row_t>> merged;
+        merged.push_back(ranges[0]);
+        
+        for (idx_t i = 1; i < ranges.size(); i++) {
+            if (ranges[i].first <= merged.back().second) {
+                // Merge ranges
+                merged.back().second = std::max(merged.back().second, ranges[i].second);
+            } else {
+                merged.push_back(ranges[i]);
+            }
+        }
+        
+        ranges = move(merged);
+    }
+};
+```
+
+This sophisticated MVCC implementation provides DuckDB with the ability to handle concurrent transactions efficiently while maintaining the consistency and isolation guarantees required for analytical workloads. The analytics-optimized design enables bulk operations and efficient version management for large datasets.
+
+---
+
+## 5.3 Write-Ahead Logging (WAL)
+
+### 5.3.1 WAL Architecture and Format
+
+**High-Performance WAL Implementation**
+DuckDB implements a sophisticated Write-Ahead Logging system optimized for analytical workloads, providing durability guarantees while minimizing performance overhead:
+
+```cpp
+class WriteAheadLog {
+public:
+    struct WALConfiguration {
+        string wal_file_path;
+        idx_t wal_buffer_size;
+        bool enable_group_commit;
+        idx_t group_commit_timeout_ms;
+        bool enable_compression;
+        bool enable_async_writes;
+        idx_t checkpoint_threshold_mb;
+        bool enable_wal_replay_optimization;
+    };
+
+private:
+    // WAL file management
+    unique_ptr<FileHandle> wal_file;
+    unique_ptr<WALBuffer> wal_buffer;
+    shared_mutex wal_lock;
+    
+    // Log sequence number tracking
+    atomic<lsn_t> current_lsn;
+    atomic<lsn_t> flushed_lsn;
+    atomic<lsn_t> checkpoint_lsn;
+    
+    // Configuration and optimization
+    WALConfiguration config;
+    unique_ptr<GroupCommitManager> group_commit_manager;
+    unique_ptr<WALCompressor> wal_compressor;
+    
+    // Recovery state
+    unique_ptr<WALRecoveryManager> recovery_manager;
+    bool is_recovering;
+
+public:
+    WriteAheadLog(WALConfiguration configuration) : config(configuration) {
+        current_lsn = 1;
+        flushed_lsn = 0;
+        checkpoint_lsn = 0;
+        is_recovering = false;
+        
+        // Initialize WAL file
+        wal_file = FileSystem::OpenFile(config.wal_file_path, 
+            FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_READ);
+        
+        // Initialize WAL buffer
+        wal_buffer = make_unique<WALBuffer>(config.wal_buffer_size);
+        
+        // Initialize optimization components
+        if (config.enable_group_commit) {
+            group_commit_manager = make_unique<GroupCommitManager>(config);
+        }
+        
+        if (config.enable_compression) {
+            wal_compressor = make_unique<WALCompressor>();
+        }
+        
+        recovery_manager = make_unique<WALRecoveryManager>(*this);
+    }
+    
+    lsn_t WriteCommitRecord(Transaction &transaction) {
+        auto commit_record = CreateCommitRecord(transaction);
+        return WriteLogRecord(move(commit_record));
+    }
+    
+    lsn_t WriteAbortRecord(Transaction &transaction) {
+        auto abort_record = CreateAbortRecord(transaction);
+        return WriteLogRecord(move(abort_record));
+    }
+    
+    lsn_t WriteBulkInsertRecord(table_id_t table_id, const DataChunk &data,
+                               const vector<row_t> &row_ids) {
+        auto bulk_insert_record = CreateBulkInsertRecord(table_id, data, row_ids);
+        return WriteLogRecord(move(bulk_insert_record));
+    }
+    
+    lsn_t WriteUpdateRecord(table_id_t table_id, row_t row_id, 
+                           const vector<column_t> &updated_columns,
+                           const DataChunk &old_data, const DataChunk &new_data) {
+        auto update_record = CreateUpdateRecord(table_id, row_id, updated_columns, old_data, new_data);
+        return WriteLogRecord(move(update_record));
+    }
+    
+    bool FlushWAL() {
+        unique_lock<shared_mutex> lock(wal_lock);
+        
+        // Flush buffer to disk
+        if (!wal_buffer->FlushToDisk(*wal_file)) {
+            return false;
+        }
+        
+        // Force sync to storage
+        if (!wal_file->Sync()) {
+            return false;
+        }
+        
+        // Update flushed LSN
+        flushed_lsn = current_lsn.load();
+        return true;
+    }
+    
+    bool Checkpoint(lsn_t checkpoint_target_lsn) {
+        // Ensure all data up to checkpoint LSN is flushed
+        if (flushed_lsn < checkpoint_target_lsn) {
+            if (!FlushWAL()) {
+                return false;
+            }
+        }
+        
+        // Write checkpoint record
+        auto checkpoint_record = CreateCheckpointRecord(checkpoint_target_lsn);
+        auto checkpoint_lsn_local = WriteLogRecord(move(checkpoint_record));
+        
+        // Update checkpoint LSN
+        checkpoint_lsn = checkpoint_lsn_local;
+        
+        return true;
+    }
+    
+    bool RecoverFromWAL() {
+        is_recovering = true;
+        
+        bool recovery_success = recovery_manager->PerformRecovery();
+        
+        is_recovering = false;
+        return recovery_success;
+    }
+
+private:
+    lsn_t WriteLogRecord(unique_ptr<WALRecord> record) {
+        // Assign LSN to record
+        auto record_lsn = current_lsn.fetch_add(1);
+        record->lsn = record_lsn;
+        record->timestamp = GetCurrentTimestamp();
+        
+        // Apply compression if enabled
+        if (config.enable_compression && wal_compressor) {
+            record = wal_compressor->CompressRecord(move(record));
+        }
+        
+        // Serialize record
+        auto serialized_record = SerializeWALRecord(*record);
+        
+        // Write to WAL buffer
+        if (config.enable_group_commit && group_commit_manager) {
+            group_commit_manager->AddRecord(move(serialized_record), record_lsn);
+        } else {
+            WriteToBuffer(serialized_record, record_lsn);
+        }
+        
+        return record_lsn;
+    }
+    
+    void WriteToBuffer(const vector<uint8_t> &data, lsn_t lsn) {
+        unique_lock<shared_mutex> lock(wal_lock);
+        
+        // Check if buffer has space
+        if (!wal_buffer->HasSpace(data.size())) {
+            // Flush buffer and try again
+            wal_buffer->FlushToDisk(*wal_file);
+        }
+        
+        // Write to buffer
+        wal_buffer->Write(data);
+        
+        // Check if immediate flush is needed
+        if (wal_buffer->ShouldFlush()) {
+            wal_buffer->FlushToDisk(*wal_file);
+            flushed_lsn = lsn;
+        }
+    }
+    
+    unique_ptr<WALRecord> CreateCommitRecord(Transaction &transaction) {
+        auto record = make_unique<WALCommitRecord>();
+        record->type = WALRecordType::COMMIT;
+        record->transaction_id = transaction.transaction_id;
+        record->commit_timestamp = transaction.commit_timestamp;
+        
+        // Include write set summary for recovery optimization
+        record->write_summary = CreateWriteSummary(transaction.write_set);
+        
+        return move(record);
+    }
+    
+    unique_ptr<WALRecord> CreateAbortRecord(Transaction &transaction) {
+        auto record = make_unique<WALAbortRecord>();
+        record->type = WALRecordType::ABORT;
+        record->transaction_id = transaction.transaction_id;
+        
+        return move(record);
+    }
+    
+    unique_ptr<WALRecord> CreateBulkInsertRecord(table_id_t table_id, 
+                                               const DataChunk &data,
+                                               const vector<row_t> &row_ids) {
+        auto record = make_unique<WALBulkInsertRecord>();
+        record->type = WALRecordType::BULK_INSERT;
+        record->table_id = table_id;
+        record->row_count = row_ids.size();
+        
+        // Compress data chunk for storage
+        record->compressed_data = CompressDataChunk(data);
+        record->row_id_ranges = CreateRowIdRanges(row_ids);
+        
+        return move(record);
+    }
+    
+    vector<uint8_t> SerializeWALRecord(const WALRecord &record) {
+        BinarySerializer serializer;
+        
+        // Write record header
+        serializer.Write<uint32_t>(WAL_RECORD_VERSION);
+        serializer.Write<uint32_t>(static_cast<uint32_t>(record.type));
+        serializer.Write<lsn_t>(record.lsn);
+        serializer.Write<timestamp_t>(record.timestamp);
+        
+        // Calculate and write record size (placeholder)
+        auto size_offset = serializer.GetPosition();
+        serializer.Write<uint32_t>(0);
+        
+        // Write record-specific data
+        SerializeRecordData(serializer, record);
+        
+        // Update record size
+        auto total_size = serializer.GetPosition() - size_offset - sizeof(uint32_t);
+        serializer.WriteAt<uint32_t>(size_offset, total_size);
+        
+        // Write checksum
+        auto data = serializer.GetData();
+        auto checksum = CalculateChecksum(data);
+        serializer.Write<uint32_t>(checksum);
+        
+        return serializer.GetData();
+    }
+    
+    static const uint32_t WAL_RECORD_VERSION = 1;
+};
+
+class GroupCommitManager {
+private:
+    WALConfiguration config;
+    
+    // Group commit state
+    vector<PendingCommit> pending_commits;
+    mutex pending_lock;
+    condition_variable commit_cv;
+    
+    // Background thread
+    unique_ptr<thread> commit_thread;
+    atomic<bool> stop_thread;
+
+public:
+    GroupCommitManager(WALConfiguration configuration) : config(configuration) {
+        stop_thread = false;
+        commit_thread = make_unique<thread>(&GroupCommitManager::CommitWorker, this);
+    }
+    
+    ~GroupCommitManager() {
+        stop_thread = true;
+        commit_cv.notify_all();
+        if (commit_thread && commit_thread->joinable()) {
+            commit_thread->join();
+        }
+    }
+    
+    void AddRecord(vector<uint8_t> data, lsn_t lsn) {
+        {
+            unique_lock<mutex> lock(pending_lock);
+            
+            PendingCommit commit;
+            commit.data = move(data);
+            commit.lsn = lsn;
+            commit.timestamp = GetCurrentTimestamp();
+            
+            pending_commits.push_back(move(commit));
+        }
+        
+        commit_cv.notify_one();
+    }
+
+private:
+    void CommitWorker() {
+        while (!stop_thread) {
+            unique_lock<mutex> lock(pending_lock);
+            
+            // Wait for commits or timeout
+            commit_cv.wait_for(lock, chrono::milliseconds(config.group_commit_timeout_ms),
+                [this] { return !pending_commits.empty() || stop_thread; });
+            
+            if (stop_thread) break;
+            
+            if (!pending_commits.empty()) {
+                // Process pending commits
+                vector<PendingCommit> commits_to_process;
+                commits_to_process.swap(pending_commits);
+                lock.unlock();
+                
+                ProcessCommitGroup(commits_to_process);
+            }
+        }
+    }
+    
+    void ProcessCommitGroup(const vector<PendingCommit> &commits) {
+        // Combine all commits into a single write operation
+        vector<uint8_t> combined_data;
+        
+        for (const auto &commit : commits) {
+            combined_data.insert(combined_data.end(), 
+                               commit.data.begin(), commit.data.end());
+        }
+        
+        // Write combined data to WAL
+        // This would involve calling the WAL's WriteToBuffer method
+        // Implementation details omitted for brevity
+    }
+    
+    struct PendingCommit {
+        vector<uint8_t> data;
+        lsn_t lsn;
+        timestamp_t timestamp;
+    };
+};
+```
+
+### 5.3.2 Recovery and Checkpointing
+
+**Robust Recovery Mechanisms**
+DuckDB implements comprehensive recovery procedures that ensure data consistency and minimize recovery time:
+
+```cpp
+class WALRecoveryManager {
+private:
+    WriteAheadLog &wal;
+    
+    // Recovery state
+    unordered_map<transaction_t, TransactionRecoveryState> recovery_transactions;
+    unordered_set<transaction_t> committed_transactions;
+    unordered_set<transaction_t> aborted_transactions;
+    
+    // Recovery optimization
+    unique_ptr<RecoveryOptimizer> recovery_optimizer;
+
+public:
+    WALRecoveryManager(WriteAheadLog &write_ahead_log) : wal(write_ahead_log) {
+        recovery_optimizer = make_unique<RecoveryOptimizer>();
+    }
+    
+    bool PerformRecovery() {
+        // Phase 1: Scan WAL to identify transaction boundaries
+        if (!ScanWALForTransactions()) {
+            return false;
+        }
+        
+        // Phase 2: Classify transactions (committed/aborted/incomplete)
+        ClassifyTransactions();
+        
+        // Phase 3: Redo committed transactions
+        if (!RedoCommittedTransactions()) {
+            return false;
+        }
+        
+        // Phase 4: Undo incomplete/aborted transactions
+        if (!UndoIncompleteTransactions()) {
+            return false;
+        }
+        
+        // Phase 5: Truncate WAL to remove processed records
+        TruncateWAL();
+        
+        return true;
+    }
+
+private:
+    bool ScanWALForTransactions() {
+        auto wal_scanner = CreateWALScanner();
+        
+        while (wal_scanner->HasMore()) {
+            auto record = wal_scanner->ReadNext();
+            if (!record) {
+                continue; // Skip corrupted records
+            }
+            
+            ProcessRecoveryRecord(*record);
+        }
+        
+        return true;
+    }
+    
+    void ProcessRecoveryRecord(const WALRecord &record) {
+        switch (record.type) {
+            case WALRecordType::COMMIT:
+                ProcessCommitRecord(static_cast<const WALCommitRecord&>(record));
+                break;
+            case WALRecordType::ABORT:
+                ProcessAbortRecord(static_cast<const WALAbortRecord&>(record));
+                break;
+            case WALRecordType::BULK_INSERT:
+                ProcessBulkInsertRecord(static_cast<const WALBulkInsertRecord&>(record));
+                break;
+            case WALRecordType::UPDATE:
+                ProcessUpdateRecord(static_cast<const WALUpdateRecord&>(record));
+                break;
+            case WALRecordType::DELETE:
+                ProcessDeleteRecord(static_cast<const WALDeleteRecord&>(record));
+                break;
+            case WALRecordType::CHECKPOINT:
+                ProcessCheckpointRecord(static_cast<const WALCheckpointRecord&>(record));
+                break;
+        }
+    }
+    
+    void ProcessCommitRecord(const WALCommitRecord &record) {
+        committed_transactions.insert(record.transaction_id);
+        
+        // Mark all operations of this transaction for redo
+        auto it = recovery_transactions.find(record.transaction_id);
+        if (it != recovery_transactions.end()) {
+            it->second.is_committed = true;
+            it->second.commit_lsn = record.lsn;
+        }
+    }
+    
+    void ProcessAbortRecord(const WALAbortRecord &record) {
+        aborted_transactions.insert(record.transaction_id);
+        
+        // Mark transaction as aborted
+        auto it = recovery_transactions.find(record.transaction_id);
+        if (it != recovery_transactions.end()) {
+            it->second.is_aborted = true;
+        }
+    }
+    
+    void ProcessBulkInsertRecord(const WALBulkInsertRecord &record) {
+        // Add to transaction's operation list
+        auto &tx_state = GetOrCreateTransactionState(record.transaction_id);
+        
+        RecoveryOperation op;
+        op.type = RecoveryOperationType::BULK_INSERT;
+        op.lsn = record.lsn;
+        op.table_id = record.table_id;
+        op.data = record.compressed_data;
+        op.row_ranges = record.row_id_ranges;
+        
+        tx_state.operations.push_back(op);
+    }
+    
+    void ClassifyTransactions() {
+        for (auto &[transaction_id, tx_state] : recovery_transactions) {
+            if (committed_transactions.count(transaction_id)) {
+                tx_state.classification = TransactionClassification::COMMITTED;
+            } else if (aborted_transactions.count(transaction_id)) {
+                tx_state.classification = TransactionClassification::ABORTED;
+            } else {
+                tx_state.classification = TransactionClassification::INCOMPLETE;
+            }
+        }
+    }
+    
+    bool RedoCommittedTransactions() {
+        // Sort transactions by commit order for proper replay
+        vector<transaction_t> commit_order;
+        
+        for (const auto &[transaction_id, tx_state] : recovery_transactions) {
+            if (tx_state.classification == TransactionClassification::COMMITTED) {
+                commit_order.push_back(transaction_id);
+            }
+        }
+        
+        std::sort(commit_order.begin(), commit_order.end(),
+            [this](transaction_t a, transaction_t b) {
+                return recovery_transactions[a].commit_lsn < recovery_transactions[b].commit_lsn;
+            });
+        
+        // Redo operations in order
+        for (auto transaction_id : commit_order) {
+            if (!RedoTransaction(transaction_id)) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    bool RedoTransaction(transaction_t transaction_id) {
+        auto &tx_state = recovery_transactions[transaction_id];
+        
+        // Sort operations by LSN
+        std::sort(tx_state.operations.begin(), tx_state.operations.end(),
+            [](const RecoveryOperation &a, const RecoveryOperation &b) {
+                return a.lsn < b.lsn;
+            });
+        
+        // Apply each operation
+        for (const auto &operation : tx_state.operations) {
+            if (!ApplyRecoveryOperation(operation)) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    bool ApplyRecoveryOperation(const RecoveryOperation &operation) {
+        switch (operation.type) {
+            case RecoveryOperationType::BULK_INSERT:
+                return ApplyBulkInsertRecovery(operation);
+            case RecoveryOperationType::UPDATE:
+                return ApplyUpdateRecovery(operation);
+            case RecoveryOperationType::DELETE:
+                return ApplyDeleteRecovery(operation);
+            default:
+                return false;
+        }
+    }
+    
+    bool ApplyBulkInsertRecovery(const RecoveryOperation &operation) {
+        // Decompress data
+        auto decompressed_data = DecompressDataChunk(operation.data);
+        
+        // Reconstruct row IDs from ranges
+        vector<row_t> row_ids;
+        for (const auto &range : operation.row_ranges) {
+            for (row_t row_id = range.first; row_id < range.second; row_id++) {
+                row_ids.push_back(row_id);
+            }
+        }
+        
+        // Apply insert to table
+        return InsertDataToTable(operation.table_id, *decompressed_data, row_ids);
+    }
+    
+    bool UndoIncompleteTransactions() {
+        for (const auto &[transaction_id, tx_state] : recovery_transactions) {
+            if (tx_state.classification == TransactionClassification::INCOMPLETE ||
+                tx_state.classification == TransactionClassification::ABORTED) {
+                
+                if (!UndoTransaction(transaction_id)) {
+                    return false;
+                }
+            }
+        }
+        
+        return true;
+    }
+    
+    bool UndoTransaction(transaction_t transaction_id) {
+        auto &tx_state = recovery_transactions[transaction_id];
+        
+        // Sort operations in reverse LSN order for undo
+        std::sort(tx_state.operations.begin(), tx_state.operations.end(),
+            [](const RecoveryOperation &a, const RecoveryOperation &b) {
+                return a.lsn > b.lsn;
+            });
+        
+        // Undo each operation
+        for (const auto &operation : tx_state.operations) {
+            if (!UndoRecoveryOperation(operation)) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    bool UndoRecoveryOperation(const RecoveryOperation &operation) {
+        switch (operation.type) {
+            case RecoveryOperationType::BULK_INSERT:
+                return UndoBulkInsertRecovery(operation);
+            case RecoveryOperationType::UPDATE:
+                return UndoUpdateRecovery(operation);
+            case RecoveryOperationType::DELETE:
+                return UndoDeleteRecovery(operation);
+            default:
+                return false;
+        }
+    }
+    
+    TransactionRecoveryState& GetOrCreateTransactionState(transaction_t transaction_id) {
+        auto it = recovery_transactions.find(transaction_id);
+        if (it != recovery_transactions.end()) {
+            return it->second;
+        }
+        
+        TransactionRecoveryState new_state;
+        new_state.transaction_id = transaction_id;
+        new_state.is_committed = false;
+        new_state.is_aborted = false;
+        new_state.classification = TransactionClassification::UNKNOWN;
+        
+        recovery_transactions[transaction_id] = new_state;
+        return recovery_transactions[transaction_id];
+    }
+    
+    void TruncateWAL() {
+        // Remove all processed WAL records up to the latest checkpoint
+        // This helps keep the WAL file size manageable
+        
+        auto checkpoint_lsn = wal.GetCheckpointLSN();
+        if (checkpoint_lsn > 0) {
+            wal.TruncateToLSN(checkpoint_lsn);
+        }
+    }
+    
+    enum class TransactionClassification {
+        UNKNOWN,
+        COMMITTED,
+        ABORTED,
+        INCOMPLETE
+    };
+    
+    struct TransactionRecoveryState {
+        transaction_t transaction_id;
+        bool is_committed;
+        bool is_aborted;
+        lsn_t commit_lsn;
+        TransactionClassification classification;
+        vector<RecoveryOperation> operations;
+    };
+    
+    struct RecoveryOperation {
+        RecoveryOperationType type;
+        lsn_t lsn;
+        table_id_t table_id;
+        vector<uint8_t> data;
+        vector<std::pair<row_t, row_t>> row_ranges;
+        vector<column_t> updated_columns;
+    };
+};
+
+class CheckpointManager {
+private:
+    WriteAheadLog &wal;
+    
+    // Checkpoint state
+    atomic<bool> checkpoint_in_progress;
+    atomic<lsn_t> last_checkpoint_lsn;
+    
+    // Background checkpointing
+    unique_ptr<thread> checkpoint_thread;
+    atomic<bool> stop_checkpointing;
+
+public:
+    CheckpointManager(WriteAheadLog &write_ahead_log) : wal(write_ahead_log) {
+        checkpoint_in_progress = false;
+        last_checkpoint_lsn = 0;
+        stop_checkpointing = false;
+        
+        // Start background checkpoint thread
+        checkpoint_thread = make_unique<thread>(&CheckpointManager::CheckpointWorker, this);
+    }
+    
+    ~CheckpointManager() {
+        stop_checkpointing = true;
+        if (checkpoint_thread && checkpoint_thread->joinable()) {
+            checkpoint_thread->join();
+        }
+    }
+    
+    bool TriggerCheckpoint() {
+        if (checkpoint_in_progress.exchange(true)) {
+            return false; // Checkpoint already in progress
+        }
+        
+        auto current_lsn = wal.GetCurrentLSN();
+        bool success = wal.Checkpoint(current_lsn);
+        
+        if (success) {
+            last_checkpoint_lsn = current_lsn;
+        }
+        
+        checkpoint_in_progress = false;
+        return success;
+    }
+
+private:
+    void CheckpointWorker() {
+        while (!stop_checkpointing) {
+            // Check if checkpoint is needed
+            if (ShouldCheckpoint()) {
+                TriggerCheckpoint();
+            }
+            
+            // Sleep for checkpoint interval
+            this_thread::sleep_for(chrono::seconds(30));
+        }
+    }
+    
+    bool ShouldCheckpoint() {
+        // Check WAL size
+        auto wal_size = wal.GetWALSize();
+        if (wal_size > wal.GetConfiguration().checkpoint_threshold_mb * 1024 * 1024) {
+            return true;
+        }
+        
+        // Check time since last checkpoint
+        auto time_since_checkpoint = GetTimeSinceLastCheckpoint();
+        if (time_since_checkpoint > chrono::minutes(10)) {
+            return true;
+        }
+        
+        return false;
+    }
+};
+```
+
+This comprehensive WAL implementation ensures DuckDB's durability guarantees while maintaining high performance for analytical workloads. The system's sophisticated recovery mechanisms and checkpoint management provide robust data protection with minimal operational overhead.
+
+---
+
+# Phase 6: Memory Management and Performance
+
+## 6.1 Memory Management Architecture
+
+### 6.1.1 Intelligent Memory Allocation Framework
+
+**Adaptive Memory Management for Analytics**
+DuckDB implements a sophisticated memory management system specifically designed for analytical workloads, providing intelligent allocation strategies, automatic memory pressure handling, and seamless streaming execution:
+
+```cpp
+class AnalyticalMemoryManager {
+public:
+    struct MemoryConfiguration {
+        idx_t max_memory_usage;
+        idx_t memory_limit_percentage;
+        bool enable_streaming_execution;
+        bool enable_memory_pressure_handling;
+        idx_t temporary_directory_size_limit;
+        bool enable_memory_tracking;
+        bool enable_numa_awareness;
+        double memory_pressure_threshold;
+    };
+
+private:
+    // Memory tracking and allocation
+    atomic<idx_t> current_memory_usage;
+    atomic<idx_t> peak_memory_usage;
+    atomic<idx_t> memory_limit;
+    
+    // Memory allocation tracking
+    unordered_map<void*, AllocationInfo> active_allocations;
+    shared_mutex allocation_lock;
+    
+    // Memory pressure handling
+    unique_ptr<MemoryPressureHandler> pressure_handler;
+    unique_ptr<StreamingExecutionManager> streaming_manager;
+    
+    // Configuration and optimization
+    MemoryConfiguration config;
+    unique_ptr<MemoryTracker> memory_tracker;
+    unique_ptr<NUMAManager> numa_manager;
+
+public:
+    AnalyticalMemoryManager(MemoryConfiguration configuration) : config(configuration) {
+        current_memory_usage = 0;
+        peak_memory_usage = 0;
+        memory_limit = config.max_memory_usage;
+        
+        // Initialize memory pressure handling
+        if (config.enable_memory_pressure_handling) {
+            pressure_handler = make_unique<MemoryPressureHandler>(config);
+        }
+        
+        // Initialize streaming execution support
+        if (config.enable_streaming_execution) {
+            streaming_manager = make_unique<StreamingExecutionManager>(config);
+        }
+        
+        // Initialize memory tracking
+        if (config.enable_memory_tracking) {
+            memory_tracker = make_unique<MemoryTracker>();
+        }
+        
+        // Initialize NUMA awareness
+        if (config.enable_numa_awareness) {
+            numa_manager = make_unique<NUMAManager>();
+        }
+    }
+    
+    void* AllocateMemory(idx_t size, MemoryTag tag = MemoryTag::GENERAL) {
+        // Check memory pressure before allocation
+        if (IsMemoryPressured() && pressure_handler) {
+            if (!pressure_handler->HandleMemoryPressure(size)) {
+                // Cannot free enough memory - use streaming execution
+                if (streaming_manager) {
+                    return streaming_manager->AllocateStreamingMemory(size, tag);
+                } else {
+                    throw OutOfMemoryException("Cannot allocate memory: " + to_string(size) + " bytes");
+                }
+            }
+        }
+        
+        // Select allocation strategy based on size and tag
+        void* ptr = nullptr;
+        if (numa_manager && ShouldUseNUMAAllocation(size, tag)) {
+            ptr = numa_manager->AllocateNUMAMemory(size, tag);
+        } else {
+            ptr = StandardAllocate(size, tag);
+        }
+        
+        if (ptr) {
+            RegisterAllocation(ptr, size, tag);
+        }
+        
+        return ptr;
+    }
+    
+    void DeallocateMemory(void* ptr) {
+        if (!ptr) return;
+        
+        unique_lock<shared_mutex> lock(allocation_lock);
+        
+        auto it = active_allocations.find(ptr);
+        if (it != active_allocations.end()) {
+            auto allocation_info = it->second;
+            active_allocations.erase(it);
+            
+            // Update memory usage
+            current_memory_usage -= allocation_info.size;
+            
+            // Deallocate based on allocation strategy
+            if (allocation_info.is_numa_allocated && numa_manager) {
+                numa_manager->DeallocateNUMAMemory(ptr, allocation_info.size);
+            } else {
+                StandardDeallocate(ptr, allocation_info.size);
+            }
+            
+            // Track deallocation
+            if (memory_tracker) {
+                memory_tracker->RecordDeallocation(allocation_info.size, allocation_info.tag);
+            }
+        }
+    }
+    
+    bool TryAllocateMemory(idx_t size, void** result, MemoryTag tag = MemoryTag::GENERAL) {
+        try {
+            *result = AllocateMemory(size, tag);
+            return *result != nullptr;
+        } catch (const OutOfMemoryException&) {
+            *result = nullptr;
+            return false;
+        }
+    }
+    
+    MemoryUsageInfo GetMemoryUsage() const {
+        MemoryUsageInfo info;
+        info.current_usage = current_memory_usage.load();
+        info.peak_usage = peak_memory_usage.load();
+        info.memory_limit = memory_limit.load();
+        info.allocation_count = GetAllocationCount();
+        
+        if (memory_tracker) {
+            info.detailed_usage = memory_tracker->GetDetailedUsage();
+        }
+        
+        return info;
+    }
+    
+    bool SetMemoryLimit(idx_t new_limit) {
+        auto current_usage = current_memory_usage.load();
+        
+        if (new_limit < current_usage) {
+            // Try to free memory to meet new limit
+            if (pressure_handler) {
+                auto memory_to_free = current_usage - new_limit;
+                if (!pressure_handler->HandleMemoryPressure(memory_to_free)) {
+                    return false; // Cannot meet new limit
+                }
+            } else {
+                return false; // Cannot reduce memory usage
+            }
+        }
+        
+        memory_limit = new_limit;
+        return true;
+    }
+
+private:
+    void RegisterAllocation(void* ptr, idx_t size, MemoryTag tag) {
+        unique_lock<shared_mutex> lock(allocation_lock);
+        
+        AllocationInfo info;
+        info.size = size;
+        info.tag = tag;
+        info.timestamp = GetCurrentTimestamp();
+        info.is_numa_allocated = numa_manager && numa_manager->IsNUMAAllocated(ptr);
+        
+        active_allocations[ptr] = info;
+        
+        // Update memory usage
+        current_memory_usage += size;
+        peak_memory_usage = std::max(peak_memory_usage.load(), current_memory_usage.load());
+        
+        // Track allocation
+        if (memory_tracker) {
+            memory_tracker->RecordAllocation(size, tag);
+        }
+    }
+    
+    bool IsMemoryPressured() const {
+        auto current_usage = current_memory_usage.load();
+        auto limit = memory_limit.load();
+        
+        double usage_ratio = static_cast<double>(current_usage) / limit;
+        return usage_ratio > config.memory_pressure_threshold;
+    }
+    
+    void* StandardAllocate(idx_t size, MemoryTag tag) {
+        // Use standard malloc with alignment optimization
+        void* ptr = nullptr;
+        
+        if (size >= LARGE_ALLOCATION_THRESHOLD) {
+            // Use aligned allocation for large blocks
+            ptr = aligned_alloc(CACHE_LINE_SIZE, AlignSize(size, CACHE_LINE_SIZE));
+        } else {
+            ptr = malloc(size);
+        }
+        
+        if (!ptr) {
+            throw OutOfMemoryException("Standard allocation failed: " + to_string(size) + " bytes");
+        }
+        
+        return ptr;
+    }
+    
+    void StandardDeallocate(void* ptr, idx_t size) {
+        free(ptr);
+    }
+    
+    bool ShouldUseNUMAAllocation(idx_t size, MemoryTag tag) const {
+        // Use NUMA allocation for large allocations and specific tags
+        return numa_manager && 
+               (size >= NUMA_ALLOCATION_THRESHOLD || 
+                tag == MemoryTag::HASH_TABLE || 
+                tag == MemoryTag::SORT_BUFFER);
+    }
+    
+    idx_t GetAllocationCount() const {
+        shared_lock<shared_mutex> lock(allocation_lock);
+        return active_allocations.size();
+    }
+    
+    struct AllocationInfo {
+        idx_t size;
+        MemoryTag tag;
+        timestamp_t timestamp;
+        bool is_numa_allocated;
+    };
+    
+    static const idx_t LARGE_ALLOCATION_THRESHOLD = 1024 * 1024; // 1MB
+    static const idx_t NUMA_ALLOCATION_THRESHOLD = 64 * 1024 * 1024; // 64MB
+    static const idx_t CACHE_LINE_SIZE = 64;
+};
+
+class MemoryPressureHandler {
+private:
+    AnalyticalMemoryManager::MemoryConfiguration config;
+    
+    // Pressure handling strategies
+    vector<unique_ptr<MemoryPressureStrategy>> strategies;
+    unique_ptr<MemoryReclamationManager> reclamation_manager;
+
+public:
+    MemoryPressureHandler(AnalyticalMemoryManager::MemoryConfiguration configuration) 
+        : config(configuration) {
+        
+        // Initialize pressure handling strategies
+        strategies.push_back(make_unique<BufferEvictionStrategy>());
+        strategies.push_back(make_unique<TemporaryDataSpillingStrategy>());
+        strategies.push_back(make_unique<CacheCleanupStrategy>());
+        
+        reclamation_manager = make_unique<MemoryReclamationManager>();
+    }
+    
+    bool HandleMemoryPressure(idx_t required_memory) {
+        idx_t freed_memory = 0;
+        
+        // Try each strategy in order of preference
+        for (auto &strategy : strategies) {
+            auto strategy_freed = strategy->FreeMemory(required_memory - freed_memory);
+            freed_memory += strategy_freed;
+            
+            if (freed_memory >= required_memory) {
+                return true;
+            }
+        }
+        
+        // If strategies didn't free enough, try aggressive reclamation
+        if (freed_memory < required_memory) {
+            auto additional_freed = reclamation_manager->AggressiveReclamation(
+                required_memory - freed_memory);
+            freed_memory += additional_freed;
+        }
+        
+        return freed_memory >= required_memory;
+    }
+};
+
+class StreamingExecutionManager {
+private:
+    AnalyticalMemoryManager::MemoryConfiguration config;
+    
+    // Streaming state
+    unordered_map<void*, StreamingAllocation> streaming_allocations;
+    shared_mutex streaming_lock;
+    
+    // Temporary storage
+    unique_ptr<TemporaryStorageManager> temp_storage;
+
+public:
+    StreamingExecutionManager(AnalyticalMemoryManager::MemoryConfiguration configuration) 
+        : config(configuration) {
+        
+        temp_storage = make_unique<TemporaryStorageManager>(
+            config.temporary_directory_size_limit);
+    }
+    
+    void* AllocateStreamingMemory(idx_t size, MemoryTag tag) {
+        // For streaming execution, allocate a smaller buffer and use temporary storage
+        auto buffer_size = CalculateStreamingBufferSize(size, tag);
+        
+        void* buffer = malloc(buffer_size);
+        if (!buffer) {
+            throw OutOfMemoryException("Cannot allocate streaming buffer");
+        }
+        
+        // Create temporary file for overflow data
+        auto temp_file = temp_storage->CreateTemporaryFile("streaming_" + to_string(tag));
+        
+        // Register streaming allocation
+        unique_lock<shared_mutex> lock(streaming_lock);
+        
+        StreamingAllocation allocation;
+        allocation.buffer = buffer;
+        allocation.buffer_size = buffer_size;
+        allocation.total_size = size;
+        allocation.temp_file = move(temp_file);
+        allocation.tag = tag;
+        
+        streaming_allocations[buffer] = move(allocation);
+        
+        return buffer;
+    }
+    
+    void DeallocateStreamingMemory(void* ptr) {
+        unique_lock<shared_mutex> lock(streaming_lock);
+        
+        auto it = streaming_allocations.find(ptr);
+        if (it != streaming_allocations.end()) {
+            auto &allocation = it->second;
+            
+            // Clean up temporary file
+            temp_storage->DeleteTemporaryFile(allocation.temp_file.get());
+            
+            // Free buffer
+            free(allocation.buffer);
+            
+            streaming_allocations.erase(it);
+        }
+    }
+
+private:
+    idx_t CalculateStreamingBufferSize(idx_t total_size, MemoryTag tag) {
+        // Calculate optimal buffer size for streaming
+        idx_t base_buffer_size = 64 * 1024; // 64KB base
+        
+        switch (tag) {
+            case MemoryTag::HASH_TABLE:
+                return std::min(total_size, base_buffer_size * 16); // Up to 1MB
+            case MemoryTag::SORT_BUFFER:
+                return std::min(total_size, base_buffer_size * 32); // Up to 2MB
+            case MemoryTag::AGGREGATE_BUFFER:
+                return std::min(total_size, base_buffer_size * 8);  // Up to 512KB
+            default:
+                return std::min(total_size, base_buffer_size);      // Up to 64KB
+        }
+    }
+    
+    struct StreamingAllocation {
+        void* buffer;
+        idx_t buffer_size;
+        idx_t total_size;
+        unique_ptr<TemporaryFile> temp_file;
+        MemoryTag tag;
+    };
+};
+```
+
+### 6.1.2 NUMA-Aware Memory Management
+
+**Optimized Memory Placement for Multi-Socket Systems**
+DuckDB implements NUMA-aware memory management to optimize performance on multi-socket systems by intelligently placing data close to processing threads:
+
+```cpp
+class NUMAManager {
+private:
+    // NUMA topology
+    vector<NUMANode> numa_nodes;
+    idx_t num_numa_nodes;
+    bool numa_available;
+    
+    // Thread-to-NUMA mapping
+    unordered_map<thread::id, idx_t> thread_numa_mapping;
+    shared_mutex numa_lock;
+    
+    // NUMA allocation tracking
+    unordered_map<void*, NUMAAllocationInfo> numa_allocations;
+
+public:
+    NUMAManager() {
+        numa_available = InitializeNUMA();
+        
+        if (numa_available) {
+            DetectNUMATopology();
+            SetupThreadNUMABindings();
+        }
+    }
+    
+    void* AllocateNUMAMemory(idx_t size, MemoryTag tag) {
+        if (!numa_available) {
+            return malloc(size);
+        }
+        
+        // Determine optimal NUMA node for allocation
+        auto numa_node = DetermineOptimalNUMANode(tag);
+        
+        // Allocate memory on specific NUMA node
+        void* ptr = numa_alloc_onnode(size, numa_node);
+        if (!ptr) {
+            // Fallback to any available NUMA node
+            ptr = numa_alloc(size);
+        }
+        
+        if (ptr) {
+            RegisterNUMAAllocation(ptr, size, numa_node, tag);
+        }
+        
+        return ptr;
+    }
+    
+    void DeallocateNUMAMemory(void* ptr, idx_t size) {
+        if (!numa_available) {
+            free(ptr);
+            return;
+        }
+        
+        {
+            unique_lock<shared_mutex> lock(numa_lock);
+            numa_allocations.erase(ptr);
+        }
+        
+        numa_free(ptr, size);
+    }
+    
+    bool IsNUMAAllocated(void* ptr) const {
+        if (!numa_available) return false;
+        
+        shared_lock<shared_mutex> lock(numa_lock);
+        return numa_allocations.find(ptr) != numa_allocations.end();
+    }
+    
+    void BindThreadToNUMA(thread::id thread_id, idx_t numa_node) {
+        if (!numa_available || numa_node >= num_numa_nodes) {
+            return;
+        }
+        
+        unique_lock<shared_mutex> lock(numa_lock);
+        thread_numa_mapping[thread_id] = numa_node;
+        
+        // Set thread affinity to NUMA node
+        SetThreadAffinity(thread_id, numa_node);
+    }
+    
+    NUMAStatistics GetNUMAStatistics() const {
+        NUMAStatistics stats;
+        stats.numa_available = numa_available;
+        stats.num_nodes = num_numa_nodes;
+        
+        if (numa_available) {
+            for (idx_t i = 0; i < num_numa_nodes; i++) {
+                NUMANodeStats node_stats;
+                node_stats.node_id = i;
+                node_stats.total_memory = GetNUMANodeMemory(i);
+                node_stats.free_memory = GetNUMANodeFreeMemory(i);
+                node_stats.allocated_bytes = GetNUMANodeAllocatedBytes(i);
+                
+                stats.node_stats.push_back(node_stats);
+            }
+        }
+        
+        return stats;
+    }
+
+private:
+    bool InitializeNUMA() {
+        // Check if NUMA is available on the system
+        return numa_available() != -1;
+    }
+    
+    void DetectNUMATopology() {
+        num_numa_nodes = numa_num_configured_nodes();
+        numa_nodes.resize(num_numa_nodes);
+        
+        for (idx_t i = 0; i < num_numa_nodes; i++) {
+            numa_nodes[i].node_id = i;
+            numa_nodes[i].cpu_mask = numa_allocate_cpumask();
+            numa_node_to_cpus(i, numa_nodes[i].cpu_mask);
+            numa_nodes[i].memory_size = GetNUMANodeMemory(i);
+        }
+    }
+    
+    void SetupThreadNUMABindings() {
+        // Distribute worker threads across NUMA nodes
+        auto num_threads = thread::hardware_concurrency();
+        
+        for (idx_t i = 0; i < num_threads; i++) {
+            auto numa_node = i % num_numa_nodes;
+            // Thread binding will be done when threads are created
+        }
+    }
+    
+    idx_t DetermineOptimalNUMANode(MemoryTag tag) const {
+        // Get current thread's NUMA node preference
+        auto current_thread = this_thread::get_id();
+        
+        shared_lock<shared_mutex> lock(numa_lock);
+        auto it = thread_numa_mapping.find(current_thread);
+        if (it != thread_numa_mapping.end()) {
+            return it->second;
+        }
+        
+        // Default to node 0 if no specific binding
+        return 0;
+    }
+    
+    void RegisterNUMAAllocation(void* ptr, idx_t size, idx_t numa_node, MemoryTag tag) {
+        unique_lock<shared_mutex> lock(numa_lock);
+        
+        NUMAAllocationInfo info;
+        info.size = size;
+        info.numa_node = numa_node;
+        info.tag = tag;
+        info.timestamp = GetCurrentTimestamp();
+        
+        numa_allocations[ptr] = info;
+    }
+    
+    void SetThreadAffinity(thread::id thread_id, idx_t numa_node) {
+        // Set CPU affinity for the thread to the specified NUMA node
+        if (numa_node < numa_nodes.size()) {
+            auto& node = numa_nodes[numa_node];
+            // Implementation would use platform-specific thread affinity APIs
+        }
+    }
+    
+    idx_t GetNUMANodeMemory(idx_t numa_node) const {
+        return numa_node_size(numa_node, nullptr);
+    }
+    
+    idx_t GetNUMANodeFreeMemory(idx_t numa_node) const {
+        // Get free memory for NUMA node
+        // Implementation would query system for free memory per node
+        return 0; // Placeholder
+    }
+    
+    idx_t GetNUMANodeAllocatedBytes(idx_t numa_node) const {
+        shared_lock<shared_mutex> lock(numa_lock);
+        
+        idx_t total_allocated = 0;
+        for (const auto& [ptr, info] : numa_allocations) {
+            if (info.numa_node == numa_node) {
+                total_allocated += info.size;
+            }
+        }
+        
+        return total_allocated;
+    }
+    
+    struct NUMANode {
+        idx_t node_id;
+        struct bitmask* cpu_mask;
+        idx_t memory_size;
+    };
+    
+    struct NUMAAllocationInfo {
+        idx_t size;
+        idx_t numa_node;
+        MemoryTag tag;
+        timestamp_t timestamp;
+    };
+};
+
+class TemporaryStorageManager {
+private:
+    idx_t storage_size_limit;
+    string temp_directory;
+    
+    // Temporary file management
+    vector<unique_ptr<TemporaryFile>> temp_files;
+    shared_mutex temp_files_lock;
+    atomic<idx_t> current_storage_usage;
+
+public:
+    TemporaryStorageManager(idx_t size_limit) : storage_size_limit(size_limit) {
+        temp_directory = GetTemporaryDirectory();
+        current_storage_usage = 0;
+    }
+    
+    unique_ptr<TemporaryFile> CreateTemporaryFile(const string& prefix) {
+        if (current_storage_usage >= storage_size_limit) {
+            CleanupOldTemporaryFiles();
+        }
+        
+        auto temp_file = make_unique<TemporaryFile>(temp_directory, prefix);
+        
+        unique_lock<shared_mutex> lock(temp_files_lock);
+        temp_files.push_back(temp_file.get());
+        
+        return temp_file;
+    }
+    
+    void DeleteTemporaryFile(TemporaryFile* file) {
+        if (!file) return;
+        
+        unique_lock<shared_mutex> lock(temp_files_lock);
+        
+        auto it = std::find_if(temp_files.begin(), temp_files.end(),
+            [file](const unique_ptr<TemporaryFile>& f) { return f.get() == file; });
+        
+        if (it != temp_files.end()) {
+            current_storage_usage -= (*it)->GetSize();
+            temp_files.erase(it);
+        }
+    }
+
+private:
+    void CleanupOldTemporaryFiles() {
+        unique_lock<shared_mutex> lock(temp_files_lock);
+        
+        // Remove oldest files first
+        std::sort(temp_files.begin(), temp_files.end(),
+            [](const unique_ptr<TemporaryFile>& a, const unique_ptr<TemporaryFile>& b) {
+                return a->GetCreationTime() < b->GetCreationTime();
+            });
+        
+        // Remove files until under limit
+        while (current_storage_usage >= storage_size_limit * 0.8 && !temp_files.empty()) {
+            auto& oldest_file = temp_files.front();
+            current_storage_usage -= oldest_file->GetSize();
+            temp_files.erase(temp_files.begin());
+        }
+    }
+    
+    string GetTemporaryDirectory() const {
+        // Get system temporary directory
+        auto temp_dir = getenv("TMPDIR");
+        if (!temp_dir) {
+            temp_dir = "/tmp";
+        }
+        return string(temp_dir) + "/duckdb_temp";
+    }
+};
+```
+
+This comprehensive memory management architecture enables DuckDB to efficiently handle large analytical workloads while maintaining optimal performance across diverse hardware configurations. The combination of intelligent allocation strategies, NUMA awareness, and streaming execution support ensures robust operation under varying memory constraints.
+
+---
+
+## 6.2 Parallel Processing
+
+### 6.2.1 Morsel-Driven Parallelism Framework
+
+**Advanced Work Distribution for Analytical Queries**
+DuckDB implements morsel-driven parallelism, a sophisticated approach that dynamically distributes work across threads while maintaining excellent load balancing and cache efficiency:
+
+```cpp
+class MorselDrivenExecutor {
+public:
+    struct ParallelConfiguration {
+        idx_t num_threads;
+        idx_t morsel_size;
+        bool enable_work_stealing;
+        bool enable_numa_awareness;
+        bool enable_adaptive_scheduling;
+        double load_balancing_threshold;
+        idx_t max_pipeline_depth;
+    };
+
+private:
+    // Thread pool and scheduling
+    unique_ptr<ThreadPool> thread_pool;
+    unique_ptr<WorkStealingScheduler> scheduler;
+    unique_ptr<PipelineManager> pipeline_manager;
+    
+    // Parallel execution state
+    ParallelConfiguration config;
+    unique_ptr<NUMAScheduler> numa_scheduler;
+    unique_ptr<LoadBalancer> load_balancer;
+    
+    // Performance monitoring
+    unique_ptr<ParallelExecutionMonitor> execution_monitor;
+
+public:
+    MorselDrivenExecutor(ParallelConfiguration configuration) : config(configuration) {
+        // Initialize thread pool
+        thread_pool = make_unique<ThreadPool>(config.num_threads);
+        
+        // Initialize work stealing scheduler
+        if (config.enable_work_stealing) {
+            scheduler = make_unique<WorkStealingScheduler>(config);
+        } else {
+            scheduler = make_unique<StaticScheduler>(config);
+        }
+        
+        // Initialize pipeline manager
+        pipeline_manager = make_unique<PipelineManager>(config);
+        
+        // Initialize NUMA-aware scheduling
+        if (config.enable_numa_awareness) {
+            numa_scheduler = make_unique<NUMAScheduler>(config);
+        }
+        
+        // Initialize load balancing
+        load_balancer = make_unique<LoadBalancer>(config);
+        
+        // Initialize performance monitoring
+        execution_monitor = make_unique<ParallelExecutionMonitor>();
+    }
+    
+    void ExecutePhysicalPlan(unique_ptr<PhysicalOperator> plan) {
+        // Build execution pipeline from physical plan
+        auto pipelines = pipeline_manager->BuildPipelines(move(plan));
+        
+        // Execute pipelines in parallel
+        ExecutePipelines(pipelines);
+    }
+    
+    void ExecutePipelines(const vector<unique_ptr<Pipeline>> &pipelines) {
+        // Start execution monitoring
+        execution_monitor->StartExecution();
+        
+        // Initialize parallel execution context
+        ParallelExecutionContext context;
+        context.num_threads = config.num_threads;
+        context.morsel_size = config.morsel_size;
+        
+        // Execute each pipeline
+        for (auto &pipeline : pipelines) {
+            ExecutePipeline(*pipeline, context);
+        }
+        
+        // Finalize execution
+        execution_monitor->EndExecution();
+    }
+
+private:
+    void ExecutePipeline(Pipeline &pipeline, ParallelExecutionContext &context) {
+        // Create morsel sources for the pipeline
+        auto morsel_sources = CreateMorselSources(pipeline);
+        
+        // Create execution tasks for each thread
+        vector<unique_ptr<PipelineTask>> tasks;
+        for (idx_t i = 0; i < config.num_threads; i++) {
+            auto task = make_unique<PipelineTask>(pipeline, morsel_sources, i, context);
+            tasks.push_back(move(task));
+        }
+        
+        // Submit tasks to thread pool
+        vector<future<void>> futures;
+        for (auto &task : tasks) {
+            auto future = thread_pool->SubmitTask([&task] { task->Execute(); });
+            futures.push_back(move(future));
+        }
+        
+        // Wait for all tasks to complete
+        for (auto &future : futures) {
+            future.wait();
+        }
+    }
+    
+    vector<unique_ptr<MorselSource>> CreateMorselSources(Pipeline &pipeline) {
+        vector<unique_ptr<MorselSource>> sources;
+        
+        // Create morsel sources for each table scan in the pipeline
+        auto scan_operators = pipeline.GetScanOperators();
+        
+        for (auto scan_op : scan_operators) {
+            auto table_scan = static_cast<PhysicalTableScan*>(scan_op);
+            auto morsel_source = CreateTableMorselSource(*table_scan);
+            sources.push_back(move(morsel_source));
+        }
+        
+        return sources;
+    }
+    
+    unique_ptr<MorselSource> CreateTableMorselSource(PhysicalTableScan &table_scan) {
+        auto table = table_scan.GetTable();
+        auto row_groups = table->GetRowGroups();
+        
+        // Create morsels from row groups
+        vector<unique_ptr<Morsel>> morsels;
+        
+        for (auto &row_group : row_groups) {
+            // Split large row groups into multiple morsels
+            auto row_group_morsels = SplitRowGroupIntoMorsels(*row_group, config.morsel_size);
+            
+            for (auto &morsel : row_group_morsels) {
+                morsels.push_back(move(morsel));
+            }
+        }
+        
+        return make_unique<TableMorselSource>(move(morsels));
+    }
+    
+    vector<unique_ptr<Morsel>> SplitRowGroupIntoMorsels(RowGroup &row_group, idx_t morsel_size) {
+        vector<unique_ptr<Morsel>> morsels;
+        
+        auto total_rows = row_group.GetRowCount();
+        idx_t current_offset = 0;
+        
+        while (current_offset < total_rows) {
+            auto morsel_rows = std::min(morsel_size, total_rows - current_offset);
+            
+            auto morsel = make_unique<TableMorsel>();
+            morsel->row_group = &row_group;
+            morsel->start_offset = current_offset;
+            morsel->row_count = morsel_rows;
+            
+            morsels.push_back(move(morsel));
+            current_offset += morsel_rows;
+        }
+        
+        return morsels;
+    }
+};
+
+class WorkStealingScheduler {
+private:
+    // Work queues for each thread
+    vector<unique_ptr<WorkQueue>> thread_queues;
+    vector<atomic<bool>> thread_active;
+    
+    // Global work coordination
+    atomic<idx_t> active_threads;
+    atomic<bool> shutdown_requested;
+    
+    // Configuration
+    MorselDrivenExecutor::ParallelConfiguration config;
+    
+    // Performance metrics
+    vector<atomic<idx_t>> steal_attempts;
+    vector<atomic<idx_t>> successful_steals;
+
+public:
+    WorkStealingScheduler(MorselDrivenExecutor::ParallelConfiguration configuration) 
+        : config(configuration) {
+        
+        // Initialize per-thread work queues
+        thread_queues.resize(config.num_threads);
+        thread_active.resize(config.num_threads);
+        steal_attempts.resize(config.num_threads);
+        successful_steals.resize(config.num_threads);
+        
+        for (idx_t i = 0; i < config.num_threads; i++) {
+            thread_queues[i] = make_unique<WorkQueue>();
+            thread_active[i] = false;
+            steal_attempts[i] = 0;
+            successful_steals[i] = 0;
+        }
+        
+        active_threads = 0;
+        shutdown_requested = false;
+    }
+    
+    unique_ptr<Morsel> GetNextMorsel(idx_t thread_id, MorselSource &source) {
+        // Try to get morsel from local queue first
+        auto morsel = GetLocalMorsel(thread_id, source);
+        if (morsel) {
+            return morsel;
+        }
+        
+        // If no local work, try work stealing
+        if (config.enable_work_stealing) {
+            morsel = AttemptWorkStealing(thread_id, source);
+            if (morsel) {
+                return morsel;
+            }
+        }
+        
+        // No work available
+        return nullptr;
+    }
+    
+    void AddMorsels(idx_t thread_id, vector<unique_ptr<Morsel>> morsels) {
+        auto &queue = *thread_queues[thread_id];
+        
+        for (auto &morsel : morsels) {
+            queue.Push(move(morsel));
+        }
+        
+        thread_active[thread_id] = true;
+        active_threads++;
+    }
+    
+    void ThreadFinished(idx_t thread_id) {
+        thread_active[thread_id] = false;
+        active_threads--;
+    }
+    
+    bool HasActiveWork() const {
+        return active_threads > 0 && !shutdown_requested;
+    }
+
+private:
+    unique_ptr<Morsel> GetLocalMorsel(idx_t thread_id, MorselSource &source) {
+        auto &queue = *thread_queues[thread_id];
+        
+        // First check local queue
+        auto morsel = queue.TryPop();
+        if (morsel) {
+            return morsel;
+        }
+        
+        // Try to get new morsels from source
+        auto new_morsels = source.GetMorsels(MORSEL_BATCH_SIZE);
+        if (!new_morsels.empty()) {
+            // Keep one morsel for immediate execution
+            morsel = move(new_morsels.back());
+            new_morsels.pop_back();
+            
+            // Add remaining morsels to local queue
+            for (auto &remaining_morsel : new_morsels) {
+                queue.Push(move(remaining_morsel));
+            }
+            
+            return morsel;
+        }
+        
+        return nullptr;
+    }
+    
+    unique_ptr<Morsel> AttemptWorkStealing(idx_t thread_id, MorselSource &source) {
+        steal_attempts[thread_id]++;
+        
+        // Try to steal from other threads
+        auto victim_thread = SelectVictimThread(thread_id);
+        if (victim_thread == INVALID_THREAD_ID) {
+            return nullptr;
+        }
+        
+        auto &victim_queue = *thread_queues[victim_thread];
+        auto stolen_morsel = victim_queue.TrySteal();
+        
+        if (stolen_morsel) {
+            successful_steals[thread_id]++;
+            return stolen_morsel;
+        }
+        
+        return nullptr;
+    }
+    
+    idx_t SelectVictimThread(idx_t thief_thread) {
+        // Use random victim selection with bias toward active threads
+        static thread_local random_device rd;
+        static thread_local mt19937 gen(rd());
+        
+        vector<idx_t> active_thread_candidates;
+        
+        for (idx_t i = 0; i < config.num_threads; i++) {
+            if (i != thief_thread && thread_active[i] && !thread_queues[i]->IsEmpty()) {
+                active_thread_candidates.push_back(i);
+            }
+        }
+        
+        if (active_thread_candidates.empty()) {
+            return INVALID_THREAD_ID;
+        }
+        
+        uniform_int_distribution<idx_t> dis(0, active_thread_candidates.size() - 1);
+        return active_thread_candidates[dis(gen)];
+    }
+    
+    static const idx_t MORSEL_BATCH_SIZE = 4;
+    static const idx_t INVALID_THREAD_ID = numeric_limits<idx_t>::max();
+};
+
+class PipelineTask {
+private:
+    Pipeline &pipeline;
+    vector<unique_ptr<MorselSource>> &morsel_sources;
+    idx_t thread_id;
+    ParallelExecutionContext &context;
+    
+    // Execution state
+    unique_ptr<ExecutionContext> execution_context;
+    unique_ptr<DataChunk> intermediate_chunk;
+
+public:
+    PipelineTask(Pipeline &pipe, vector<unique_ptr<MorselSource>> &sources, 
+                idx_t tid, ParallelExecutionContext &ctx)
+        : pipeline(pipe), morsel_sources(sources), thread_id(tid), context(ctx) {
+        
+        execution_context = make_unique<ExecutionContext>();
+        execution_context->thread_id = thread_id;
+        
+        intermediate_chunk = make_unique<DataChunk>();
+    }
+    
+    void Execute() {
+        // Initialize thread-local execution state
+        InitializeThreadExecution();
+        
+        try {
+            // Main execution loop
+            while (context.ShouldContinue()) {
+                bool processed_morsel = false;
+                
+                // Try to process a morsel from any source
+                for (auto &source : morsel_sources) {
+                    auto morsel = context.scheduler->GetNextMorsel(thread_id, *source);
+                    if (morsel) {
+                        ProcessMorsel(*morsel);
+                        processed_morsel = true;
+                        break;
+                    }
+                }
+                
+                if (!processed_morsel) {
+                    // No more work available
+                    break;
+                }
+            }
+        } catch (const exception &e) {
+            // Handle execution errors
+            context.SetError(e.what());
+        }
+        
+        // Cleanup thread execution
+        FinalizeThreadExecution();
+    }
+
+private:
+    void InitializeThreadExecution() {
+        // Initialize thread-local operators
+        pipeline.InitializeThread(*execution_context);
+        
+        // Set up intermediate data structures
+        intermediate_chunk->Initialize(pipeline.GetTypes());
+    }
+    
+    void ProcessMorsel(Morsel &morsel) {
+        // Reset chunk for new morsel
+        intermediate_chunk->Reset();
+        
+        // Execute pipeline on morsel
+        auto scan_operator = pipeline.GetSourceOperator();
+        scan_operator->GetChunk(*execution_context, *intermediate_chunk, morsel);
+        
+        // Process through pipeline operators
+        auto current_chunk = intermediate_chunk.get();
+        auto operators = pipeline.GetOperators();
+        
+        for (auto op : operators) {
+            if (current_chunk->size() == 0) {
+                break; // No data to process
+            }
+            
+            auto output_chunk = make_unique<DataChunk>();
+            output_chunk->Initialize(op->GetTypes());
+            
+            op->GetChunk(*execution_context, *output_chunk, *current_chunk);
+            
+            // Swap chunks for next iteration
+            swap(current_chunk, output_chunk.get());
+        }
+        
+        // Send final result to sink
+        if (current_chunk->size() > 0) {
+            auto sink = pipeline.GetSinkOperator();
+            if (sink) {
+                sink->Sink(*execution_context, *current_chunk);
+            }
+        }
+    }
+    
+    void FinalizeThreadExecution() {
+        // Finalize thread-local state in operators
+        pipeline.FinalizeThread(*execution_context);
+        
+        // Report thread completion
+        context.scheduler->ThreadFinished(thread_id);
+    }
+};
+```
+
+### 6.2.2 NUMA-Aware Parallel Scheduling
+
+**Optimized Thread Placement and Data Locality**
+DuckDB implements sophisticated NUMA-aware scheduling that optimizes thread placement and data locality for multi-socket systems:
+
+```cpp
+class NUMAScheduler {
+private:
+    // NUMA topology information
+    idx_t num_numa_nodes;
+    vector<NUMANode> numa_nodes;
+    
+    // Thread-to-NUMA assignments
+    vector<idx_t> thread_numa_assignments;
+    unordered_map<idx_t, vector<idx_t>> numa_thread_groups;
+    
+    // Load balancing across NUMA nodes
+    vector<atomic<idx_t>> numa_load_counters;
+    unique_ptr<LoadBalancer> numa_load_balancer;
+    
+    // Configuration
+    MorselDrivenExecutor::ParallelConfiguration config;
+
+public:
+    NUMAScheduler(MorselDrivenExecutor::ParallelConfiguration configuration) : config(configuration) {
+        InitializeNUMATopology();
+        AssignThreadsToNUMANodes();
+        InitializeLoadBalancing();
+    }
+    
+    void ScheduleMorsel(unique_ptr<Morsel> morsel, idx_t preferred_numa_node = INVALID_NUMA_NODE) {
+        // Determine optimal NUMA node for morsel execution
+        auto target_numa_node = DetermineOptimalNUMANode(*morsel, preferred_numa_node);
+        
+        // Get threads assigned to target NUMA node
+        auto &numa_threads = numa_thread_groups[target_numa_node];
+        
+        // Select least loaded thread from NUMA node
+        auto target_thread = SelectOptimalThread(numa_threads);
+        
+        // Schedule morsel on target thread
+        ScheduleMorselOnThread(move(morsel), target_thread);
+        
+        // Update load counters
+        numa_load_counters[target_numa_node]++;
+    }
+    
+    void OptimizeDataPlacement(DataChunk &chunk, idx_t numa_node) {
+        // Migrate data to optimal NUMA node if beneficial
+        if (ShouldMigrateData(chunk, numa_node)) {
+            MigrateChunkToNUMANode(chunk, numa_node);
+        }
+    }
+    
+    NUMAPerformanceStats GetNUMAPerformanceStats() const {
+        NUMAPerformanceStats stats;
+        stats.num_numa_nodes = num_numa_nodes;
+        
+        for (idx_t i = 0; i < num_numa_nodes; i++) {
+            NUMANodePerformance node_perf;
+            node_perf.numa_node = i;
+            node_perf.assigned_threads = numa_thread_groups.at(i).size();
+            node_perf.current_load = numa_load_counters[i].load();
+            node_perf.memory_bandwidth_utilization = GetMemoryBandwidthUtilization(i);
+            
+            stats.node_performance.push_back(node_perf);
+        }
+        
+        return stats;
+    }
+
+private:
+    void InitializeNUMATopology() {
+        num_numa_nodes = GetSystemNUMANodeCount();
+        numa_nodes.resize(num_numa_nodes);
+        numa_load_counters.resize(num_numa_nodes);
+        
+        for (idx_t i = 0; i < num_numa_nodes; i++) {
+            numa_nodes[i].node_id = i;
+            numa_nodes[i].memory_size = GetNUMANodeMemorySize(i);
+            numa_nodes[i].cpu_cores = GetNUMANodeCPUCores(i);
+            numa_load_counters[i] = 0;
+        }
+    }
+    
+    void AssignThreadsToNUMANodes() {
+        thread_numa_assignments.resize(config.num_threads);
+        
+        // Distribute threads evenly across NUMA nodes
+        for (idx_t thread_id = 0; thread_id < config.num_threads; thread_id++) {
+            auto numa_node = thread_id % num_numa_nodes;
+            thread_numa_assignments[thread_id] = numa_node;
+            numa_thread_groups[numa_node].push_back(thread_id);
+        }
+        
+        // Bind threads to NUMA nodes
+        for (idx_t thread_id = 0; thread_id < config.num_threads; thread_id++) {
+            BindThreadToNUMANode(thread_id, thread_numa_assignments[thread_id]);
+        }
+    }
+    
+    void InitializeLoadBalancing() {
+        numa_load_balancer = make_unique<LoadBalancer>(config);
+    }
+    
+    idx_t DetermineOptimalNUMANode(const Morsel &morsel, idx_t preferred_numa_node) {
+        // If preferred NUMA node is specified and valid, use it
+        if (preferred_numa_node != INVALID_NUMA_NODE && preferred_numa_node < num_numa_nodes) {
+            return preferred_numa_node;
+        }
+        
+        // Analyze morsel characteristics to determine optimal placement
+        auto data_location = AnalyzeMorselDataLocation(morsel);
+        if (data_location != INVALID_NUMA_NODE) {
+            return data_location;
+        }
+        
+        // Fall back to least loaded NUMA node
+        return GetLeastLoadedNUMANode();
+    }
+    
+    idx_t AnalyzeMorselDataLocation(const Morsel &morsel) {
+        // Check if morsel data is already located on a specific NUMA node
+        if (morsel.GetType() == MorselType::TABLE_MORSEL) {
+            auto table_morsel = static_cast<const TableMorsel&>(morsel);
+            return GetDataNUMALocation(table_morsel.row_group);
+        }
+        
+        return INVALID_NUMA_NODE;
+    }
+    
+    idx_t GetLeastLoadedNUMANode() const {
+        idx_t min_load = numeric_limits<idx_t>::max();
+        idx_t least_loaded_node = 0;
+        
+        for (idx_t i = 0; i < num_numa_nodes; i++) {
+            auto current_load = numa_load_counters[i].load();
+            if (current_load < min_load) {
+                min_load = current_load;
+                least_loaded_node = i;
+            }
+        }
+        
+        return least_loaded_node;
+    }
+    
+    idx_t SelectOptimalThread(const vector<idx_t> &numa_threads) {
+        // Select thread with least current workload
+        // This would integrate with the work stealing scheduler
+        
+        if (numa_threads.empty()) {
+            return 0; // Fallback
+        }
+        
+        // Simple round-robin for now
+        static atomic<idx_t> round_robin_counter{0};
+        auto index = round_robin_counter.fetch_add(1) % numa_threads.size();
+        return numa_threads[index];
+    }
+    
+    void ScheduleMorselOnThread(unique_ptr<Morsel> morsel, idx_t thread_id) {
+        // Add morsel to thread's work queue
+        // This would integrate with the work stealing scheduler
+        // Implementation depends on scheduler interface
+    }
+    
+    bool ShouldMigrateData(const DataChunk &chunk, idx_t target_numa_node) {
+        // Check if data migration would be beneficial
+        auto current_location = GetDataNUMALocation(&chunk);
+        
+        if (current_location == target_numa_node) {
+            return false; // Already optimally placed
+        }
+        
+        // Calculate migration cost vs benefit
+        auto migration_cost = EstimateDataMigrationCost(chunk, target_numa_node);
+        auto locality_benefit = EstimateLocalityBenefit(chunk, target_numa_node);
+        
+        return locality_benefit > migration_cost * MIGRATION_THRESHOLD;
+    }
+    
+    void MigrateChunkToNUMANode(DataChunk &chunk, idx_t numa_node) {
+        // Migrate chunk data to specific NUMA node
+        // This involves allocating new memory on target node and copying data
+        
+        for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
+            auto &vector = chunk.data[col];
+            MigrateVectorToNUMANode(vector, numa_node);
+        }
+    }
+    
+    void MigrateVectorToNUMANode(Vector &vector, idx_t numa_node) {
+        // Allocate new memory on target NUMA node
+        auto data_size = vector.GetSerializedSize();
+        void* new_data = AllocateNUMAMemory(data_size, numa_node);
+        
+        // Copy vector data to new location
+        memcpy(new_data, vector.GetData(), data_size);
+        
+        // Update vector to use new memory
+        vector.SetData(new_data);
+    }
+    
+    void BindThreadToNUMANode(idx_t thread_id, idx_t numa_node) {
+        // Set thread CPU affinity to NUMA node
+        // Implementation would use platform-specific APIs
+        // e.g., pthread_setaffinity_np on Linux
+    }
+    
+    double GetMemoryBandwidthUtilization(idx_t numa_node) const {
+        // Get memory bandwidth utilization for NUMA node
+        // Implementation would query system performance counters
+        return 0.0; // Placeholder
+    }
+    
+    struct NUMANode {
+        idx_t node_id;
+        idx_t memory_size;
+        vector<idx_t> cpu_cores;
+    };
+    
+    static const idx_t INVALID_NUMA_NODE = numeric_limits<idx_t>::max();
+    static const double MIGRATION_THRESHOLD = 1.5; // Migration must be 50% beneficial
+};
+
+class LoadBalancer {
+private:
+    // Load balancing state
+    vector<atomic<idx_t>> thread_loads;
+    vector<atomic<timestamp_t>> last_activity;
+    
+    // Dynamic load balancing
+    unique_ptr<WorkStealingController> work_stealing_controller;
+    unique_ptr<LoadMigrationManager> migration_manager;
+    
+    // Configuration
+    MorselDrivenExecutor::ParallelConfiguration config;
+
+public:
+    LoadBalancer(MorselDrivenExecutor::ParallelConfiguration configuration) : config(configuration) {
+        thread_loads.resize(config.num_threads);
+        last_activity.resize(config.num_threads);
+        
+        for (idx_t i = 0; i < config.num_threads; i++) {
+            thread_loads[i] = 0;
+            last_activity[i] = GetCurrentTimestamp();
+        }
+        
+        work_stealing_controller = make_unique<WorkStealingController>(config);
+        migration_manager = make_unique<LoadMigrationManager>(config);
+    }
+    
+    void ReportThreadActivity(idx_t thread_id, idx_t work_units_processed) {
+        thread_loads[thread_id] += work_units_processed;
+        last_activity[thread_id] = GetCurrentTimestamp();
+        
+        // Trigger load balancing if imbalance detected
+        if (DetectLoadImbalance()) {
+            TriggerLoadBalancing();
+        }
+    }
+    
+    bool DetectLoadImbalance() const {
+        // Calculate load distribution metrics
+        auto load_stats = CalculateLoadStatistics();
+        
+        // Check if load imbalance exceeds threshold
+        return load_stats.coefficient_of_variation > config.load_balancing_threshold;
+    }
+    
+    void TriggerLoadBalancing() {
+        // Identify overloaded and underloaded threads
+        auto load_analysis = AnalyzeThreadLoads();
+        
+        // Attempt work migration
+        for (auto &migration : load_analysis.recommended_migrations) {
+            migration_manager->MigrateWork(migration.source_thread, 
+                                         migration.target_thread, 
+                                         migration.work_amount);
+        }
+    }
+
+private:
+    LoadStatistics CalculateLoadStatistics() const {
+        LoadStatistics stats;
+        
+        vector<idx_t> loads;
+        for (idx_t i = 0; i < config.num_threads; i++) {
+            loads.push_back(thread_loads[i].load());
+        }
+        
+        // Calculate mean
+        stats.mean_load = accumulate(loads.begin(), loads.end(), 0.0) / loads.size();
+        
+        // Calculate variance
+        double variance = 0.0;
+        for (auto load : loads) {
+            variance += (load - stats.mean_load) * (load - stats.mean_load);
+        }
+        variance /= loads.size();
+        
+        // Calculate coefficient of variation
+        stats.standard_deviation = sqrt(variance);
+        stats.coefficient_of_variation = stats.standard_deviation / stats.mean_load;
+        
+        stats.min_load = *min_element(loads.begin(), loads.end());
+        stats.max_load = *max_element(loads.begin(), loads.end());
+        
+        return stats;
+    }
+    
+    LoadAnalysis AnalyzeThreadLoads() const {
+        LoadAnalysis analysis;
+        
+        auto load_stats = CalculateLoadStatistics();
+        
+        // Identify threads that need work migration
+        for (idx_t i = 0; i < config.num_threads; i++) {
+            auto thread_load = thread_loads[i].load();
+            
+            if (thread_load > load_stats.mean_load * 1.2) {
+                // Overloaded thread
+                analysis.overloaded_threads.push_back(i);
+            } else if (thread_load < load_stats.mean_load * 0.8) {
+                // Underloaded thread
+                analysis.underloaded_threads.push_back(i);
+            }
+        }
+        
+        // Generate migration recommendations
+        analysis.recommended_migrations = GenerateMigrationRecommendations(analysis);
+        
+        return analysis;
+    }
+    
+    vector<WorkMigration> GenerateMigrationRecommendations(const LoadAnalysis &analysis) const {
+        vector<WorkMigration> migrations;
+        
+        // Match overloaded threads with underloaded threads
+        auto overloaded_it = analysis.overloaded_threads.begin();
+        auto underloaded_it = analysis.underloaded_threads.begin();
+        
+        while (overloaded_it != analysis.overloaded_threads.end() && 
+               underloaded_it != analysis.underloaded_threads.end()) {
+            
+            WorkMigration migration;
+            migration.source_thread = *overloaded_it;
+            migration.target_thread = *underloaded_it;
+            migration.work_amount = CalculateOptimalMigrationAmount(*overloaded_it, *underloaded_it);
+            
+            migrations.push_back(migration);
+            
+            ++overloaded_it;
+            ++underloaded_it;
+        }
+        
+        return migrations;
+    }
+    
+    idx_t CalculateOptimalMigrationAmount(idx_t source_thread, idx_t target_thread) const {
+        auto source_load = thread_loads[source_thread].load();
+        auto target_load = thread_loads[target_thread].load();
+        
+        // Migrate enough work to balance the loads
+        auto load_difference = source_load - target_load;
+        return load_difference / 2; // Split the difference
+    }
+    
+    struct LoadStatistics {
+        double mean_load;
+        double standard_deviation;
+        double coefficient_of_variation;
+        idx_t min_load;
+        idx_t max_load;
+    };
+    
+    struct WorkMigration {
+        idx_t source_thread;
+        idx_t target_thread;
+        idx_t work_amount;
+    };
+    
+    struct LoadAnalysis {
+        vector<idx_t> overloaded_threads;
+        vector<idx_t> underloaded_threads;
+        vector<WorkMigration> recommended_migrations;
+    };
+};
+```
+
+This sophisticated parallel processing framework enables DuckDB to achieve exceptional performance on multi-core systems through intelligent work distribution, NUMA-aware scheduling, and dynamic load balancing. The morsel-driven approach ensures optimal cache utilization while the work stealing mechanism maintains excellent load balancing across diverse query workloads.
+
+---
