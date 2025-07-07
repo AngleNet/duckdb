@@ -14417,3 +14417,3179 @@ private:
 This sophisticated parallel processing framework enables DuckDB to achieve exceptional performance on multi-core systems through intelligent work distribution, NUMA-aware scheduling, and dynamic load balancing. The morsel-driven approach ensures optimal cache utilization while the work stealing mechanism maintains excellent load balancing across diverse query workloads.
 
 ---
+
+# Phase 7: Extension System and Ecosystem
+
+## 7.1 Extension Architecture
+
+### 7.1.1 Plugin System Design and Framework
+
+**Zero-Dependency Extension Architecture**
+DuckDB implements a sophisticated extension system that maintains the core principle of zero external dependencies while enabling rich functionality through modular extensions. The architecture provides a clean separation between core functionality and optional features:
+
+```cpp
+class ExtensionManager {
+public:
+    struct ExtensionConfiguration {
+        bool enable_auto_loading;
+        bool enable_signature_verification;
+        string extension_directory;
+        vector<string> trusted_extension_paths;
+        bool enable_remote_extensions;
+        string remote_extension_repository;
+        bool enable_extension_security_sandboxing;
+    };
+
+private:
+    // Extension registry and lifecycle management
+    unordered_map<string, unique_ptr<LoadedExtension>> loaded_extensions;
+    unordered_map<string, ExtensionMetadata> available_extensions;
+    shared_mutex extension_lock;
+    
+    // Extension loading and validation
+    unique_ptr<ExtensionLoader> extension_loader;
+    unique_ptr<ExtensionValidator> extension_validator;
+    unique_ptr<ExtensionSecurity> security_manager;
+    
+    // Configuration and state
+    ExtensionConfiguration config;
+    unique_ptr<ExtensionDependencyResolver> dependency_resolver;
+
+public:
+    ExtensionManager(ExtensionConfiguration configuration) : config(configuration) {
+        // Initialize extension loader
+        extension_loader = make_unique<ExtensionLoader>(config);
+        
+        // Initialize validation system
+        if (config.enable_signature_verification) {
+            extension_validator = make_unique<ExtensionValidator>(config);
+        }
+        
+        // Initialize security management
+        if (config.enable_extension_security_sandboxing) {
+            security_manager = make_unique<ExtensionSecurity>(config);
+        }
+        
+        // Initialize dependency resolution
+        dependency_resolver = make_unique<ExtensionDependencyResolver>();
+        
+        // Discover available extensions
+        DiscoverExtensions();
+    }
+    
+    bool LoadExtension(const string &extension_name, bool force_reload = false) {
+        unique_lock<shared_mutex> lock(extension_lock);
+        
+        // Check if extension is already loaded
+        if (!force_reload && IsExtensionLoaded(extension_name)) {
+            return true;
+        }
+        
+        // Resolve extension dependencies
+        auto dependency_chain = dependency_resolver->ResolveDependencies(extension_name);
+        
+        // Load dependencies first
+        for (const auto &dependency : dependency_chain) {
+            if (!LoadExtensionInternal(dependency)) {
+                return false;
+            }
+        }
+        
+        // Load the main extension
+        return LoadExtensionInternal(extension_name);
+    }
+    
+    bool UnloadExtension(const string &extension_name) {
+        unique_lock<shared_mutex> lock(extension_lock);
+        
+        auto it = loaded_extensions.find(extension_name);
+        if (it == loaded_extensions.end()) {
+            return false; // Extension not loaded
+        }
+        
+        // Check for dependent extensions
+        if (HasDependentExtensions(extension_name)) {
+            return false; // Cannot unload extension with active dependents
+        }
+        
+        // Cleanup extension state
+        it->second->Cleanup();
+        
+        // Remove from loaded extensions
+        loaded_extensions.erase(it);
+        
+        return true;
+    }
+    
+    vector<ExtensionInfo> GetLoadedExtensions() const {
+        shared_lock<shared_mutex> lock(extension_lock);
+        
+        vector<ExtensionInfo> extensions;
+        for (const auto &[name, extension] : loaded_extensions) {
+            ExtensionInfo info;
+            info.name = name;
+            info.version = extension->GetVersion();
+            info.description = extension->GetDescription();
+            info.author = extension->GetAuthor();
+            info.load_time = extension->GetLoadTime();
+            info.is_core_extension = extension->IsCoreExtension();
+            
+            extensions.push_back(info);
+        }
+        
+        return extensions;
+    }
+    
+    bool RegisterFunction(const string &extension_name, unique_ptr<ScalarFunction> function) {
+        auto extension = GetLoadedExtension(extension_name);
+        if (!extension) {
+            return false;
+        }
+        
+        // Register function with the catalog
+        return extension->RegisterFunction(move(function));
+    }
+    
+    bool RegisterTableFunction(const string &extension_name, unique_ptr<TableFunction> function) {
+        auto extension = GetLoadedExtension(extension_name);
+        if (!extension) {
+            return false;
+        }
+        
+        return extension->RegisterTableFunction(move(function));
+    }
+
+private:
+    bool LoadExtensionInternal(const string &extension_name) {
+        // Check if extension metadata exists
+        auto metadata_it = available_extensions.find(extension_name);
+        if (metadata_it == available_extensions.end()) {
+            return false;
+        }
+        
+        auto &metadata = metadata_it->second;
+        
+        // Validate extension before loading
+        if (extension_validator && !extension_validator->ValidateExtension(metadata)) {
+            return false;
+        }
+        
+        // Load extension binary
+        auto extension_handle = extension_loader->LoadExtensionBinary(metadata.library_path);
+        if (!extension_handle) {
+            return false;
+        }
+        
+        // Create extension instance
+        auto extension = CreateExtensionInstance(*extension_handle, metadata);
+        if (!extension) {
+            return false;
+        }
+        
+        // Initialize extension
+        if (!extension->Initialize()) {
+            return false;
+        }
+        
+        // Apply security policies
+        if (security_manager) {
+            security_manager->ApplySecurityPolicy(*extension);
+        }
+        
+        // Register extension
+        loaded_extensions[extension_name] = move(extension);
+        
+        return true;
+    }
+    
+    void DiscoverExtensions() {
+        // Discover extensions in standard directories
+        auto discovery_paths = GetExtensionDiscoveryPaths();
+        
+        for (const auto &path : discovery_paths) {
+            DiscoverExtensionsInDirectory(path);
+        }
+        
+        // Discover remote extensions if enabled
+        if (config.enable_remote_extensions) {
+            DiscoverRemoteExtensions();
+        }
+    }
+    
+    void DiscoverExtensionsInDirectory(const string &directory_path) {
+        // Scan directory for extension files
+        auto extension_files = FileSystem::ListFiles(directory_path, ".duckdb_extension");
+        
+        for (const auto &file_path : extension_files) {
+            auto metadata = ParseExtensionMetadata(file_path);
+            if (metadata.is_valid) {
+                available_extensions[metadata.name] = metadata;
+            }
+        }
+    }
+    
+    ExtensionMetadata ParseExtensionMetadata(const string &file_path) {
+        ExtensionMetadata metadata;
+        
+        try {
+            // Read extension metadata from file header
+            auto file_handle = FileSystem::OpenFile(file_path, FileFlags::FILE_FLAGS_READ);
+            
+            // Read magic number and version
+            uint32_t magic_number;
+            file_handle->Read(&magic_number, sizeof(magic_number));
+            
+            if (magic_number != DUCKDB_EXTENSION_MAGIC) {
+                metadata.is_valid = false;
+                return metadata;
+            }
+            
+            // Read extension metadata
+            metadata.name = ReadStringFromFile(*file_handle);
+            metadata.version = ReadStringFromFile(*file_handle);
+            metadata.description = ReadStringFromFile(*file_handle);
+            metadata.author = ReadStringFromFile(*file_handle);
+            metadata.duckdb_version = ReadStringFromFile(*file_handle);
+            metadata.library_path = file_path;
+            metadata.is_valid = true;
+            
+            // Read dependencies
+            uint32_t dependency_count;
+            file_handle->Read(&dependency_count, sizeof(dependency_count));
+            
+            for (uint32_t i = 0; i < dependency_count; i++) {
+                auto dependency = ReadStringFromFile(*file_handle);
+                metadata.dependencies.push_back(dependency);
+            }
+            
+        } catch (const exception &e) {
+            metadata.is_valid = false;
+        }
+        
+        return metadata;
+    }
+    
+    vector<string> GetExtensionDiscoveryPaths() const {
+        vector<string> paths;
+        
+        // Standard extension directory
+        paths.push_back(config.extension_directory);
+        
+        // Trusted extension paths
+        for (const auto &trusted_path : config.trusted_extension_paths) {
+            paths.push_back(trusted_path);
+        }
+        
+        // System extension directories
+        paths.push_back(GetSystemExtensionDirectory());
+        
+        return paths;
+    }
+    
+    unique_ptr<LoadedExtension> CreateExtensionInstance(ExtensionHandle &handle, 
+                                                       const ExtensionMetadata &metadata) {
+        // Get extension entry point
+        auto init_function = extension_loader->GetExtensionFunction<ExtensionInitFunction>(
+            handle, "duckdb_extension_init");
+        
+        if (!init_function) {
+            return nullptr;
+        }
+        
+        // Create extension instance
+        auto extension = make_unique<LoadedExtension>(metadata, handle);
+        
+        // Call extension initialization function
+        ExtensionInitInfo init_info;
+        init_info.duckdb_version = DUCKDB_VERSION;
+        init_info.extension_api_version = EXTENSION_API_VERSION;
+        
+        if (!init_function(init_info)) {
+            return nullptr;
+        }
+        
+        return extension;
+    }
+    
+    static const uint32_t DUCKDB_EXTENSION_MAGIC = 0x44554358; // "DUCX"
+    static const string EXTENSION_API_VERSION = "1.0.0";
+};
+
+class LoadedExtension {
+private:
+    ExtensionMetadata metadata;
+    ExtensionHandle library_handle;
+    
+    // Extension state
+    bool is_initialized;
+    timestamp_t load_time;
+    
+    // Registered components
+    vector<unique_ptr<ScalarFunction>> registered_functions;
+    vector<unique_ptr<TableFunction>> registered_table_functions;
+    vector<unique_ptr<AggregateFunction>> registered_aggregate_functions;
+    
+    // Extension API interface
+    unique_ptr<ExtensionAPI> extension_api;
+
+public:
+    LoadedExtension(const ExtensionMetadata &meta, ExtensionHandle &handle)
+        : metadata(meta), library_handle(move(handle)) {
+        is_initialized = false;
+        load_time = GetCurrentTimestamp();
+        extension_api = make_unique<ExtensionAPI>(*this);
+    }
+    
+    bool Initialize() {
+        if (is_initialized) {
+            return true;
+        }
+        
+        try {
+            // Get extension initialization function
+            auto setup_function = GetExtensionFunction<ExtensionSetupFunction>("duckdb_extension_setup");
+            if (setup_function) {
+                setup_function(*extension_api);
+            }
+            
+            is_initialized = true;
+            return true;
+        } catch (const exception &e) {
+            return false;
+        }
+    }
+    
+    void Cleanup() {
+        if (!is_initialized) {
+            return;
+        }
+        
+        // Call extension cleanup function if available
+        auto cleanup_function = GetExtensionFunction<ExtensionCleanupFunction>("duckdb_extension_cleanup");
+        if (cleanup_function) {
+            cleanup_function();
+        }
+        
+        // Clear registered components
+        registered_functions.clear();
+        registered_table_functions.clear();
+        registered_aggregate_functions.clear();
+        
+        is_initialized = false;
+    }
+    
+    bool RegisterFunction(unique_ptr<ScalarFunction> function) {
+        if (!is_initialized) {
+            return false;
+        }
+        
+        // Register function with DuckDB catalog
+        auto catalog = Catalog::GetCatalog();
+        catalog->CreateFunction(DEFAULT_SCHEMA, function.get());
+        
+        // Track registered function
+        registered_functions.push_back(move(function));
+        return true;
+    }
+    
+    template<typename T>
+    T GetExtensionFunction(const string &function_name) {
+        return reinterpret_cast<T>(library_handle.GetSymbol(function_name));
+    }
+    
+    string GetName() const { return metadata.name; }
+    string GetVersion() const { return metadata.version; }
+    string GetDescription() const { return metadata.description; }
+    string GetAuthor() const { return metadata.author; }
+    timestamp_t GetLoadTime() const { return load_time; }
+    bool IsCoreExtension() const { return metadata.is_core_extension; }
+};
+```
+
+### 7.1.2 Dynamic Loading and Security Framework
+
+**Secure Extension Loading with Validation**
+DuckDB implements comprehensive security measures for extension loading, including signature verification, sandboxing, and permission management:
+
+```cpp
+class ExtensionSecurity {
+public:
+    struct SecurityPolicy {
+        bool require_signature_verification;
+        bool enable_capability_restrictions;
+        bool enable_resource_limits;
+        bool enable_network_restrictions;
+        vector<string> allowed_file_paths;
+        vector<string> allowed_network_domains;
+        MemoryLimit memory_limit;
+        CPULimit cpu_limit;
+    };
+
+private:
+    SecurityPolicy default_policy;
+    unordered_map<string, SecurityPolicy> extension_policies;
+    unique_ptr<ExtensionSandbox> sandbox;
+    unique_ptr<SignatureValidator> signature_validator;
+
+public:
+    ExtensionSecurity(ExtensionManager::ExtensionConfiguration config) {
+        // Initialize default security policy
+        default_policy.require_signature_verification = config.enable_signature_verification;
+        default_policy.enable_capability_restrictions = true;
+        default_policy.enable_resource_limits = true;
+        default_policy.enable_network_restrictions = true;
+        
+        // Initialize signature validation
+        if (config.enable_signature_verification) {
+            signature_validator = make_unique<SignatureValidator>();
+        }
+        
+        // Initialize sandboxing
+        if (config.enable_extension_security_sandboxing) {
+            sandbox = make_unique<ExtensionSandbox>();
+        }
+    }
+    
+    bool ValidateExtensionSecurity(const ExtensionMetadata &metadata) {
+        // Get security policy for extension
+        auto policy = GetSecurityPolicy(metadata.name);
+        
+        // Validate signature if required
+        if (policy.require_signature_verification && signature_validator) {
+            if (!signature_validator->ValidateSignature(metadata)) {
+                return false;
+            }
+        }
+        
+        // Validate extension capabilities
+        if (policy.enable_capability_restrictions) {
+            if (!ValidateCapabilities(metadata, policy)) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    void ApplySecurityPolicy(LoadedExtension &extension) {
+        auto policy = GetSecurityPolicy(extension.GetName());
+        
+        // Apply sandboxing if enabled
+        if (sandbox && policy.enable_capability_restrictions) {
+            sandbox->ApplySandbox(extension, policy);
+        }
+        
+        // Set resource limits
+        if (policy.enable_resource_limits) {
+            ApplyResourceLimits(extension, policy);
+        }
+    }
+
+private:
+    SecurityPolicy GetSecurityPolicy(const string &extension_name) {
+        auto it = extension_policies.find(extension_name);
+        if (it != extension_policies.end()) {
+            return it->second;
+        }
+        return default_policy;
+    }
+    
+    bool ValidateCapabilities(const ExtensionMetadata &metadata, const SecurityPolicy &policy) {
+        // Parse extension manifest for capability requirements
+        auto capabilities = ParseExtensionCapabilities(metadata);
+        
+        // Validate each capability against policy
+        for (const auto &capability : capabilities) {
+            if (!IsCapabilityAllowed(capability, policy)) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    vector<ExtensionCapability> ParseExtensionCapabilities(const ExtensionMetadata &metadata) {
+        vector<ExtensionCapability> capabilities;
+        
+        // Parse capabilities from extension metadata
+        // This would be implementation-specific based on extension format
+        
+        return capabilities;
+    }
+    
+    bool IsCapabilityAllowed(const ExtensionCapability &capability, const SecurityPolicy &policy) {
+        switch (capability.type) {
+            case CapabilityType::FILE_SYSTEM_ACCESS:
+                return IsFileSystemAccessAllowed(capability.resource, policy);
+            case CapabilityType::NETWORK_ACCESS:
+                return IsNetworkAccessAllowed(capability.resource, policy);
+            case CapabilityType::SYSTEM_CALL:
+                return IsSystemCallAllowed(capability.resource, policy);
+            default:
+                return false; // Unknown capability - deny by default
+        }
+    }
+    
+    bool IsFileSystemAccessAllowed(const string &path, const SecurityPolicy &policy) {
+        // Check if path is in allowed file paths
+        for (const auto &allowed_path : policy.allowed_file_paths) {
+            if (path.starts_with(allowed_path)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    void ApplyResourceLimits(LoadedExtension &extension, const SecurityPolicy &policy) {
+        if (policy.memory_limit.enabled) {
+            extension.SetMemoryLimit(policy.memory_limit.max_bytes);
+        }
+        
+        if (policy.cpu_limit.enabled) {
+            extension.SetCPULimit(policy.cpu_limit.max_cpu_time_ms);
+        }
+    }
+};
+
+class ExtensionLoader {
+private:
+    ExtensionManager::ExtensionConfiguration config;
+    unordered_map<string, unique_ptr<ExtensionHandle>> loaded_handles;
+
+public:
+    ExtensionLoader(ExtensionManager::ExtensionConfiguration configuration) : config(configuration) {}
+    
+    unique_ptr<ExtensionHandle> LoadExtensionBinary(const string &library_path) {
+        // Check if library is already loaded
+        auto it = loaded_handles.find(library_path);
+        if (it != loaded_handles.end()) {
+            return make_unique<ExtensionHandle>(*it->second);
+        }
+        
+        // Load shared library
+        auto handle = LoadSharedLibrary(library_path);
+        if (!handle) {
+            return nullptr;
+        }
+        
+        // Validate extension binary
+        if (!ValidateExtensionBinary(*handle)) {
+            UnloadSharedLibrary(*handle);
+            return nullptr;
+        }
+        
+        // Cache loaded handle
+        loaded_handles[library_path] = make_unique<ExtensionHandle>(*handle);
+        
+        return handle;
+    }
+
+private:
+    unique_ptr<ExtensionHandle> LoadSharedLibrary(const string &library_path) {
+        auto handle = make_unique<ExtensionHandle>();
+        
+#ifdef _WIN32
+        handle->native_handle = LoadLibraryA(library_path.c_str());
+        if (!handle->native_handle) {
+            return nullptr;
+        }
+#else
+        handle->native_handle = dlopen(library_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
+        if (!handle->native_handle) {
+            return nullptr;
+        }
+#endif
+        
+        handle->library_path = library_path;
+        return handle;
+    }
+    
+    bool ValidateExtensionBinary(ExtensionHandle &handle) {
+        // Check for required symbols
+        auto version_function = handle.GetSymbol("duckdb_extension_version");
+        if (!version_function) {
+            return false;
+        }
+        
+        auto init_function = handle.GetSymbol("duckdb_extension_init");
+        if (!init_function) {
+            return false;
+        }
+        
+        // Validate extension version compatibility
+        auto get_version = reinterpret_cast<ExtensionVersionFunction>(version_function);
+        auto extension_version = get_version();
+        
+        if (!IsVersionCompatible(extension_version, DUCKDB_VERSION)) {
+            return false;
+        }
+        
+        return true;
+    }
+    
+    void UnloadSharedLibrary(ExtensionHandle &handle) {
+#ifdef _WIN32
+        if (handle.native_handle) {
+            FreeLibrary(static_cast<HMODULE>(handle.native_handle));
+        }
+#else
+        if (handle.native_handle) {
+            dlclose(handle.native_handle);
+        }
+#endif
+        handle.native_handle = nullptr;
+    }
+    
+    bool IsVersionCompatible(const string &extension_version, const string &duckdb_version) {
+        // Implement semantic version compatibility checking
+        // Major version must match, minor version must be <= DuckDB version
+        
+        auto ext_major = GetMajorVersion(extension_version);
+        auto ext_minor = GetMinorVersion(extension_version);
+        auto db_major = GetMajorVersion(duckdb_version);
+        auto db_minor = GetMinorVersion(duckdb_version);
+        
+        return (ext_major == db_major) && (ext_minor <= db_minor);
+    }
+};
+
+class ExtensionAPI {
+private:
+    LoadedExtension &extension;
+    
+    // API interface components
+    unique_ptr<FunctionRegistry> function_registry;
+    unique_ptr<TypeRegistry> type_registry;
+    unique_ptr<CatalogInterface> catalog_interface;
+
+public:
+    ExtensionAPI(LoadedExtension &ext) : extension(ext) {
+        function_registry = make_unique<FunctionRegistry>(extension);
+        type_registry = make_unique<TypeRegistry>(extension);
+        catalog_interface = make_unique<CatalogInterface>(extension);
+    }
+    
+    // Function registration API
+    bool RegisterScalarFunction(const string &name, ScalarFunction function) {
+        return function_registry->RegisterScalarFunction(name, move(function));
+    }
+    
+    bool RegisterAggregateFunction(const string &name, AggregateFunction function) {
+        return function_registry->RegisterAggregateFunction(name, move(function));
+    }
+    
+    bool RegisterTableFunction(const string &name, TableFunction function) {
+        return function_registry->RegisterTableFunction(name, move(function));
+    }
+    
+    // Type system API
+    bool RegisterCustomType(const string &name, LogicalType type) {
+        return type_registry->RegisterCustomType(name, move(type));
+    }
+    
+    // Catalog manipulation API
+    bool CreateTable(const string &schema, const string &table_name, 
+                    const vector<ColumnDefinition> &columns) {
+        return catalog_interface->CreateTable(schema, table_name, columns);
+    }
+    
+    bool CreateView(const string &schema, const string &view_name, const string &sql) {
+        return catalog_interface->CreateView(schema, view_name, sql);
+    }
+    
+    // Configuration API
+    void SetExtensionConfiguration(const string &key, const Value &value) {
+        extension.SetConfiguration(key, value);
+    }
+    
+    Value GetExtensionConfiguration(const string &key) {
+        return extension.GetConfiguration(key);
+    }
+    
+    // Logging API
+    void LogInfo(const string &message) {
+        Logger::Info("[%s] %s", extension.GetName().c_str(), message.c_str());
+    }
+    
+    void LogWarning(const string &message) {
+        Logger::Warning("[%s] %s", extension.GetName().c_str(), message.c_str());
+    }
+    
+    void LogError(const string &message) {
+        Logger::Error("[%s] %s", extension.GetName().c_str(), message.c_str());
+    }
+};
+```
+
+### 7.1.3 Extension Lifecycle and Dependency Management
+
+**Sophisticated Dependency Resolution and Version Management**
+DuckDB implements comprehensive dependency management that handles complex extension interdependencies while maintaining system stability:
+
+```cpp
+class ExtensionDependencyResolver {
+private:
+    // Dependency graph representation
+    unordered_map<string, vector<ExtensionDependency>> dependency_graph;
+    unordered_map<string, ExtensionVersion> extension_versions;
+    
+    // Circular dependency detection
+    unordered_set<string> visited_extensions;
+    unordered_set<string> recursion_stack;
+
+public:
+    vector<string> ResolveDependencies(const string &extension_name) {
+        // Clear state for new resolution
+        visited_extensions.clear();
+        recursion_stack.clear();
+        
+        vector<string> resolution_order;
+        
+        if (!ResolveDependenciesRecursive(extension_name, resolution_order)) {
+            throw DependencyException("Cannot resolve dependencies for extension: " + extension_name);
+        }
+        
+        return resolution_order;
+    }
+    
+    bool AddExtension(const string &name, const ExtensionMetadata &metadata) {
+        // Parse dependency information
+        vector<ExtensionDependency> dependencies;
+        
+        for (const auto &dep_string : metadata.dependencies) {
+            auto dependency = ParseDependencyString(dep_string);
+            dependencies.push_back(dependency);
+        }
+        
+        dependency_graph[name] = dependencies;
+        extension_versions[name] = ExtensionVersion(metadata.version);
+        
+        // Validate dependency graph doesn't introduce cycles
+        return ValidateDependencyGraph();
+    }
+    
+    bool ValidateCompatibility(const string &extension_name, const string &required_version) {
+        auto it = extension_versions.find(extension_name);
+        if (it == extension_versions.end()) {
+            return false; // Extension not found
+        }
+        
+        auto available_version = it->second;
+        auto required = ExtensionVersion(required_version);
+        
+        return available_version.IsCompatibleWith(required);
+    }
+
+private:
+    bool ResolveDependenciesRecursive(const string &extension_name, vector<string> &resolution_order) {
+        // Check for circular dependencies
+        if (recursion_stack.count(extension_name)) {
+            return false; // Circular dependency detected
+        }
+        
+        if (visited_extensions.count(extension_name)) {
+            return true; // Already resolved
+        }
+        
+        // Mark as being processed
+        recursion_stack.insert(extension_name);
+        
+        // Get dependencies for this extension
+        auto deps_it = dependency_graph.find(extension_name);
+        if (deps_it != dependency_graph.end()) {
+            for (const auto &dependency : deps_it->second) {
+                // Check version compatibility
+                if (!ValidateCompatibility(dependency.name, dependency.version_constraint)) {
+                    return false;
+                }
+                
+                // Recursively resolve dependency
+                if (!ResolveDependenciesRecursive(dependency.name, resolution_order)) {
+                    return false;
+                }
+            }
+        }
+        
+        // Remove from recursion stack and mark as visited
+        recursion_stack.erase(extension_name);
+        visited_extensions.insert(extension_name);
+        
+        // Add to resolution order
+        resolution_order.push_back(extension_name);
+        
+        return true;
+    }
+    
+    ExtensionDependency ParseDependencyString(const string &dep_string) {
+        ExtensionDependency dependency;
+        
+        // Parse strings like "extension_name>=1.0.0" or "extension_name=1.2.3"
+        auto constraint_pos = dep_string.find_first_of(">=<!");
+        
+        if (constraint_pos == string::npos) {
+            // No version constraint
+            dependency.name = dep_string;
+            dependency.version_constraint = "";
+            dependency.constraint_type = VersionConstraintType::ANY;
+        } else {
+            dependency.name = dep_string.substr(0, constraint_pos);
+            
+            // Parse constraint operator
+            string constraint_op;
+            while (constraint_pos < dep_string.length() && 
+                   (dep_string[constraint_pos] == '>' || dep_string[constraint_pos] == '<' || 
+                    dep_string[constraint_pos] == '=' || dep_string[constraint_pos] == '!')) {
+                constraint_op += dep_string[constraint_pos];
+                constraint_pos++;
+            }
+            
+            dependency.version_constraint = dep_string.substr(constraint_pos);
+            dependency.constraint_type = ParseConstraintType(constraint_op);
+        }
+        
+        return dependency;
+    }
+    
+    VersionConstraintType ParseConstraintType(const string &constraint_op) {
+        if (constraint_op == ">=") return VersionConstraintType::GREATER_EQUAL;
+        if (constraint_op == ">") return VersionConstraintType::GREATER;
+        if (constraint_op == "<=") return VersionConstraintType::LESS_EQUAL;
+        if (constraint_op == "<") return VersionConstraintType::LESS;
+        if (constraint_op == "=") return VersionConstraintType::EQUAL;
+        if (constraint_op == "!=") return VersionConstraintType::NOT_EQUAL;
+        
+        return VersionConstraintType::ANY;
+    }
+    
+    bool ValidateDependencyGraph() {
+        // Perform topological sort to detect cycles
+        unordered_map<string, int> in_degree;
+        
+        // Calculate in-degrees
+        for (const auto &[extension, dependencies] : dependency_graph) {
+            if (in_degree.find(extension) == in_degree.end()) {
+                in_degree[extension] = 0;
+            }
+            
+            for (const auto &dep : dependencies) {
+                in_degree[dep.name]++;
+            }
+        }
+        
+        // Use Kahn's algorithm for cycle detection
+        queue<string> zero_in_degree;
+        for (const auto &[extension, degree] : in_degree) {
+            if (degree == 0) {
+                zero_in_degree.push(extension);
+            }
+        }
+        
+        int processed_count = 0;
+        while (!zero_in_degree.empty()) {
+            auto current = zero_in_degree.front();
+            zero_in_degree.pop();
+            processed_count++;
+            
+            auto deps_it = dependency_graph.find(current);
+            if (deps_it != dependency_graph.end()) {
+                for (const auto &dep : deps_it->second) {
+                    in_degree[dep.name]--;
+                    if (in_degree[dep.name] == 0) {
+                        zero_in_degree.push(dep.name);
+                    }
+                }
+            }
+        }
+        
+        return processed_count == dependency_graph.size(); // No cycles if all processed
+    }
+    
+    struct ExtensionDependency {
+        string name;
+        string version_constraint;
+        VersionConstraintType constraint_type;
+    };
+    
+    enum class VersionConstraintType {
+        ANY,
+        EQUAL,
+        NOT_EQUAL,
+        GREATER,
+        GREATER_EQUAL,
+        LESS,
+        LESS_EQUAL
+    };
+};
+
+class ExtensionVersion {
+private:
+    int major;
+    int minor;
+    int patch;
+    string pre_release;
+
+public:
+    ExtensionVersion(const string &version_string) {
+        ParseVersion(version_string);
+    }
+    
+    bool IsCompatibleWith(const ExtensionVersion &required) const {
+        // Semantic versioning compatibility rules
+        if (major != required.major) {
+            return false; // Major version must match exactly
+        }
+        
+        if (minor < required.minor) {
+            return false; // Minor version must be >= required
+        }
+        
+        if (minor == required.minor && patch < required.patch) {
+            return false; // Patch version must be >= required if minor matches
+        }
+        
+        return true;
+    }
+    
+    bool operator==(const ExtensionVersion &other) const {
+        return major == other.major && minor == other.minor && 
+               patch == other.patch && pre_release == other.pre_release;
+    }
+    
+    bool operator<(const ExtensionVersion &other) const {
+        if (major != other.major) return major < other.major;
+        if (minor != other.minor) return minor < other.minor;
+        if (patch != other.patch) return patch < other.patch;
+        
+        // Pre-release versions are less than normal versions
+        if (pre_release.empty() && !other.pre_release.empty()) return false;
+        if (!pre_release.empty() && other.pre_release.empty()) return true;
+        
+        return pre_release < other.pre_release;
+    }
+
+private:
+    void ParseVersion(const string &version_string) {
+        // Parse version strings like "1.2.3" or "1.2.3-beta.1"
+        auto parts = SplitString(version_string, '-');
+        auto version_part = parts[0];
+        
+        if (parts.size() > 1) {
+            pre_release = parts[1];
+        }
+        
+        auto version_numbers = SplitString(version_part, '.');
+        
+        major = version_numbers.size() > 0 ? stoi(version_numbers[0]) : 0;
+        minor = version_numbers.size() > 1 ? stoi(version_numbers[1]) : 0;
+        patch = version_numbers.size() > 2 ? stoi(version_numbers[2]) : 0;
+    }
+    
+    vector<string> SplitString(const string &str, char delimiter) {
+        vector<string> result;
+        stringstream ss(str);
+        string item;
+        
+        while (getline(ss, item, delimiter)) {
+            result.push_back(item);
+        }
+        
+        return result;
+    }
+};
+```
+
+This comprehensive extension architecture provides DuckDB with a robust, secure, and flexible plugin system that maintains the core principle of zero dependencies while enabling rich functionality through modular extensions. The sophisticated dependency management and security framework ensure system stability and security while providing developers with powerful tools for extending DuckDB's capabilities.
+
+---
+
+## 7.2 Core Extensions
+
+### 7.2.1 Parquet Integration Extension
+
+**High-Performance Columnar Data Processing**
+DuckDB's Parquet extension provides native support for the Apache Parquet columnar format, offering optimized reading and writing capabilities with advanced features like predicate pushdown and column pruning:
+
+```cpp
+class ParquetExtension : public Extension {
+public:
+    void Initialize(ExtensionAPI &api) override {
+        // Register Parquet table functions
+        api.RegisterTableFunction("read_parquet", CreateParquetReadFunction());
+        api.RegisterTableFunction("parquet_scan", CreateParquetScanFunction());
+        api.RegisterTableFunction("parquet_metadata", CreateParquetMetadataFunction());
+        
+        // Register Parquet export functions
+        api.RegisterFunction("write_parquet", CreateParquetWriteFunction());
+        
+        // Register Parquet-specific functions
+        api.RegisterFunction("parquet_schema", CreateParquetSchemaFunction());
+        api.RegisterFunction("parquet_file_metadata", CreateParquetFileMetadataFunction());
+    }
+
+private:
+    unique_ptr<TableFunction> CreateParquetReadFunction() {
+        auto function = make_unique<TableFunction>("read_parquet");
+        
+        function->arguments.push_back(LogicalType::VARCHAR); // file_path
+        function->named_parameters["columns"] = LogicalType::LIST(LogicalType::VARCHAR);
+        function->named_parameters["filter"] = LogicalType::VARCHAR;
+        function->named_parameters["hive_partitioning"] = LogicalType::BOOLEAN;
+        function->named_parameters["union_by_name"] = LogicalType::BOOLEAN;
+        
+        function->bind = ParquetReadBind;
+        function->init_global = ParquetReadInitGlobal;
+        function->init_local = ParquetReadInitLocal;
+        function->function = ParquetReadFunction;
+        function->statistics = ParquetReadStatistics;
+        function->dependency = ParquetReadDependency;
+        function->cardinality = ParquetReadCardinality;
+        function->pushdown_complex_filter = ParquetReadComplexFilter;
+        function->serialize = ParquetReadSerialize;
+        function->deserialize = ParquetReadDeserialize;
+        
+        return function;
+    }
+};
+
+class ParquetReader {
+private:
+    // Parquet file handling
+    unique_ptr<parquet::arrow::FileReader> file_reader;
+    shared_ptr<parquet::FileMetaData> file_metadata;
+    
+    // Schema and type information
+    vector<LogicalType> return_types;
+    vector<string> names;
+    unordered_map<idx_t, idx_t> column_mapping;
+    
+    // Optimization state
+    unique_ptr<ParquetFilter> filter_pushdown;
+    unique_ptr<ParquetStatistics> statistics_cache;
+    bool enable_dictionary_optimization;
+
+public:
+    ParquetReader(const string &file_name, const ParquetReadOptions &options) {
+        // Open Parquet file
+        auto file_result = parquet::ParquetFileReader::OpenFile(file_name);
+        if (!file_result.ok()) {
+            throw ParquetException("Cannot open Parquet file: " + file_name);
+        }
+        
+        auto parquet_reader = move(file_result.ValueOrDie());
+        file_metadata = parquet_reader->metadata();
+        
+        // Create Arrow file reader for optimized reading
+        auto arrow_reader_result = parquet::arrow::FileReader::Make(
+            arrow::default_memory_pool(), move(parquet_reader));
+        
+        if (!arrow_reader_result.ok()) {
+            throw ParquetException("Cannot create Arrow reader for: " + file_name);
+        }
+        
+        file_reader = move(arrow_reader_result.ValueOrDie());
+        
+        // Initialize schema mapping
+        InitializeSchema(options);
+        
+        // Initialize optimization features
+        filter_pushdown = make_unique<ParquetFilter>(file_metadata.get());
+        statistics_cache = make_unique<ParquetStatistics>(file_metadata.get());
+        enable_dictionary_optimization = options.enable_dictionary_optimization;
+    }
+    
+    unique_ptr<DataChunk> ReadChunk(idx_t chunk_size, const vector<column_t> &column_ids) {
+        auto chunk = make_unique<DataChunk>();
+        chunk->Initialize(return_types);
+        
+        // Determine row groups to read
+        auto row_groups_to_read = DetermineRowGroupsToRead();
+        
+        for (auto row_group_idx : row_groups_to_read) {
+            if (chunk->size() >= chunk_size) {
+                break;
+            }
+            
+            auto remaining_rows = chunk_size - chunk->size();
+            ReadRowGroup(row_group_idx, column_ids, *chunk, remaining_rows);
+        }
+        
+        return chunk;
+    }
+    
+    void ApplyFilter(const TableFilter &filter) {
+        if (filter_pushdown) {
+            filter_pushdown->AddFilter(filter);
+        }
+    }
+    
+    unique_ptr<BaseStatistics> GetStatistics(column_t column_id) {
+        if (statistics_cache) {
+            return statistics_cache->GetColumnStatistics(column_id);
+        }
+        return nullptr;
+    }
+
+private:
+    void InitializeSchema(const ParquetReadOptions &options) {
+        // Get Arrow schema from Parquet file
+        shared_ptr<arrow::Schema> arrow_schema;
+        auto schema_result = file_reader->GetSchema(&arrow_schema);
+        
+        if (!schema_result.ok()) {
+            throw ParquetException("Cannot read Parquet schema");
+        }
+        
+        // Convert Arrow schema to DuckDB types
+        for (int i = 0; i < arrow_schema->num_fields(); i++) {
+            auto field = arrow_schema->field(i);
+            
+            // Skip columns not in the projection if specified
+            if (!options.column_names.empty() && 
+                std::find(options.column_names.begin(), options.column_names.end(), 
+                         field->name()) == options.column_names.end()) {
+                continue;
+            }
+            
+            auto duckdb_type = ArrowToDuckDBType(field->type());
+            return_types.push_back(duckdb_type);
+            names.push_back(field->name());
+            column_mapping[names.size() - 1] = i;
+        }
+    }
+    
+    vector<idx_t> DetermineRowGroupsToRead() {
+        vector<idx_t> row_groups;
+        
+        auto num_row_groups = file_metadata->num_row_groups();
+        
+        for (int rg_idx = 0; rg_idx < num_row_groups; rg_idx++) {
+            // Check if row group passes filter conditions
+            if (filter_pushdown && !filter_pushdown->RowGroupPassesFilter(rg_idx)) {
+                continue;
+            }
+            
+            row_groups.push_back(rg_idx);
+        }
+        
+        return row_groups;
+    }
+    
+    void ReadRowGroup(idx_t row_group_idx, const vector<column_t> &column_ids,
+                     DataChunk &chunk, idx_t max_rows) {
+        // Create column reader for specified columns
+        vector<int> arrow_column_indices;
+        for (auto col_id : column_ids) {
+            arrow_column_indices.push_back(column_mapping[col_id]);
+        }
+        
+        // Read row group data
+        shared_ptr<arrow::Table> arrow_table;
+        auto read_result = file_reader->ReadRowGroup(row_group_idx, arrow_column_indices, &arrow_table);
+        
+        if (!read_result.ok()) {
+            throw ParquetException("Cannot read Parquet row group");
+        }
+        
+        // Convert Arrow table to DuckDB DataChunk
+        ConvertArrowTableToDataChunk(arrow_table, chunk, max_rows);
+    }
+    
+    void ConvertArrowTableToDataChunk(shared_ptr<arrow::Table> arrow_table, 
+                                     DataChunk &chunk, idx_t max_rows) {
+        auto num_columns = arrow_table->num_columns();
+        auto num_rows = std::min(static_cast<idx_t>(arrow_table->num_rows()), max_rows);
+        
+        for (int col_idx = 0; col_idx < num_columns; col_idx++) {
+            auto arrow_column = arrow_table->column(col_idx);
+            auto &duckdb_vector = chunk.data[col_idx];
+            
+            // Convert Arrow column to DuckDB vector
+            ConvertArrowColumnToVector(arrow_column, duckdb_vector, num_rows);
+        }
+        
+        chunk.SetCardinality(num_rows);
+    }
+    
+    void ConvertArrowColumnToVector(shared_ptr<arrow::Column> arrow_column, 
+                                   Vector &duckdb_vector, idx_t num_rows) {
+        // Handle different Arrow data types
+        auto arrow_type = arrow_column->type();
+        
+        switch (arrow_type->id()) {
+            case arrow::Type::INT32:
+                ConvertArrowIntegerColumn<int32_t>(arrow_column, duckdb_vector, num_rows);
+                break;
+            case arrow::Type::INT64:
+                ConvertArrowIntegerColumn<int64_t>(arrow_column, duckdb_vector, num_rows);
+                break;
+            case arrow::Type::DOUBLE:
+                ConvertArrowFloatingColumn<double>(arrow_column, duckdb_vector, num_rows);
+                break;
+            case arrow::Type::STRING:
+                ConvertArrowStringColumn(arrow_column, duckdb_vector, num_rows);
+                break;
+            case arrow::Type::DICTIONARY:
+                ConvertArrowDictionaryColumn(arrow_column, duckdb_vector, num_rows);
+                break;
+            default:
+                throw ParquetException("Unsupported Arrow type: " + arrow_type->ToString());
+        }
+    }
+    
+    template<typename T>
+    void ConvertArrowIntegerColumn(shared_ptr<arrow::Column> arrow_column, 
+                                  Vector &duckdb_vector, idx_t num_rows) {
+        auto data_ptr = FlatVector::GetData<T>(duckdb_vector);
+        auto validity_mask = FlatVector::Validity(duckdb_vector);
+        
+        // Process each chunk in the Arrow column
+        for (int chunk_idx = 0; chunk_idx < arrow_column->num_chunks(); chunk_idx++) {
+            auto arrow_array = std::static_pointer_cast<arrow::NumericArray<arrow::Int64Type>>(
+                arrow_column->chunk(chunk_idx));
+            
+            for (int64_t i = 0; i < arrow_array->length() && i < num_rows; i++) {
+                if (arrow_array->IsNull(i)) {
+                    validity_mask.SetInvalid(i);
+                } else {
+                    data_ptr[i] = static_cast<T>(arrow_array->Value(i));
+                }
+            }
+        }
+    }
+    
+    LogicalType ArrowToDuckDBType(shared_ptr<arrow::DataType> arrow_type) {
+        switch (arrow_type->id()) {
+            case arrow::Type::BOOL:
+                return LogicalType::BOOLEAN;
+            case arrow::Type::INT8:
+                return LogicalType::TINYINT;
+            case arrow::Type::INT16:
+                return LogicalType::SMALLINT;
+            case arrow::Type::INT32:
+                return LogicalType::INTEGER;
+            case arrow::Type::INT64:
+                return LogicalType::BIGINT;
+            case arrow::Type::FLOAT:
+                return LogicalType::FLOAT;
+            case arrow::Type::DOUBLE:
+                return LogicalType::DOUBLE;
+            case arrow::Type::STRING:
+            case arrow::Type::BINARY:
+                return LogicalType::VARCHAR;
+            case arrow::Type::TIMESTAMP:
+                return LogicalType::TIMESTAMP;
+            case arrow::Type::DATE32:
+            case arrow::Type::DATE64:
+                return LogicalType::DATE;
+            case arrow::Type::DICTIONARY:
+                return ArrowToDuckDBType(
+                    std::static_pointer_cast<arrow::DictionaryType>(arrow_type)->value_type());
+            default:
+                return LogicalType::VARCHAR; // Fallback to string
+        }
+    }
+};
+
+class ParquetFilter {
+private:
+    parquet::FileMetaData* file_metadata;
+    vector<unique_ptr<TableFilter>> active_filters;
+    unordered_map<string, idx_t> column_name_to_index;
+
+public:
+    ParquetFilter(parquet::FileMetaData* metadata) : file_metadata(metadata) {
+        // Build column name mapping
+        auto schema = metadata->schema();
+        for (int i = 0; i < schema->num_columns(); i++) {
+            auto column_desc = schema->Column(i);
+            column_name_to_index[column_desc->name()] = i;
+        }
+    }
+    
+    void AddFilter(const TableFilter &filter) {
+        active_filters.push_back(filter.Clone());
+    }
+    
+    bool RowGroupPassesFilter(idx_t row_group_index) {
+        auto row_group_metadata = file_metadata->RowGroup(row_group_index);
+        
+        for (const auto &filter : active_filters) {
+            if (!EvaluateFilterOnRowGroup(*filter, row_group_metadata)) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+
+private:
+    bool EvaluateFilterOnRowGroup(const TableFilter &filter, 
+                                 std::shared_ptr<parquet::RowGroupMetaData> row_group) {
+        // Get column statistics from row group metadata
+        auto column_idx_it = column_name_to_index.find(filter.column_name);
+        if (column_idx_it == column_name_to_index.end()) {
+            return true; // Cannot evaluate - assume passes
+        }
+        
+        auto column_chunk = row_group->ColumnChunk(column_idx_it->second);
+        auto statistics = column_chunk->statistics();
+        
+        if (!statistics) {
+            return true; // No statistics available - assume passes
+        }
+        
+        // Evaluate filter based on min/max statistics
+        return EvaluateFilterWithStatistics(filter, statistics.get());
+    }
+    
+    bool EvaluateFilterWithStatistics(const TableFilter &filter, 
+                                     parquet::Statistics* stats) {
+        switch (filter.comparison_type) {
+            case ComparisonType::EQUAL_TO:
+                // Value must be within [min, max] range
+                return CompareWithStatistics(filter.constant, stats, ">=") &&
+                       CompareWithStatistics(filter.constant, stats, "<=");
+            case ComparisonType::GREATER_THAN:
+                // Max value must be > filter value
+                return CompareWithStatistics(filter.constant, stats, "<");
+            case ComparisonType::LESS_THAN:
+                // Min value must be < filter value
+                return CompareWithStatistics(filter.constant, stats, ">");
+            default:
+                return true; // Conservative approach for other comparisons
+        }
+    }
+    
+    bool CompareWithStatistics(const Value &filter_value, 
+                              parquet::Statistics* stats, 
+                              const string &comparison) {
+        // Implementation would depend on specific Parquet statistics format
+        // This is a simplified version
+        return true;
+    }
+};
+```
+
+### 7.2.2 JSON Processing Extension
+
+**Native JSON Support and Advanced Manipulation**
+DuckDB's JSON extension provides comprehensive JSON processing capabilities with optimized parsing, path-based queries, and schema inference:
+
+```cpp
+class JSONExtension : public Extension {
+public:
+    void Initialize(ExtensionAPI &api) override {
+        // Register JSON table functions
+        api.RegisterTableFunction("read_json", CreateJSONReadFunction());
+        api.RegisterTableFunction("read_ndjson", CreateNDJSONReadFunction());
+        
+        // Register JSON scalar functions
+        api.RegisterFunction("json_extract", CreateJSONExtractFunction());
+        api.RegisterFunction("json_extract_path", CreateJSONExtractPathFunction());
+        api.RegisterFunction("json_extract_string", CreateJSONExtractStringFunction());
+        api.RegisterFunction("json_array_length", CreateJSONArrayLengthFunction());
+        api.RegisterFunction("json_object_keys", CreateJSONObjectKeysFunction());
+        api.RegisterFunction("json_type", CreateJSONTypeFunction());
+        api.RegisterFunction("json_valid", CreateJSONValidFunction());
+        
+        // Register JSON aggregate functions
+        api.RegisterAggregateFunction("json_group_array", CreateJSONGroupArrayFunction());
+        api.RegisterAggregateFunction("json_group_object", CreateJSONGroupObjectFunction());
+        
+        // Register JSON operators
+        api.RegisterFunction("json_extract_operator", CreateJSONExtractOperatorFunction());
+        
+        // Register JSON type
+        api.RegisterCustomType("JSON", CreateJSONLogicalType());
+    }
+
+private:
+    unique_ptr<ScalarFunction> CreateJSONExtractFunction() {
+        auto function = make_unique<ScalarFunction>("json_extract");
+        
+        function->arguments = {LogicalType::JSON, LogicalType::VARCHAR};
+        function->return_type = LogicalType::JSON;
+        function->function = JSONExtractExecute;
+        function->bind = JSONExtractBind;
+        
+        return function;
+    }
+    
+    static void JSONExtractExecute(DataChunk &args, ExpressionState &state, 
+                                  Vector &result) {
+        auto &json_vector = args.data[0];
+        auto &path_vector = args.data[1];
+        
+        UnaryExecutor::Execute<string_t, string_t>(
+            json_vector, result, args.size(),
+            [&](string_t json_str) {
+                auto path_str = path_vector.GetValue(0).GetValue<string>();
+                return ExtractJSONPath(json_str.GetString(), path_str);
+            });
+    }
+    
+    static string_t ExtractJSONPath(const string &json_str, const string &path) {
+        // Parse JSON document
+        auto json_doc = ParseJSONDocument(json_str);
+        if (!json_doc) {
+            return string_t(); // Invalid JSON
+        }
+        
+        // Navigate JSON path
+        auto result = NavigateJSONPath(*json_doc, path);
+        if (!result) {
+            return string_t(); // Path not found
+        }
+        
+        // Serialize result back to JSON string
+        return SerializeJSONValue(*result);
+    }
+};
+
+class JSONParser {
+private:
+    // JSON parsing state
+    const char* input;
+    size_t input_length;
+    size_t position;
+    
+    // Error handling
+    string error_message;
+    bool has_error;
+
+public:
+    JSONParser(const string &json_input) 
+        : input(json_input.c_str()), input_length(json_input.length()), position(0) {
+        has_error = false;
+    }
+    
+    unique_ptr<JSONValue> Parse() {
+        SkipWhitespace();
+        
+        if (position >= input_length) {
+            SetError("Empty JSON input");
+            return nullptr;
+        }
+        
+        auto value = ParseValue();
+        
+        if (!has_error) {
+            SkipWhitespace();
+            if (position < input_length) {
+                SetError("Unexpected characters after JSON value");
+                return nullptr;
+            }
+        }
+        
+        return value;
+    }
+    
+    bool HasError() const { return has_error; }
+    string GetError() const { return error_message; }
+
+private:
+    unique_ptr<JSONValue> ParseValue() {
+        SkipWhitespace();
+        
+        if (position >= input_length) {
+            SetError("Unexpected end of JSON input");
+            return nullptr;
+        }
+        
+        char current = input[position];
+        
+        switch (current) {
+            case '"':
+                return ParseString();
+            case '{':
+                return ParseObject();
+            case '[':
+                return ParseArray();
+            case 't':
+            case 'f':
+                return ParseBoolean();
+            case 'n':
+                return ParseNull();
+            default:
+                if (current == '-' || (current >= '0' && current <= '9')) {
+                    return ParseNumber();
+                }
+                SetError("Unexpected character: " + string(1, current));
+                return nullptr;
+        }
+    }
+    
+    unique_ptr<JSONValue> ParseString() {
+        if (input[position] != '"') {
+            SetError("Expected opening quote for string");
+            return nullptr;
+        }
+        position++; // Skip opening quote
+        
+        string result;
+        
+        while (position < input_length && input[position] != '"') {
+            if (input[position] == '\\') {
+                // Handle escape sequences
+                position++;
+                if (position >= input_length) {
+                    SetError("Unexpected end of string");
+                    return nullptr;
+                }
+                
+                char escaped = input[position];
+                switch (escaped) {
+                    case '"':
+                    case '\\':
+                    case '/':
+                        result += escaped;
+                        break;
+                    case 'b':
+                        result += '\b';
+                        break;
+                    case 'f':
+                        result += '\f';
+                        break;
+                    case 'n':
+                        result += '\n';
+                        break;
+                    case 'r':
+                        result += '\r';
+                        break;
+                    case 't':
+                        result += '\t';
+                        break;
+                    case 'u':
+                        // Unicode escape sequence
+                        if (position + 4 >= input_length) {
+                            SetError("Invalid unicode escape sequence");
+                            return nullptr;
+                        }
+                        // Simplified: just add the unicode sequence as-is
+                        result += "\\u";
+                        for (int i = 0; i < 4; i++) {
+                            result += input[++position];
+                        }
+                        break;
+                    default:
+                        SetError("Invalid escape sequence: \\" + string(1, escaped));
+                        return nullptr;
+                }
+            } else {
+                result += input[position];
+            }
+            position++;
+        }
+        
+        if (position >= input_length) {
+            SetError("Unterminated string");
+            return nullptr;
+        }
+        
+        position++; // Skip closing quote
+        return make_unique<JSONString>(result);
+    }
+    
+    unique_ptr<JSONValue> ParseObject() {
+        if (input[position] != '{') {
+            SetError("Expected opening brace for object");
+            return nullptr;
+        }
+        position++; // Skip opening brace
+        
+        auto object = make_unique<JSONObject>();
+        
+        SkipWhitespace();
+        
+        // Handle empty object
+        if (position < input_length && input[position] == '}') {
+            position++;
+            return move(object);
+        }
+        
+        while (position < input_length) {
+            SkipWhitespace();
+            
+            // Parse key
+            auto key_value = ParseString();
+            if (!key_value || key_value->GetType() != JSONType::STRING) {
+                SetError("Expected string key in object");
+                return nullptr;
+            }
+            
+            string key = static_cast<JSONString*>(key_value.get())->GetValue();
+            
+            SkipWhitespace();
+            
+            // Expect colon
+            if (position >= input_length || input[position] != ':') {
+                SetError("Expected colon after object key");
+                return nullptr;
+            }
+            position++; // Skip colon
+            
+            // Parse value
+            auto value = ParseValue();
+            if (!value) {
+                return nullptr;
+            }
+            
+            object->SetProperty(key, move(value));
+            
+            SkipWhitespace();
+            
+            // Check for end of object or comma
+            if (position >= input_length) {
+                SetError("Unexpected end of object");
+                return nullptr;
+            }
+            
+            if (input[position] == '}') {
+                position++;
+                break;
+            } else if (input[position] == ',') {
+                position++;
+                continue;
+            } else {
+                SetError("Expected comma or closing brace in object");
+                return nullptr;
+            }
+        }
+        
+        return move(object);
+    }
+    
+    unique_ptr<JSONValue> ParseArray() {
+        if (input[position] != '[') {
+            SetError("Expected opening bracket for array");
+            return nullptr;
+        }
+        position++; // Skip opening bracket
+        
+        auto array = make_unique<JSONArray>();
+        
+        SkipWhitespace();
+        
+        // Handle empty array
+        if (position < input_length && input[position] == ']') {
+            position++;
+            return move(array);
+        }
+        
+        while (position < input_length) {
+            auto value = ParseValue();
+            if (!value) {
+                return nullptr;
+            }
+            
+            array->AddElement(move(value));
+            
+            SkipWhitespace();
+            
+            // Check for end of array or comma
+            if (position >= input_length) {
+                SetError("Unexpected end of array");
+                return nullptr;
+            }
+            
+            if (input[position] == ']') {
+                position++;
+                break;
+            } else if (input[position] == ',') {
+                position++;
+                continue;
+            } else {
+                SetError("Expected comma or closing bracket in array");
+                return nullptr;
+            }
+        }
+        
+        return move(array);
+    }
+    
+    void SkipWhitespace() {
+        while (position < input_length && 
+               (input[position] == ' ' || input[position] == '\t' || 
+                input[position] == '\n' || input[position] == '\r')) {
+            position++;
+        }
+    }
+    
+    void SetError(const string &message) {
+        error_message = message + " at position " + to_string(position);
+        has_error = true;
+    }
+};
+
+class JSONSchemaInference {
+private:
+    unordered_map<string, TypeFrequency> field_types;
+    idx_t total_documents;
+
+public:
+    JSONSchemaInference() : total_documents(0) {}
+    
+    void AnalyzeDocument(const JSONValue &json_doc) {
+        total_documents++;
+        
+        if (json_doc.GetType() == JSONType::OBJECT) {
+            AnalyzeObject(static_cast<const JSONObject&>(json_doc), "");
+        }
+    }
+    
+    vector<ColumnDefinition> InferSchema() {
+        vector<ColumnDefinition> columns;
+        
+        for (const auto &[field_path, type_freq] : field_types) {
+            // Determine most common type for field
+            auto inferred_type = InferFieldType(type_freq);
+            
+            ColumnDefinition column;
+            column.name = field_path;
+            column.type = inferred_type;
+            column.nullable = type_freq.null_count > 0;
+            
+            columns.push_back(column);
+        }
+        
+        return columns;
+    }
+
+private:
+    void AnalyzeObject(const JSONObject &obj, const string &path_prefix) {
+        for (const auto &[key, value] : obj.GetProperties()) {
+            string field_path = path_prefix.empty() ? key : path_prefix + "." + key;
+            
+            RecordFieldType(field_path, value->GetType());
+            
+            // Recursively analyze nested objects
+            if (value->GetType() == JSONType::OBJECT) {
+                AnalyzeObject(static_cast<const JSONObject&>(*value), field_path);
+            } else if (value->GetType() == JSONType::ARRAY) {
+                AnalyzeArray(static_cast<const JSONArray&>(*value), field_path);
+            }
+        }
+    }
+    
+    void AnalyzeArray(const JSONArray &arr, const string &field_path) {
+        // For arrays, analyze the element types
+        unordered_set<JSONType> element_types;
+        
+        for (const auto &element : arr.GetElements()) {
+            element_types.insert(element->GetType());
+            
+            if (element->GetType() == JSONType::OBJECT) {
+                AnalyzeObject(static_cast<const JSONObject&>(*element), field_path);
+            }
+        }
+        
+        // Record that this field is an array with specific element types
+        RecordArrayFieldType(field_path, element_types);
+    }
+    
+    void RecordFieldType(const string &field_path, JSONType json_type) {
+        auto &type_freq = field_types[field_path];
+        
+        switch (json_type) {
+            case JSONType::NULL_VALUE:
+                type_freq.null_count++;
+                break;
+            case JSONType::BOOLEAN:
+                type_freq.boolean_count++;
+                break;
+            case JSONType::NUMBER:
+                type_freq.number_count++;
+                break;
+            case JSONType::STRING:
+                type_freq.string_count++;
+                break;
+            case JSONType::ARRAY:
+                type_freq.array_count++;
+                break;
+            case JSONType::OBJECT:
+                type_freq.object_count++;
+                break;
+        }
+    }
+    
+    LogicalType InferFieldType(const TypeFrequency &type_freq) {
+        // Determine the most frequent non-null type
+        idx_t max_count = 0;
+        LogicalType inferred_type = LogicalType::VARCHAR; // Default fallback
+        
+        if (type_freq.boolean_count > max_count) {
+            max_count = type_freq.boolean_count;
+            inferred_type = LogicalType::BOOLEAN;
+        }
+        
+        if (type_freq.number_count > max_count) {
+            max_count = type_freq.number_count;
+            inferred_type = LogicalType::DOUBLE; // Conservative choice
+        }
+        
+        if (type_freq.string_count > max_count) {
+            max_count = type_freq.string_count;
+            inferred_type = LogicalType::VARCHAR;
+        }
+        
+        if (type_freq.array_count > max_count) {
+            max_count = type_freq.array_count;
+            inferred_type = LogicalType::LIST(LogicalType::JSON);
+        }
+        
+        if (type_freq.object_count > max_count) {
+            max_count = type_freq.object_count;
+            inferred_type = LogicalType::JSON;
+        }
+        
+        return inferred_type;
+    }
+    
+    struct TypeFrequency {
+        idx_t null_count = 0;
+        idx_t boolean_count = 0;
+        idx_t number_count = 0;
+        idx_t string_count = 0;
+        idx_t array_count = 0;
+        idx_t object_count = 0;
+    };
+};
+```
+
+### 7.2.3 HTTP and Cloud Storage Extensions
+
+**Seamless Cloud Data Access**
+DuckDB's HTTP and cloud storage extensions provide native access to remote data sources including S3, GCS, and Azure Blob Storage:
+
+```cpp
+class HTTPExtension : public Extension {
+public:
+    void Initialize(ExtensionAPI &api) override {
+        // Register HTTP table functions
+        api.RegisterTableFunction("read_csv_url", CreateHTTPCSVFunction());
+        api.RegisterTableFunction("read_parquet_url", CreateHTTPParquetFunction());
+        api.RegisterTableFunction("read_json_url", CreateHTTPJSONFunction());
+        
+        // Register HTTP utility functions
+        api.RegisterFunction("http_get", CreateHTTPGetFunction());
+        api.RegisterFunction("http_post", CreateHTTPPostFunction());
+        api.RegisterFunction("http_head", CreateHTTPHeadFunction());
+        
+        // Register cloud storage functions
+        api.RegisterTableFunction("s3_list_objects", CreateS3ListObjectsFunction());
+        api.RegisterFunction("s3_get_object", CreateS3GetObjectFunction());
+    }
+
+private:
+    unique_ptr<TableFunction> CreateHTTPCSVFunction() {
+        auto function = make_unique<TableFunction>("read_csv_url");
+        
+        function->arguments.push_back(LogicalType::VARCHAR); // URL
+        function->named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+        function->named_parameters["timeout"] = LogicalType::INTEGER;
+        function->named_parameters["retries"] = LogicalType::INTEGER;
+        function->named_parameters["auth_token"] = LogicalType::VARCHAR;
+        
+        function->bind = HTTPCSVBind;
+        function->init_global = HTTPCSVInitGlobal;
+        function->function = HTTPCSVFunction;
+        
+        return function;
+    }
+};
+
+class HTTPClient {
+private:
+    // HTTP client configuration
+    string user_agent;
+    idx_t timeout_ms;
+    idx_t max_retries;
+    bool verify_ssl;
+    
+    // Connection pooling
+    unordered_map<string, unique_ptr<HTTPConnection>> connection_pool;
+    shared_mutex pool_lock;
+    
+    // Authentication
+    unordered_map<string, HTTPCredentials> credentials;
+
+public:
+    HTTPClient(const HTTPConfig &config) 
+        : user_agent(config.user_agent), timeout_ms(config.timeout_ms), 
+          max_retries(config.max_retries), verify_ssl(config.verify_ssl) {}
+    
+    unique_ptr<HTTPResponse> GET(const string &url, const HTTPHeaders &headers = {}) {
+        return ExecuteRequest("GET", url, headers, "");
+    }
+    
+    unique_ptr<HTTPResponse> POST(const string &url, const string &body, 
+                                 const HTTPHeaders &headers = {}) {
+        return ExecuteRequest("POST", url, headers, body);
+    }
+    
+    unique_ptr<HTTPResponse> HEAD(const string &url, const HTTPHeaders &headers = {}) {
+        return ExecuteRequest("HEAD", url, headers, "");
+    }
+    
+    unique_ptr<HTTPStreamingResponse> StreamingGET(const string &url, 
+                                                  const HTTPHeaders &headers = {}) {
+        auto connection = GetConnection(url);
+        return connection->StartStreamingRequest("GET", url, headers);
+    }
+
+private:
+    unique_ptr<HTTPResponse> ExecuteRequest(const string &method, const string &url,
+                                           const HTTPHeaders &headers, const string &body) {
+        auto parsed_url = ParseURL(url);
+        
+        for (idx_t retry = 0; retry <= max_retries; retry++) {
+            try {
+                auto connection = GetConnection(url);
+                
+                // Add authentication if available
+                auto auth_headers = headers;
+                AddAuthenticationHeaders(parsed_url, auth_headers);
+                
+                auto response = connection->ExecuteRequest(method, parsed_url.path, auth_headers, body);
+                
+                if (response->status_code < 500 || retry == max_retries) {
+                    return response;
+                }
+                
+                // Retry on 5xx errors
+                this_thread::sleep_for(chrono::milliseconds(100 * (1 << retry)));
+                
+            } catch (const HTTPException &e) {
+                if (retry == max_retries) {
+                    throw;
+                }
+                this_thread::sleep_for(chrono::milliseconds(100 * (1 << retry)));
+            }
+        }
+        
+        throw HTTPException("Max retries exceeded for URL: " + url);
+    }
+    
+    HTTPConnection* GetConnection(const string &url) {
+        auto parsed_url = ParseURL(url);
+        string connection_key = parsed_url.scheme + "://" + parsed_url.host + ":" + to_string(parsed_url.port);
+        
+        shared_lock<shared_mutex> lock(pool_lock);
+        auto it = connection_pool.find(connection_key);
+        if (it != connection_pool.end()) {
+            return it->second.get();
+        }
+        
+        lock.unlock();
+        
+        // Create new connection
+        unique_lock<shared_mutex> write_lock(pool_lock);
+        
+        // Double-check after acquiring write lock
+        auto it2 = connection_pool.find(connection_key);
+        if (it2 != connection_pool.end()) {
+            return it2->second.get();
+        }
+        
+        auto connection = CreateConnection(parsed_url);
+        auto result = connection.get();
+        connection_pool[connection_key] = move(connection);
+        
+        return result;
+    }
+    
+    unique_ptr<HTTPConnection> CreateConnection(const ParsedURL &parsed_url) {
+        if (parsed_url.scheme == "https") {
+            return make_unique<HTTPSConnection>(parsed_url.host, parsed_url.port, timeout_ms, verify_ssl);
+        } else {
+            return make_unique<HTTPConnection>(parsed_url.host, parsed_url.port, timeout_ms);
+        }
+    }
+    
+    void AddAuthenticationHeaders(const ParsedURL &parsed_url, HTTPHeaders &headers) {
+        string auth_key = parsed_url.host;
+        auto it = credentials.find(auth_key);
+        
+        if (it != credentials.end()) {
+            const auto &creds = it->second;
+            
+            switch (creds.type) {
+                case AuthType::BEARER_TOKEN:
+                    headers["Authorization"] = "Bearer " + creds.token;
+                    break;
+                case AuthType::BASIC_AUTH:
+                    headers["Authorization"] = "Basic " + EncodeBase64(creds.username + ":" + creds.password);
+                    break;
+                case AuthType::API_KEY:
+                    headers[creds.api_key_header] = creds.api_key;
+                    break;
+            }
+        }
+    }
+};
+
+class S3Client {
+private:
+    // S3 configuration
+    string access_key_id;
+    string secret_access_key;
+    string session_token;
+    string region;
+    string endpoint;
+    
+    // HTTP client for S3 requests
+    unique_ptr<HTTPClient> http_client;
+    
+    // Request signing
+    unique_ptr<AWSV4Signer> signer;
+
+public:
+    S3Client(const S3Config &config) 
+        : access_key_id(config.access_key_id), secret_access_key(config.secret_access_key),
+          session_token(config.session_token), region(config.region), endpoint(config.endpoint) {
+        
+        HTTPConfig http_config;
+        http_config.timeout_ms = config.timeout_ms;
+        http_config.max_retries = config.max_retries;
+        http_client = make_unique<HTTPClient>(http_config);
+        
+        signer = make_unique<AWSV4Signer>(access_key_id, secret_access_key, region);
+    }
+    
+    unique_ptr<S3Object> GetObject(const string &bucket, const string &key) {
+        string url = BuildS3URL(bucket, key);
+        
+        // Sign the request
+        HTTPHeaders headers;
+        signer->SignRequest("GET", url, headers, "");
+        
+        auto response = http_client->GET(url, headers);
+        
+        if (response->status_code != 200) {
+            throw S3Exception("Failed to get S3 object: " + bucket + "/" + key + 
+                            " (Status: " + to_string(response->status_code) + ")");
+        }
+        
+        auto s3_object = make_unique<S3Object>();
+        s3_object->bucket = bucket;
+        s3_object->key = key;
+        s3_object->data = move(response->body);
+        s3_object->metadata = response->headers;
+        
+        return s3_object;
+    }
+    
+    unique_ptr<S3StreamingObject> GetObjectStreaming(const string &bucket, const string &key) {
+        string url = BuildS3URL(bucket, key);
+        
+        HTTPHeaders headers;
+        signer->SignRequest("GET", url, headers, "");
+        
+        auto streaming_response = http_client->StreamingGET(url, headers);
+        
+        return make_unique<S3StreamingObject>(bucket, key, move(streaming_response));
+    }
+    
+    vector<S3ObjectInfo> ListObjects(const string &bucket, const string &prefix = "") {
+        string url = BuildS3URL(bucket, "");
+        
+        HTTPHeaders headers;
+        string query_params = "list-type=2";
+        if (!prefix.empty()) {
+            query_params += "&prefix=" + URLEncode(prefix);
+        }
+        
+        url += "?" + query_params;
+        
+        signer->SignRequest("GET", url, headers, "");
+        
+        auto response = http_client->GET(url, headers);
+        
+        if (response->status_code != 200) {
+            throw S3Exception("Failed to list S3 objects in bucket: " + bucket);
+        }
+        
+        return ParseListObjectsResponse(response->body);
+    }
+
+private:
+    string BuildS3URL(const string &bucket, const string &key) {
+        if (!endpoint.empty()) {
+            return endpoint + "/" + bucket + "/" + key;
+        } else {
+            return "https://" + bucket + ".s3." + region + ".amazonaws.com/" + key;
+        }
+    }
+    
+    vector<S3ObjectInfo> ParseListObjectsResponse(const string &xml_response) {
+        // Parse S3 ListObjectsV2 XML response
+        vector<S3ObjectInfo> objects;
+        
+        // Simplified XML parsing - in practice would use a proper XML parser
+        size_t pos = 0;
+        while ((pos = xml_response.find("<Contents>", pos)) != string::npos) {
+            S3ObjectInfo object_info;
+            
+            // Extract key
+            auto key_start = xml_response.find("<Key>", pos) + 5;
+            auto key_end = xml_response.find("</Key>", key_start);
+            object_info.key = xml_response.substr(key_start, key_end - key_start);
+            
+            // Extract size
+            auto size_start = xml_response.find("<Size>", pos) + 6;
+            auto size_end = xml_response.find("</Size>", size_start);
+            object_info.size = stoull(xml_response.substr(size_start, size_end - size_start));
+            
+            // Extract last modified
+            auto modified_start = xml_response.find("<LastModified>", pos) + 14;
+            auto modified_end = xml_response.find("</LastModified>", modified_start);
+            object_info.last_modified = xml_response.substr(modified_start, modified_end - modified_start);
+            
+            objects.push_back(object_info);
+            pos = xml_response.find("</Contents>", pos) + 11;
+        }
+        
+        return objects;
+    }
+};
+```
+
+This comprehensive core extensions framework demonstrates DuckDB's powerful extensibility while maintaining the system's core principle of zero dependencies. The Parquet extension provides high-performance columnar data access with advanced optimizations, the JSON extension offers complete JSON processing capabilities with intelligent schema inference, and the HTTP/cloud storage extensions enable seamless access to remote data sources with robust authentication and error handling.
+
+---
+
+## 7.3 Community Extensions
+
+### 7.3.1 Spatial Data Processing Extension
+
+**Geographic Information Systems and Spatial Analytics**
+DuckDB's spatial extension provides comprehensive GIS capabilities with PostGIS compatibility, enabling advanced geographic data analysis and spatial operations:
+
+```cpp
+class SpatialExtension : public Extension {
+public:
+    void Initialize(ExtensionAPI &api) override {
+        // Register spatial types
+        api.RegisterCustomType("GEOMETRY", CreateGeometryType());
+        api.RegisterCustomType("GEOGRAPHY", CreateGeographyType());
+        api.RegisterCustomType("POINT", CreatePointType());
+        api.RegisterCustomType("LINESTRING", CreateLineStringType());
+        api.RegisterCustomType("POLYGON", CreatePolygonType());
+        
+        // Register spatial constructors
+        api.RegisterFunction("ST_Point", CreateSTPointFunction());
+        api.RegisterFunction("ST_MakePoint", CreateSTMakePointFunction());
+        api.RegisterFunction("ST_GeomFromText", CreateSTGeomFromTextFunction());
+        api.RegisterFunction("ST_GeomFromWKB", CreateSTGeomFromWKBFunction());
+        api.RegisterFunction("ST_GeomFromGeoJSON", CreateSTGeomFromGeoJSONFunction());
+        
+        // Register spatial predicates
+        api.RegisterFunction("ST_Contains", CreateSTContainsFunction());
+        api.RegisterFunction("ST_Within", CreateSTWithinFunction());
+        api.RegisterFunction("ST_Intersects", CreateSTIntersectsFunction());
+        api.RegisterFunction("ST_Touches", CreateSTTouchesFunction());
+        api.RegisterFunction("ST_Crosses", CreateSTCrossesFunction());
+        api.RegisterFunction("ST_Overlaps", CreateSTOverlapsFunction());
+        api.RegisterFunction("ST_Equals", CreateSTEqualsFunction());
+        api.RegisterFunction("ST_DWithin", CreateSTDWithinFunction());
+        
+        // Register spatial measurements
+        api.RegisterFunction("ST_Distance", CreateSTDistanceFunction());
+        api.RegisterFunction("ST_Area", CreateSTAreaFunction());
+        api.RegisterFunction("ST_Length", CreateSTLengthFunction());
+        api.RegisterFunction("ST_Perimeter", CreateSTPerimeterFunction());
+        
+        // Register spatial transformations
+        api.RegisterFunction("ST_Buffer", CreateSTBufferFunction());
+        api.RegisterFunction("ST_Envelope", CreateSTEnvelopeFunction());
+        api.RegisterFunction("ST_ConvexHull", CreateSTConvexHullFunction());
+        api.RegisterFunction("ST_Centroid", CreateSTCentroidFunction());
+        api.RegisterFunction("ST_Transform", CreateSTTransformFunction());
+        
+        // Register spatial aggregates
+        api.RegisterAggregateFunction("ST_Union", CreateSTUnionAggregateFunction());
+        api.RegisterAggregateFunction("ST_Collect", CreateSTCollectAggregateFunction());
+        api.RegisterAggregateFunction("ST_Extent", CreateSTExtentAggregateFunction());
+        
+        // Register spatial table functions
+        api.RegisterTableFunction("ST_Read", CreateSTReadFunction());
+        api.RegisterTableFunction("read_shapefile", CreateReadShapefileFunction());
+        api.RegisterTableFunction("read_geojson", CreateReadGeoJSONFunction());
+    }
+
+private:
+    unique_ptr<ScalarFunction> CreateSTDistanceFunction() {
+        auto function = make_unique<ScalarFunction>("ST_Distance");
+        
+        function->arguments = {LogicalType::GEOMETRY, LogicalType::GEOMETRY};
+        function->return_type = LogicalType::DOUBLE;
+        function->function = STDistanceExecute;
+        
+        return function;
+    }
+    
+    static void STDistanceExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+        auto &geom1_vector = args.data[0];
+        auto &geom2_vector = args.data[1];
+        
+        BinaryExecutor::Execute<geometry_t, geometry_t, double>(
+            geom1_vector, geom2_vector, result, args.size(),
+            [&](geometry_t geom1, geometry_t geom2) {
+                return CalculateGeometryDistance(geom1, geom2);
+            });
+    }
+    
+    static double CalculateGeometryDistance(geometry_t geom1, geometry_t geom2) {
+        // Parse geometries
+        auto parsed_geom1 = ParseGeometry(geom1);
+        auto parsed_geom2 = ParseGeometry(geom2);
+        
+        // Calculate distance using GEOS library or custom implementation
+        return ComputeDistance(*parsed_geom1, *parsed_geom2);
+    }
+};
+
+class GeometryProcessor {
+private:
+    // Spatial reference system information
+    unordered_map<int, SpatialReferenceSystem> srs_cache;
+    
+    // Geometry parsing and serialization
+    unique_ptr<WKBParser> wkb_parser;
+    unique_ptr<WKTParser> wkt_parser;
+    unique_ptr<GeoJSONParser> geojson_parser;
+    
+    // Spatial operations engine
+    unique_ptr<SpatialOperationsEngine> operations_engine;
+
+public:
+    GeometryProcessor() {
+        wkb_parser = make_unique<WKBParser>();
+        wkt_parser = make_unique<WKTParser>();
+        geojson_parser = make_unique<GeoJSONParser>();
+        operations_engine = make_unique<SpatialOperationsEngine>();
+        
+        // Initialize common spatial reference systems
+        InitializeCommonSRS();
+    }
+    
+    unique_ptr<Geometry> ParseWKT(const string &wkt_text) {
+        return wkt_parser->Parse(wkt_text);
+    }
+    
+    unique_ptr<Geometry> ParseWKB(const string &wkb_binary) {
+        return wkb_parser->Parse(wkb_binary);
+    }
+    
+    unique_ptr<Geometry> ParseGeoJSON(const string &geojson_text) {
+        return geojson_parser->Parse(geojson_text);
+    }
+    
+    bool TestSpatialPredicate(const Geometry &geom1, const Geometry &geom2, 
+                             SpatialPredicate predicate) {
+        switch (predicate) {
+            case SpatialPredicate::CONTAINS:
+                return operations_engine->Contains(geom1, geom2);
+            case SpatialPredicate::WITHIN:
+                return operations_engine->Within(geom1, geom2);
+            case SpatialPredicate::INTERSECTS:
+                return operations_engine->Intersects(geom1, geom2);
+            case SpatialPredicate::TOUCHES:
+                return operations_engine->Touches(geom1, geom2);
+            case SpatialPredicate::CROSSES:
+                return operations_engine->Crosses(geom1, geom2);
+            case SpatialPredicate::OVERLAPS:
+                return operations_engine->Overlaps(geom1, geom2);
+            case SpatialPredicate::EQUALS:
+                return operations_engine->Equals(geom1, geom2);
+            default:
+                throw SpatialException("Unknown spatial predicate");
+        }
+    }
+    
+    double CalculateDistance(const Geometry &geom1, const Geometry &geom2) {
+        return operations_engine->Distance(geom1, geom2);
+    }
+    
+    double CalculateArea(const Geometry &geometry) {
+        return operations_engine->Area(geometry);
+    }
+    
+    unique_ptr<Geometry> ApplySpatialOperation(const Geometry &geometry, 
+                                              SpatialOperation operation, 
+                                              const OperationParameters &params) {
+        switch (operation) {
+            case SpatialOperation::BUFFER:
+                return operations_engine->Buffer(geometry, params.buffer_distance);
+            case SpatialOperation::ENVELOPE:
+                return operations_engine->Envelope(geometry);
+            case SpatialOperation::CONVEX_HULL:
+                return operations_engine->ConvexHull(geometry);
+            case SpatialOperation::CENTROID:
+                return operations_engine->Centroid(geometry);
+            default:
+                throw SpatialException("Unknown spatial operation");
+        }
+    }
+    
+    unique_ptr<Geometry> TransformCoordinates(const Geometry &geometry, 
+                                             int source_srid, int target_srid) {
+        auto source_srs = GetSpatialReferenceSystem(source_srid);
+        auto target_srs = GetSpatialReferenceSystem(target_srid);
+        
+        return operations_engine->Transform(geometry, *source_srs, *target_srs);
+    }
+
+private:
+    void InitializeCommonSRS() {
+        // WGS84 (EPSG:4326)
+        SpatialReferenceSystem wgs84;
+        wgs84.srid = 4326;
+        wgs84.authority = "EPSG";
+        wgs84.proj4_text = "+proj=longlat +datum=WGS84 +no_defs";
+        wgs84.wkt = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],"
+                    "PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]]";
+        srs_cache[4326] = wgs84;
+        
+        // Web Mercator (EPSG:3857)
+        SpatialReferenceSystem web_mercator;
+        web_mercator.srid = 3857;
+        web_mercator.authority = "EPSG";
+        web_mercator.proj4_text = "+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 "
+                                 "+x_0=0.0 +y_0=0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs";
+        srs_cache[3857] = web_mercator;
+    }
+    
+    SpatialReferenceSystem* GetSpatialReferenceSystem(int srid) {
+        auto it = srs_cache.find(srid);
+        if (it != srs_cache.end()) {
+            return &it->second;
+        }
+        
+        // Load SRS from external source if not cached
+        auto srs = LoadSpatialReferenceSystem(srid);
+        if (srs) {
+            srs_cache[srid] = *srs;
+            return &srs_cache[srid];
+        }
+        
+        throw SpatialException("Unknown spatial reference system: " + to_string(srid));
+    }
+};
+
+class SpatialIndex {
+private:
+    // R-tree index for spatial queries
+    unique_ptr<RTreeIndex> rtree_index;
+    
+    // Grid-based spatial index for uniform data
+    unique_ptr<GridIndex> grid_index;
+    
+    // Quadtree index for hierarchical spatial data
+    unique_ptr<QuadtreeIndex> quadtree_index;
+    
+    // Index selection strategy
+    SpatialIndexType selected_index_type;
+
+public:
+    SpatialIndex(const SpatialIndexConfiguration &config) {
+        // Choose appropriate index type based on data characteristics
+        selected_index_type = DetermineOptimalIndexType(config);
+        
+        switch (selected_index_type) {
+            case SpatialIndexType::RTREE:
+                rtree_index = make_unique<RTreeIndex>(config.rtree_config);
+                break;
+            case SpatialIndexType::GRID:
+                grid_index = make_unique<GridIndex>(config.grid_config);
+                break;
+            case SpatialIndexType::QUADTREE:
+                quadtree_index = make_unique<QuadtreeIndex>(config.quadtree_config);
+                break;
+        }
+    }
+    
+    void InsertGeometry(geometry_id_t id, const Geometry &geometry) {
+        auto envelope = geometry.GetEnvelope();
+        
+        switch (selected_index_type) {
+            case SpatialIndexType::RTREE:
+                rtree_index->Insert(id, envelope);
+                break;
+            case SpatialIndexType::GRID:
+                grid_index->Insert(id, envelope);
+                break;
+            case SpatialIndexType::QUADTREE:
+                quadtree_index->Insert(id, envelope);
+                break;
+        }
+    }
+    
+    vector<geometry_id_t> QueryIntersecting(const Envelope &query_envelope) {
+        switch (selected_index_type) {
+            case SpatialIndexType::RTREE:
+                return rtree_index->QueryIntersecting(query_envelope);
+            case SpatialIndexType::GRID:
+                return grid_index->QueryIntersecting(query_envelope);
+            case SpatialIndexType::QUADTREE:
+                return quadtree_index->QueryIntersecting(query_envelope);
+            default:
+                return {};
+        }
+    }
+    
+    vector<geometry_id_t> QueryWithinDistance(const Point &query_point, double distance) {
+        // Create circular query envelope
+        Envelope query_envelope;
+        query_envelope.min_x = query_point.x - distance;
+        query_envelope.max_x = query_point.x + distance;
+        query_envelope.min_y = query_point.y - distance;
+        query_envelope.max_y = query_point.y + distance;
+        
+        // Get candidates from spatial index
+        auto candidates = QueryIntersecting(query_envelope);
+        
+        // Filter candidates by exact distance
+        vector<geometry_id_t> results;
+        for (auto candidate_id : candidates) {
+            // Would need access to actual geometry data to compute exact distance
+            // This is typically done in a second pass
+            results.push_back(candidate_id);
+        }
+        
+        return results;
+    }
+    
+    void UpdateGeometry(geometry_id_t id, const Geometry &old_geometry, 
+                       const Geometry &new_geometry) {
+        RemoveGeometry(id, old_geometry);
+        InsertGeometry(id, new_geometry);
+    }
+    
+    void RemoveGeometry(geometry_id_t id, const Geometry &geometry) {
+        auto envelope = geometry.GetEnvelope();
+        
+        switch (selected_index_type) {
+            case SpatialIndexType::RTREE:
+                rtree_index->Remove(id, envelope);
+                break;
+            case SpatialIndexType::GRID:
+                grid_index->Remove(id, envelope);
+                break;
+            case SpatialIndexType::QUADTREE:
+                quadtree_index->Remove(id, envelope);
+                break;
+        }
+    }
+
+private:
+    SpatialIndexType DetermineOptimalIndexType(const SpatialIndexConfiguration &config) {
+        // Heuristics for index selection based on data characteristics
+        if (config.data_distribution == DataDistribution::UNIFORM && 
+            config.query_pattern == QueryPattern::RANGE_DOMINANT) {
+            return SpatialIndexType::GRID;
+        } else if (config.data_distribution == DataDistribution::CLUSTERED && 
+                  config.query_pattern == QueryPattern::POINT_DOMINANT) {
+            return SpatialIndexType::QUADTREE;
+        } else {
+            return SpatialIndexType::RTREE; // General purpose choice
+        }
+    }
+};
+```
+
+### 7.3.2 Machine Learning and Vector Processing Extension
+
+**Advanced ML Model Integration and Vector Operations**
+DuckDB's ML extension provides comprehensive machine learning capabilities including model training, inference, and vector similarity search:
+
+```cpp
+class MLExtension : public Extension {
+public:
+    void Initialize(ExtensionAPI &api) override {
+        // Register vector types
+        api.RegisterCustomType("VECTOR", CreateVectorType());
+        api.RegisterCustomType("EMBEDDING", CreateEmbeddingType());
+        
+        // Register vector operations
+        api.RegisterFunction("vector_add", CreateVectorAddFunction());
+        api.RegisterFunction("vector_subtract", CreateVectorSubtractFunction());
+        api.RegisterFunction("vector_multiply", CreateVectorMultiplyFunction());
+        api.RegisterFunction("dot_product", CreateDotProductFunction());
+        api.RegisterFunction("cosine_similarity", CreateCosineSimilarityFunction());
+        api.RegisterFunction("euclidean_distance", CreateEuclideanDistanceFunction());
+        api.RegisterFunction("manhattan_distance", CreateManhattanDistanceFunction());
+        
+        // Register ML model functions
+        api.RegisterFunction("train_linear_regression", CreateTrainLinearRegressionFunction());
+        api.RegisterFunction("train_logistic_regression", CreateTrainLogisticRegressionFunction());
+        api.RegisterFunction("train_decision_tree", CreateTrainDecisionTreeFunction());
+        api.RegisterFunction("train_random_forest", CreateTrainRandomForestFunction());
+        api.RegisterFunction("train_gradient_boosting", CreateTrainGradientBoostingFunction());
+        
+        // Register model prediction functions
+        api.RegisterFunction("predict", CreatePredictFunction());
+        api.RegisterFunction("predict_proba", CreatePredictProbaFunction());
+        
+        // Register model management functions
+        api.RegisterFunction("save_model", CreateSaveModelFunction());
+        api.RegisterFunction("load_model", CreateLoadModelFunction());
+        api.RegisterFunction("model_info", CreateModelInfoFunction());
+        
+        // Register vector similarity search
+        api.RegisterTableFunction("vector_search", CreateVectorSearchFunction());
+        api.RegisterFunction("create_vector_index", CreateVectorIndexFunction());
+    }
+
+private:
+    unique_ptr<ScalarFunction> CreateCosineSimilarityFunction() {
+        auto function = make_unique<ScalarFunction>("cosine_similarity");
+        
+        function->arguments = {LogicalType::VECTOR, LogicalType::VECTOR};
+        function->return_type = LogicalType::DOUBLE;
+        function->function = CosineSimilarityExecute;
+        
+        return function;
+    }
+    
+    static void CosineSimilarityExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+        auto &vec1_vector = args.data[0];
+        auto &vec2_vector = args.data[1];
+        
+        BinaryExecutor::Execute<vector_t, vector_t, double>(
+            vec1_vector, vec2_vector, result, args.size(),
+            [&](vector_t vec1, vector_t vec2) {
+                return CalculateCosineSimilarity(vec1, vec2);
+            });
+    }
+    
+    static double CalculateCosineSimilarity(vector_t vec1, vector_t vec2) {
+        if (vec1.dimension != vec2.dimension) {
+            throw MLException("Vector dimensions must match for cosine similarity");
+        }
+        
+        double dot_product = 0.0;
+        double norm1 = 0.0;
+        double norm2 = 0.0;
+        
+        for (idx_t i = 0; i < vec1.dimension; i++) {
+            dot_product += vec1.data[i] * vec2.data[i];
+            norm1 += vec1.data[i] * vec1.data[i];
+            norm2 += vec2.data[i] * vec2.data[i];
+        }
+        
+        if (norm1 == 0.0 || norm2 == 0.0) {
+            return 0.0; // Handle zero vectors
+        }
+        
+        return dot_product / (sqrt(norm1) * sqrt(norm2));
+    }
+};
+
+class MLModelTrainer {
+private:
+    // Model registry
+    unordered_map<string, unique_ptr<MLModel>> trained_models;
+    
+    // Training algorithms
+    unique_ptr<LinearRegressionTrainer> linear_regression_trainer;
+    unique_ptr<LogisticRegressionTrainer> logistic_regression_trainer;
+    unique_ptr<DecisionTreeTrainer> decision_tree_trainer;
+    unique_ptr<RandomForestTrainer> random_forest_trainer;
+    unique_ptr<GradientBoostingTrainer> gradient_boosting_trainer;
+    
+    // Feature engineering
+    unique_ptr<FeatureProcessor> feature_processor;
+
+public:
+    MLModelTrainer() {
+        linear_regression_trainer = make_unique<LinearRegressionTrainer>();
+        logistic_regression_trainer = make_unique<LogisticRegressionTrainer>();
+        decision_tree_trainer = make_unique<DecisionTreeTrainer>();
+        random_forest_trainer = make_unique<RandomForestTrainer>();
+        gradient_boosting_trainer = make_unique<GradientBoostingTrainer>();
+        feature_processor = make_unique<FeatureProcessor>();
+    }
+    
+    string TrainLinearRegression(const TrainingDataset &dataset, 
+                               const LinearRegressionConfig &config) {
+        // Preprocess features
+        auto processed_features = feature_processor->ProcessFeatures(dataset.features, config.feature_config);
+        
+        // Train model
+        auto model = linear_regression_trainer->Train(processed_features, dataset.targets, config);
+        
+        // Generate model ID and store
+        string model_id = GenerateModelID("linear_regression");
+        trained_models[model_id] = move(model);
+        
+        return model_id;
+    }
+    
+    string TrainRandomForest(const TrainingDataset &dataset, 
+                           const RandomForestConfig &config) {
+        auto processed_features = feature_processor->ProcessFeatures(dataset.features, config.feature_config);
+        
+        // Validate configuration
+        if (config.n_estimators <= 0) {
+            throw MLException("Number of estimators must be positive");
+        }
+        
+        if (config.max_depth <= 0) {
+            config.max_depth = CalculateOptimalDepth(processed_features);
+        }
+        
+        auto model = random_forest_trainer->Train(processed_features, dataset.targets, config);
+        
+        string model_id = GenerateModelID("random_forest");
+        trained_models[model_id] = move(model);
+        
+        return model_id;
+    }
+    
+    vector<double> Predict(const string &model_id, const Matrix &features) {
+        auto model_it = trained_models.find(model_id);
+        if (model_it == trained_models.end()) {
+            throw MLException("Model not found: " + model_id);
+        }
+        
+        auto &model = model_it->second;
+        
+        // Preprocess features using the same preprocessing as training
+        auto processed_features = feature_processor->ProcessFeatures(features, model->GetFeatureConfig());
+        
+        return model->Predict(processed_features);
+    }
+    
+    Matrix PredictProba(const string &model_id, const Matrix &features) {
+        auto model_it = trained_models.find(model_id);
+        if (model_it == trained_models.end()) {
+            throw MLException("Model not found: " + model_id);
+        }
+        
+        auto &model = model_it->second;
+        
+        if (!model->SupportsProba()) {
+            throw MLException("Model does not support probability predictions");
+        }
+        
+        auto processed_features = feature_processor->ProcessFeatures(features, model->GetFeatureConfig());
+        
+        return model->PredictProba(processed_features);
+    }
+    
+    ModelMetadata GetModelInfo(const string &model_id) {
+        auto model_it = trained_models.find(model_id);
+        if (model_it == trained_models.end()) {
+            throw MLException("Model not found: " + model_id);
+        }
+        
+        return model_it->second->GetMetadata();
+    }
+    
+    void SaveModel(const string &model_id, const string &file_path) {
+        auto model_it = trained_models.find(model_id);
+        if (model_it == trained_models.end()) {
+            throw MLException("Model not found: " + model_id);
+        }
+        
+        // Serialize model to file
+        ModelSerializer serializer;
+        serializer.SerializeModel(*model_it->second, file_path);
+    }
+    
+    string LoadModel(const string &file_path) {
+        ModelSerializer serializer;
+        auto model = serializer.DeserializeModel(file_path);
+        
+        string model_id = GenerateModelID(model->GetModelType());
+        trained_models[model_id] = move(model);
+        
+        return model_id;
+    }
+
+private:
+    string GenerateModelID(const string &model_type) {
+        auto timestamp = chrono::duration_cast<chrono::milliseconds>(
+            chrono::system_clock::now().time_since_epoch()).count();
+        
+        return model_type + "_" + to_string(timestamp);
+    }
+    
+    idx_t CalculateOptimalDepth(const Matrix &features) {
+        // Heuristic for optimal tree depth based on dataset size
+        idx_t n_samples = features.rows;
+        idx_t n_features = features.cols;
+        
+        return static_cast<idx_t>(log2(n_samples)) + static_cast<idx_t>(sqrt(n_features));
+    }
+};
+
+class VectorSearchEngine {
+private:
+    // Vector index implementations
+    unordered_map<string, unique_ptr<VectorIndex>> vector_indexes;
+    
+    // Index type selection
+    VectorIndexType default_index_type;
+    
+    // Vector storage
+    unordered_map<string, VectorStorage> vector_storage;
+
+public:
+    VectorSearchEngine() : default_index_type(VectorIndexType::HNSW) {}
+    
+    string CreateVectorIndex(const string &index_name, const VectorIndexConfig &config) {
+        VectorIndexType index_type = config.index_type.empty() ? 
+            default_index_type : ParseIndexType(config.index_type);
+        
+        unique_ptr<VectorIndex> index;
+        
+        switch (index_type) {
+            case VectorIndexType::FLAT:
+                index = make_unique<FlatVectorIndex>(config);
+                break;
+            case VectorIndexType::IVF:
+                index = make_unique<IVFVectorIndex>(config);
+                break;
+            case VectorIndexType::HNSW:
+                index = make_unique<HNSWVectorIndex>(config);
+                break;
+            case VectorIndexType::LSH:
+                index = make_unique<LSHVectorIndex>(config);
+                break;
+            default:
+                throw MLException("Unsupported vector index type");
+        }
+        
+        vector_indexes[index_name] = move(index);
+        
+        return index_name;
+    }
+    
+    void AddVectors(const string &index_name, const vector<vector_id_t> &ids, 
+                   const vector<Vector> &vectors) {
+        auto index_it = vector_indexes.find(index_name);
+        if (index_it == vector_indexes.end()) {
+            throw MLException("Vector index not found: " + index_name);
+        }
+        
+        auto &index = index_it->second;
+        
+        // Validate vector dimensions
+        if (!vectors.empty()) {
+            idx_t expected_dim = index->GetDimension();
+            for (const auto &vec : vectors) {
+                if (vec.dimension != expected_dim) {
+                    throw MLException("Vector dimension mismatch");
+                }
+            }
+        }
+        
+        // Add vectors to index
+        index->AddVectors(ids, vectors);
+        
+        // Store vectors for retrieval
+        auto &storage = vector_storage[index_name];
+        for (idx_t i = 0; i < ids.size(); i++) {
+            storage.vectors[ids[i]] = vectors[i];
+        }
+    }
+    
+    vector<VectorSearchResult> SearchSimilar(const string &index_name, 
+                                            const Vector &query_vector, 
+                                            idx_t k, 
+                                            const VectorSearchOptions &options) {
+        auto index_it = vector_indexes.find(index_name);
+        if (index_it == vector_indexes.end()) {
+            throw MLException("Vector index not found: " + index_name);
+        }
+        
+        auto &index = index_it->second;
+        
+        // Validate query vector dimension
+        if (query_vector.dimension != index->GetDimension()) {
+            throw MLException("Query vector dimension mismatch");
+        }
+        
+        // Perform similarity search
+        auto search_results = index->Search(query_vector, k, options);
+        
+        // Enhance results with vector data if requested
+        if (options.include_vectors) {
+            auto &storage = vector_storage[index_name];
+            for (auto &result : search_results) {
+                auto vec_it = storage.vectors.find(result.id);
+                if (vec_it != storage.vectors.end()) {
+                    result.vector = vec_it->second;
+                }
+            }
+        }
+        
+        return search_results;
+    }
+    
+    void RemoveVectors(const string &index_name, const vector<vector_id_t> &ids) {
+        auto index_it = vector_indexes.find(index_name);
+        if (index_it == vector_indexes.end()) {
+            throw MLException("Vector index not found: " + index_name);
+        }
+        
+        auto &index = index_it->second;
+        index->RemoveVectors(ids);
+        
+        // Remove from storage
+        auto &storage = vector_storage[index_name];
+        for (auto id : ids) {
+            storage.vectors.erase(id);
+        }
+    }
+    
+    VectorIndexStats GetIndexStats(const string &index_name) {
+        auto index_it = vector_indexes.find(index_name);
+        if (index_it == vector_indexes.end()) {
+            throw MLException("Vector index not found: " + index_name);
+        }
+        
+        return index_it->second->GetStats();
+    }
+
+private:
+    VectorIndexType ParseIndexType(const string &index_type_str) {
+        if (index_type_str == "flat") return VectorIndexType::FLAT;
+        if (index_type_str == "ivf") return VectorIndexType::IVF;
+        if (index_type_str == "hnsw") return VectorIndexType::HNSW;
+        if (index_type_str == "lsh") return VectorIndexType::LSH;
+        
+        throw MLException("Unknown vector index type: " + index_type_str);
+    }
+    
+    struct VectorStorage {
+        unordered_map<vector_id_t, Vector> vectors;
+    };
+};
+```
+
+### 7.3.3 Full-Text Search and Document Processing Extension
+
+**Advanced Text Analysis and Search Capabilities**
+DuckDB's full-text search extension provides comprehensive document indexing, search, and text analysis functionality:
+
+```cpp
+class FullTextSearchExtension : public Extension {
+public:
+    void Initialize(ExtensionAPI &api) override {
+        // Register full-text search functions
+        api.RegisterFunction("create_fts_index", CreateFTSIndexFunction());
+        api.RegisterFunction("fts_search", CreateFTSSearchFunction());
+        api.RegisterFunction("fts_match", CreateFTSMatchFunction());
+        api.RegisterFunction("fts_rank", CreateFTSRankFunction());
+        
+        // Register text analysis functions
+        api.RegisterFunction("tokenize", CreateTokenizeFunction());
+        api.RegisterFunction("stem", CreateStemFunction());
+        api.RegisterFunction("remove_stopwords", CreateRemoveStopwordsFunction());
+        api.RegisterFunction("ngrams", CreateNGramsFunction());
+        api.RegisterFunction("text_similarity", CreateTextSimilarityFunction());
+        
+        // Register document processing functions
+        api.RegisterFunction("extract_text", CreateExtractTextFunction());
+        api.RegisterFunction("detect_language", CreateDetectLanguageFunction());
+        api.RegisterFunction("sentiment_analysis", CreateSentimentAnalysisFunction());
+        api.RegisterFunction("keyword_extraction", CreateKeywordExtractionFunction());
+        
+        // Register search table functions
+        api.RegisterTableFunction("fts_query", CreateFTSQueryFunction());
+        api.RegisterTableFunction("text_search", CreateTextSearchFunction());
+    }
+
+private:
+    unique_ptr<ScalarFunction> CreateFTSSearchFunction() {
+        auto function = make_unique<ScalarFunction>("fts_search");
+        
+        function->arguments = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+        function->return_type = LogicalType::DOUBLE;
+        function->function = FTSSearchExecute;
+        
+        return function;
+    }
+    
+    static void FTSSearchExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+        auto &index_name_vector = args.data[0];
+        auto &query_vector = args.data[1];
+        
+        BinaryExecutor::Execute<string_t, string_t, double>(
+            index_name_vector, query_vector, result, args.size(),
+            [&](string_t index_name, string_t query) {
+                return ExecuteFullTextSearch(index_name.GetString(), query.GetString());
+            });
+    }
+    
+    static double ExecuteFullTextSearch(const string &index_name, const string &query) {
+        // Get FTS engine instance
+        auto fts_engine = GetFTSEngine();
+        
+        // Execute search and return relevance score
+        auto search_results = fts_engine->Search(index_name, query);
+        
+        // Return highest relevance score (simplified)
+        return search_results.empty() ? 0.0 : search_results[0].score;
+    }
+};
+
+class FullTextSearchEngine {
+private:
+    // Text indexes
+    unordered_map<string, unique_ptr<TextIndex>> text_indexes;
+    
+    // Text processors
+    unique_ptr<TextTokenizer> tokenizer;
+    unique_ptr<TextStemmer> stemmer;
+    unique_ptr<StopWordsFilter> stopwords_filter;
+    unique_ptr<LanguageDetector> language_detector;
+    
+    // Ranking algorithms
+    unique_ptr<TFIDFRanker> tfidf_ranker;
+    unique_ptr<BM25Ranker> bm25_ranker;
+    unique_ptr<CosineSimilarityRanker> cosine_ranker;
+
+public:
+    FullTextSearchEngine() {
+        tokenizer = make_unique<TextTokenizer>();
+        stemmer = make_unique<TextStemmer>();
+        stopwords_filter = make_unique<StopWordsFilter>();
+        language_detector = make_unique<LanguageDetector>();
+        tfidf_ranker = make_unique<TFIDFRanker>();
+        bm25_ranker = make_unique<BM25Ranker>();
+        cosine_ranker = make_unique<CosineSimilarityRanker>();
+    }
+    
+    string CreateIndex(const string &index_name, const FTSIndexConfig &config) {
+        // Determine index type
+        IndexType index_type = config.index_type.empty() ? 
+            IndexType::INVERTED_INDEX : ParseIndexType(config.index_type);
+        
+        unique_ptr<TextIndex> index;
+        
+        switch (index_type) {
+            case IndexType::INVERTED_INDEX:
+                index = make_unique<InvertedIndex>(config);
+                break;
+            case IndexType::SUFFIX_ARRAY:
+                index = make_unique<SuffixArrayIndex>(config);
+                break;
+            case IndexType::TRIE_INDEX:
+                index = make_unique<TrieIndex>(config);
+                break;
+            case IndexType::NGRAM_INDEX:
+                index = make_unique<NGramIndex>(config);
+                break;
+            default:
+                throw FTSException("Unsupported index type");
+        }
+        
+        text_indexes[index_name] = move(index);
+        
+        return index_name;
+    }
+    
+    void AddDocuments(const string &index_name, 
+                     const vector<document_id_t> &doc_ids, 
+                     const vector<string> &documents) {
+        auto index_it = text_indexes.find(index_name);
+        if (index_it == text_indexes.end()) {
+            throw FTSException("Text index not found: " + index_name);
+        }
+        
+        auto &index = index_it->second;
+        
+        for (idx_t i = 0; i < doc_ids.size(); i++) {
+            // Process document text
+            auto processed_text = ProcessDocument(documents[i], index->GetConfig());
+            
+            // Add to index
+            index->AddDocument(doc_ids[i], processed_text);
+        }
+    }
+    
+    vector<SearchResult> Search(const string &index_name, const string &query, 
+                               const SearchOptions &options) {
+        auto index_it = text_indexes.find(index_name);
+        if (index_it == text_indexes.end()) {
+            throw FTSException("Text index not found: " + index_name);
+        }
+        
+        auto &index = index_it->second;
+        
+        // Process query
+        auto processed_query = ProcessQuery(query, index->GetConfig());
+        
+        // Execute search
+        auto raw_results = index->Search(processed_query, options);
+        
+        // Apply ranking
+        auto ranked_results = ApplyRanking(raw_results, processed_query, options);
+        
+        // Apply result limits and filtering
+        return FilterAndLimitResults(ranked_results, options);
+    }
+    
+    double CalculateRelevanceScore(const string &index_name, 
+                                  document_id_t doc_id, 
+                                  const string &query) {
+        auto index_it = text_indexes.find(index_name);
+        if (index_it == text_indexes.end()) {
+            return 0.0;
+        }
+        
+        auto &index = index_it->second;
+        auto processed_query = ProcessQuery(query, index->GetConfig());
+        
+        return index->CalculateRelevance(doc_id, processed_query);
+    }
+    
+    void RemoveDocuments(const string &index_name, const vector<document_id_t> &doc_ids) {
+        auto index_it = text_indexes.find(index_name);
+        if (index_it == text_indexes.end()) {
+            throw FTSException("Text index not found: " + index_name);
+        }
+        
+        auto &index = index_it->second;
+        
+        for (auto doc_id : doc_ids) {
+            index->RemoveDocument(doc_id);
+        }
+    }
+
+private:
+    ProcessedText ProcessDocument(const string &document, const FTSIndexConfig &config) {
+        ProcessedText result;
+        
+        // Detect language if enabled
+        if (config.enable_language_detection) {
+            result.language = language_detector->DetectLanguage(document);
+        }
+        
+        // Tokenize text
+        auto tokens = tokenizer->Tokenize(document, config.tokenizer_config);
+        
+        // Apply stemming if enabled
+        if (config.enable_stemming) {
+            tokens = stemmer->StemTokens(tokens, result.language);
+        }
+        
+        // Remove stop words if enabled
+        if (config.enable_stopword_removal) {
+            tokens = stopwords_filter->FilterStopWords(tokens, result.language);
+        }
+        
+        // Generate n-grams if configured
+        if (config.ngram_size > 1) {
+            auto ngrams = GenerateNGrams(tokens, config.ngram_size);
+            tokens.insert(tokens.end(), ngrams.begin(), ngrams.end());
+        }
+        
+        result.tokens = tokens;
+        result.original_length = document.length();
+        result.processed_token_count = tokens.size();
+        
+        return result;
+    }
+    
+    ProcessedQuery ProcessQuery(const string &query, const FTSIndexConfig &config) {
+        ProcessedQuery result;
+        
+        // Parse query syntax (support for AND, OR, NOT, phrase queries, etc.)
+        result.query_tree = ParseQuerySyntax(query);
+        
+        // Process query terms same as documents
+        auto processed_text = ProcessDocument(query, config);
+        result.terms = processed_text.tokens;
+        
+        // Extract query operators and modifiers
+        result.operators = ExtractQueryOperators(query);
+        
+        return result;
+    }
+    
+    vector<SearchResult> ApplyRanking(const vector<SearchResult> &raw_results, 
+                                     const ProcessedQuery &query, 
+                                     const SearchOptions &options) {
+        vector<SearchResult> ranked_results = raw_results;
+        
+        switch (options.ranking_algorithm) {
+            case RankingAlgorithm::TFIDF:
+                tfidf_ranker->RankResults(ranked_results, query);
+                break;
+            case RankingAlgorithm::BM25:
+                bm25_ranker->RankResults(ranked_results, query);
+                break;
+            case RankingAlgorithm::COSINE_SIMILARITY:
+                cosine_ranker->RankResults(ranked_results, query);
+                break;
+            default:
+                // Keep original ordering
+                break;
+        }
+        
+        // Sort by relevance score (descending)
+        sort(ranked_results.begin(), ranked_results.end(), 
+             [](const SearchResult &a, const SearchResult &b) {
+                 return a.relevance_score > b.relevance_score;
+             });
+        
+        return ranked_results;
+    }
+    
+    vector<SearchResult> FilterAndLimitResults(const vector<SearchResult> &ranked_results, 
+                                              const SearchOptions &options) {
+        vector<SearchResult> filtered_results;
+        
+        // Apply score threshold
+        for (const auto &result : ranked_results) {
+            if (result.relevance_score >= options.min_score_threshold) {
+                filtered_results.push_back(result);
+            }
+        }
+        
+        // Apply result limit
+        if (options.max_results > 0 && filtered_results.size() > options.max_results) {
+            filtered_results.resize(options.max_results);
+        }
+        
+        return filtered_results;
+    }
+    
+    vector<string> GenerateNGrams(const vector<string> &tokens, idx_t n) {
+        vector<string> ngrams;
+        
+        if (tokens.size() < n) {
+            return ngrams;
+        }
+        
+        for (idx_t i = 0; i <= tokens.size() - n; i++) {
+            string ngram;
+            for (idx_t j = 0; j < n; j++) {
+                if (j > 0) ngram += " ";
+                ngram += tokens[i + j];
+            }
+            ngrams.push_back(ngram);
+        }
+        
+        return ngrams;
+    }
+    
+    IndexType ParseIndexType(const string &index_type_str) {
+        if (index_type_str == "inverted") return IndexType::INVERTED_INDEX;
+        if (index_type_str == "suffix_array") return IndexType::SUFFIX_ARRAY;
+        if (index_type_str == "trie") return IndexType::TRIE_INDEX;
+        if (index_type_str == "ngram") return IndexType::NGRAM_INDEX;
+        
+        throw FTSException("Unknown index type: " + index_type_str);
+    }
+};
+```
+
+This comprehensive community extensions framework showcases DuckDB's vibrant ecosystem and powerful extensibility. The spatial extension provides full GIS capabilities with PostGIS compatibility, the ML extension offers complete machine learning workflows including vector similarity search, and the full-text search extension delivers advanced document processing and search capabilities. These extensions demonstrate how DuckDB's architecture enables specialized functionality while maintaining performance and integration with the core analytical engine.
+
+---
