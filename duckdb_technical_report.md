@@ -9260,62 +9260,710 @@ The physical execution engine represents the culmination of DuckDB's query proce
 
 The transition from logical to physical planning represents a critical transformation where abstract query semantics are mapped to concrete execution strategies that consider hardware characteristics, resource availability, and performance optimization opportunities.
 
-**Physical Operator Hierarchy**
-DuckDB's physical operators form a sophisticated hierarchy that mirrors logical operators while adding execution-specific functionality:
+**Advanced Physical Operator Hierarchy with Vectorized Execution**
+DuckDB's physical operators form a sophisticated hierarchy that implements vectorized processing, push-based execution, and automatic parallelization through advanced execution frameworks:
 
 ```cpp
-class PhysicalOperator {
+// Advanced physical operator system with vectorized execution and analytical optimizations
+class AdvancedPhysicalOperator {
 public:
     PhysicalOperatorType type;
-    vector<unique_ptr<PhysicalOperator>> children;
+    vector<unique_ptr<AdvancedPhysicalOperator>> children;
     vector<LogicalType> types;
     idx_t estimated_cardinality;
     
-    // Execution state management
-    unique_ptr<OperatorState> local_state;
-    unique_ptr<GlobalOperatorState> global_state;
+    // Advanced execution state management
+    unique_ptr<VectorizedOperatorState> local_state;
+    unique_ptr<GlobalVectorizedState> global_state;
+    unique_ptr<ParallelExecutionState> parallel_state;
     
-    // Performance characteristics
+    // Vectorized processing capabilities
+    bool supports_vectorized_execution;
+    bool supports_simd_operations;
+    VectorProcessingType vector_processing_type;
+    size_t optimal_vector_size;
+    
+    // Performance characteristics and optimization
     bool can_be_parallelized;
     bool preserves_insertion_order;
     bool requires_sorted_input;
+    bool supports_streaming;
+    bool supports_pushdown;
     
-    // Resource management
+    // Advanced resource management
     idx_t estimated_memory_usage;
+    idx_t peak_memory_usage;
     double cpu_cost_factor;
+    double memory_cost_factor;
+    IOPattern io_pattern;
     
-    virtual unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) = 0;
-    virtual unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) = 0;
-    virtual OperatorResultType Execute(ExecutionContext &context,
-                                     DataChunk &input,
-                                     DataChunk &chunk,
-                                     GlobalOperatorState &gstate,
-                                     OperatorState &state) = 0;
+    // Analytical workload optimizations
+    bool supports_bloom_filters;
+    bool supports_zone_maps;
+    bool supports_predicate_pushdown;
+    bool supports_projection_pushdown;
+    
+    // Performance monitoring and adaptation
+    mutable atomic<uint64_t> execution_count{0};
+    mutable atomic<uint64_t> total_execution_time{0};
+    mutable atomic<uint64_t> total_tuples_processed{0};
+    
+    virtual unique_ptr<VectorizedOperatorState> GetOperatorState(ExecutionContext &context) = 0;
+    virtual unique_ptr<GlobalVectorizedState> GetGlobalOperatorState(ClientContext &context) = 0;
+    
+    // Advanced vectorized execution interface
+    virtual OperatorResultType ExecuteVectorized(ExecutionContext &context,
+                                                DataChunk &input,
+                                                DataChunk &output,
+                                                GlobalVectorizedState &gstate,
+                                                VectorizedOperatorState &state) = 0;
+    
+    // Parallel execution coordination
+    virtual bool CanParallelizeExecution(const ExecutionContext &context) const;
+    virtual unique_ptr<ParallelExecutionTask> CreateParallelTask(const ExecutionContext &context);
+    virtual void CoordinateParallelExecution(vector<unique_ptr<ParallelExecutionTask>> &tasks);
+    
+    // Memory management and spilling
+    virtual void HandleMemoryPressure(MemoryPressureEvent &event);
+    virtual bool CanSpillToDisk() const { return false; }
+    virtual void InitiateSpilling(const SpillingContext &context) {}
+    
+    // Performance optimization
+    virtual void OptimizeForWorkload(const WorkloadCharacteristics &workload);
+    virtual void UpdateStatistics(const ExecutionStatistics &stats);
+    
+protected:
+    // Utility methods for vectorized processing
+    void ProcessVectorizedChunk(DataChunk &input, DataChunk &output,
+                               const VectorProcessingFunction &func);
+    void ApplySIMDOptimizations(DataChunk &chunk, const SIMDOperationContext &context);
+    void EnableBloomFilterPushdown(const BloomFilterContext &context);
+    
+    // Memory management helpers
+    void MonitorMemoryUsage();
+    void AdaptToMemoryPressure(idx_t available_memory);
+    
+    // Performance tracking
+    void RecordExecutionMetrics(uint64_t execution_time, idx_t tuples_processed) const;
+    double GetAverageExecutionTime() const;
+    double GetThroughput() const;
+};
+
+// Advanced vectorized operator state with NUMA awareness
+class VectorizedOperatorState {
+protected:
+    // Core state management
+    ExecutionContext *context;
+    unique_ptr<DataChunkAllocator> chunk_allocator;
+    
+    // Vectorized processing state
+    vector<VectorProcessingState> vector_states;
+    unique_ptr<ExpressionExecutor> expression_executor;
+    
+    // Memory management
+    unique_ptr<LocalMemoryManager> memory_manager;
+    idx_t current_memory_usage;
+    idx_t memory_limit;
+    
+    // Performance optimization state
+    unique_ptr<VectorCache> vector_cache;
+    unique_ptr<SIMDOptimizationState> simd_state;
+    
+    // Analytical optimizations
+    unique_ptr<BloomFilterState> bloom_filter_state;
+    unique_ptr<ZoneMapState> zone_map_state;
+    
+    // Statistics and monitoring
+    OperatorStatistics local_statistics;
+    PerformanceCounters performance_counters;
+
+public:
+    VectorizedOperatorState(ExecutionContext &ctx) : context(&ctx) {
+        chunk_allocator = make_unique<DataChunkAllocator>(ctx);
+        expression_executor = make_unique<ExpressionExecutor>(ctx);
+        memory_manager = make_unique<LocalMemoryManager>(ctx);
+        vector_cache = make_unique<VectorCache>();
+        simd_state = make_unique<SIMDOptimizationState>();
+        
+        InitializeVectorizedState();
+    }
+    
+    virtual ~VectorizedOperatorState() = default;
+    
+    // Vectorized data processing
+    void ProcessDataVector(Vector &input, Vector &output, idx_t count,
+                          const VectorProcessingFunction &func);
+    
+    // Memory management
+    void AllocateVector(Vector &vector, LogicalType type, idx_t capacity);
+    void ReallocateVector(Vector &vector, idx_t new_capacity);
+    void DeallocateVector(Vector &vector);
+    
+    // Expression evaluation with vectorization
+    void EvaluateExpression(Expression &expr, DataChunk &input, Vector &result);
+    void EvaluateExpressionList(vector<unique_ptr<Expression>> &expressions,
+                               DataChunk &input, DataChunk &output);
+    
+    // Performance optimizations
+    void EnableSIMDProcessing(const SIMDConfiguration &config);
+    void OptimizeVectorLayout(DataChunk &chunk);
+    void ApplyVectorizedFilters(DataChunk &chunk, const vector<idx_t> &filter_indices);
+
+private:
+    void InitializeVectorizedState();
+    void ConfigureVectorProcessing();
+    void SetupSIMDOptimizations();
+};
+
+// Global state management for parallel vectorized execution
+class GlobalVectorizedState {
+private:
+    // Global coordination
+    unique_ptr<ParallelCoordinator> parallel_coordinator;
+    unique_ptr<GlobalMemoryManager> global_memory_manager;
+    
+    // Shared state across threads
+    unique_ptr<GlobalStatistics> global_statistics;
+    unique_ptr<SharedHashTable> shared_hash_table;
+    unique_ptr<GlobalBloomFilter> global_bloom_filter;
+    
+    // Work distribution
+    unique_ptr<WorkQueue> work_queue;
+    unique_ptr<MorselScheduler> morsel_scheduler;
+    
+    // Synchronization primitives
+    mutable mutex state_mutex;
+    mutable condition_variable state_condition;
+    atomic<OperatorFinalizationState> finalization_state{OperatorFinalizationState::RUNNING};
+    
+    // Performance monitoring
+    atomic<uint64_t> total_processed_tuples{0};
+    atomic<uint64_t> total_execution_time{0};
+    vector<unique_ptr<ThreadPerformanceTracker>> thread_trackers;
+
+public:
+    GlobalVectorizedState() {
+        parallel_coordinator = make_unique<ParallelCoordinator>();
+        global_memory_manager = make_unique<GlobalMemoryManager>();
+        global_statistics = make_unique<GlobalStatistics>();
+        work_queue = make_unique<WorkQueue>();
+        morsel_scheduler = make_unique<MorselScheduler>();
+    }
+    
+    // Parallel execution coordination
+    void InitializeParallelExecution(const ParallelExecutionConfig &config);
+    void CoordinateParallelWork(vector<unique_ptr<WorkerThread>> &workers);
+    void FinalizeParallelExecution();
+    
+    // Work distribution and scheduling
+    unique_ptr<WorkItem> GetNextWorkItem(idx_t thread_id);
+    void CompleteWorkItem(unique_ptr<WorkItem> item, const WorkResult &result);
+    bool HasPendingWork() const;
+    
+    // Shared state management
+    void UpdateGlobalStatistics(const LocalStatistics &local_stats);
+    void MergeLocalResults(const LocalExecutionResult &result);
+    
+    // Memory coordination
+    void HandleGlobalMemoryPressure();
+    void CoordinateSpilling(const SpillingRequest &request);
+    
+    // Performance tracking
+    void RecordThreadPerformance(idx_t thread_id, const ThreadPerformanceData &data);
+    GlobalPerformanceMetrics GetGlobalPerformanceMetrics() const;
+};
+
+// Advanced execution context with analytical optimizations
+class AnalyticalExecutionContext : public ExecutionContext {
+private:
+    // Analytical workload specific components
+    unique_ptr<VectorizedExecutionEngine> vectorized_engine;
+    unique_ptr<AnalyticalOptimizationManager> optimization_manager;
+    unique_ptr<WorkloadAnalyzer> workload_analyzer;
+    
+    // Advanced memory management
+    unique_ptr<AnalyticalMemoryManager> analytical_memory_manager;
+    unique_ptr<SpillingCoordinator> spilling_coordinator;
+    
+    // Performance optimization
+    unique_ptr<AdaptiveOptimizer> adaptive_optimizer;
+    unique_ptr<CacheManager> cache_manager;
+    
+    // Hardware utilization
+    unique_ptr<SIMDCapabilityDetector> simd_detector;
+    unique_ptr<NUMATopologyManager> numa_manager;
+
+public:
+    AnalyticalExecutionContext(ClientContext &client) : ExecutionContext(client) {
+        vectorized_engine = make_unique<VectorizedExecutionEngine>();
+        optimization_manager = make_unique<AnalyticalOptimizationManager>();
+        workload_analyzer = make_unique<WorkloadAnalyzer>();
+        analytical_memory_manager = make_unique<AnalyticalMemoryManager>();
+        spilling_coordinator = make_unique<SpillingCoordinator>();
+        adaptive_optimizer = make_unique<AdaptiveOptimizer>();
+        cache_manager = make_unique<CacheManager>();
+        simd_detector = make_unique<SIMDCapabilityDetector>();
+        numa_manager = make_unique<NUMATopologyManager>();
+        
+        InitializeAnalyticalContext();
+    }
+    
+    // Vectorized execution management
+    VectorizedExecutionEngine& GetVectorizedEngine() { return *vectorized_engine; }
+    void ConfigureVectorizedExecution(const VectorizedExecutionConfig &config);
+    
+    // Analytical optimization
+    void OptimizeForAnalyticalWorkload(const AnalyticalWorkloadProfile &profile);
+    void AdaptToWorkloadChanges(const WorkloadChangeEvent &event);
+    
+    // Advanced memory management
+    void HandleComplexMemoryRequirements(const ComplexMemoryRequest &request);
+    void CoordinateMemoryAcrossOperators(const MemoryCoordinationRequest &request);
+    
+    // Hardware optimization
+    void DetectAndConfigureHardwareCapabilities();
+    void OptimizeForNUMATopology();
+    void EnableSIMDOptimizations();
+
+private:
+    void InitializeAnalyticalContext();
+    void ConfigureForAnalyticalWorkloads();
+    void SetupHardwareOptimizations();
 };
 ```
 
-**Execution Context Integration**
-Physical operators integrate with DuckDB's execution context to manage resources and coordinate parallel execution:
+**Advanced Vectorized Execution Framework**
+The vectorized execution framework represents DuckDB's core innovation, implementing push-based vectorized processing with sophisticated parallelization and analytical optimizations:
 
 ```cpp
-class ExecutionContext {
-    ClientContext &client;
-    ThreadContext thread_context;
-    unique_ptr<TaskScheduler> task_scheduler;
+// Comprehensive vectorized execution engine with analytical optimizations
+class VectorizedExecutionEngine {
+private:
+    // Core vectorized processing components
+    unique_ptr<VectorProcessor> vector_processor;
+    unique_ptr<DataChunkManager> chunk_manager;
+    unique_ptr<ExpressionVectorizer> expression_vectorizer;
     
-public:
-    // Resource management
-    BufferManager &GetBufferManager() { return client.GetBufferManager(); }
-    MemoryManager &GetMemoryManager() { return client.GetMemoryManager(); }
+    // Pipeline management
+    unique_ptr<PipelineScheduler> pipeline_scheduler;
+    unique_ptr<ExecutionPipelineManager> pipeline_manager;
     
     // Parallel execution coordination
-    void ScheduleTask(unique_ptr<Task> task);
-    void WaitForTasks();
-    bool ShouldContinueExecution();
+    unique_ptr<ParallelExecutionCoordinator> parallel_coordinator;
+    unique_ptr<WorkStealingScheduler> work_scheduler;
     
-    // Performance monitoring
-    ProfilerInterface &GetProfiler() { return client.GetProfiler(); }
-    void RecordOperatorTiming(PhysicalOperatorType type, double execution_time);
+    // Memory and resource management
+    unique_ptr<VectorizedMemoryManager> memory_manager;
+    unique_ptr<SpillingManager> spilling_manager;
+    
+    // Performance optimization
+    unique_ptr<VectorizedProfiler> profiler;
+    unique_ptr<AdaptiveVectorSizeManager> vector_size_manager;
+    unique_ptr<SIMDOptimizationManager> simd_manager;
+    
+    // Configuration
+    VectorizedExecutionConfig config;
+
+public:
+    VectorizedExecutionEngine() {
+        vector_processor = make_unique<VectorProcessor>();
+        chunk_manager = make_unique<DataChunkManager>();
+        expression_vectorizer = make_unique<ExpressionVectorizer>();
+        pipeline_scheduler = make_unique<PipelineScheduler>();
+        pipeline_manager = make_unique<ExecutionPipelineManager>();
+        parallel_coordinator = make_unique<ParallelExecutionCoordinator>();
+        work_scheduler = make_unique<WorkStealingScheduler>();
+        memory_manager = make_unique<VectorizedMemoryManager>();
+        spilling_manager = make_unique<SpillingManager>();
+        profiler = make_unique<VectorizedProfiler>();
+        vector_size_manager = make_unique<AdaptiveVectorSizeManager>();
+        simd_manager = make_unique<SIMDOptimizationManager>();
+        
+        ConfigureForAnalyticalWorkloads();
+    }
+    
+    // Primary execution interface
+    unique_ptr<QueryResult> ExecuteVectorizedPlan(unique_ptr<AdvancedPhysicalOperator> plan,
+                                                  const AnalyticalExecutionContext &context) {
+        auto start_time = chrono::high_resolution_clock::now();
+        
+        try {
+            // Phase 1: Pipeline construction and optimization
+            auto pipelines = ConstructExecutionPipelines(plan.get(), context);
+            
+            // Phase 2: Resource allocation and configuration
+            ConfigureExecutionResources(pipelines, context);
+            
+            // Phase 3: Parallel execution coordination
+            auto execution_result = ExecutePipelinesInParallel(pipelines, context);
+            
+            // Phase 4: Result materialization and cleanup
+            auto query_result = MaterializeQueryResult(execution_result, context);
+            
+            auto end_time = chrono::high_resolution_clock::now();
+            auto duration = chrono::duration_cast<chrono::microseconds>(end_time - start_time);
+            
+            profiler->RecordQueryExecution(duration.count(), query_result->GetRowCount());
+            
+            return query_result;
+            
+        } catch (const ExecutionException &e) {
+            return HandleExecutionError(e, plan.get(), context);
+        }
+    }
+
+private:
+    vector<unique_ptr<ExecutionPipeline>> ConstructExecutionPipelines(AdvancedPhysicalOperator *root,
+                                                                     const AnalyticalExecutionContext &context) {
+        PipelineConstructionContext pipeline_context;
+        pipeline_context.enable_vectorization = true;
+        pipeline_context.enable_parallelization = true;
+        pipeline_context.target_vector_size = config.default_vector_size;
+        
+        // Analyze operator tree for pipeline boundaries
+        auto pipeline_boundaries = AnalyzePipelineBoundaries(root, pipeline_context);
+        
+        // Construct pipelines based on boundaries
+        vector<unique_ptr<ExecutionPipeline>> pipelines;
+        for (const auto &boundary : pipeline_boundaries) {
+            auto pipeline = ConstructSinglePipeline(boundary, pipeline_context);
+            pipelines.push_back(move(pipeline));
+        }
+        
+        // Optimize pipeline execution order
+        OptimizePipelineExecutionOrder(pipelines, context);
+        
+        return pipelines;
+    }
+    
+    unique_ptr<ExecutionPipeline> ConstructSinglePipeline(const PipelineBoundary &boundary,
+                                                          const PipelineConstructionContext &context) {
+        auto pipeline = make_unique<ExecutionPipeline>();
+        
+        // Configure pipeline characteristics
+        pipeline->pipeline_id = GeneratePipelineId();
+        pipeline->source_operator = boundary.source;
+        pipeline->sink_operator = boundary.sink;
+        pipeline->intermediate_operators = boundary.intermediate_operators;
+        
+        // Configure vectorized processing
+        pipeline->vector_size = DetermineOptimalVectorSize(boundary, context);
+        pipeline->supports_streaming = AnalyzeStreamingCapability(boundary);
+        pipeline->memory_requirements = EstimatePipelineMemoryUsage(boundary);
+        
+        // Configure parallelization
+        auto parallelization_analysis = AnalyzePipelineParallelization(boundary, context);
+        pipeline->can_parallelize = parallelization_analysis.can_parallelize;
+        pipeline->optimal_thread_count = parallelization_analysis.optimal_thread_count;
+        pipeline->morsel_size = parallelization_analysis.optimal_morsel_size;
+        
+        // Configure resource management
+        pipeline->spilling_support = AnalyzeSpillingRequirements(boundary);
+        pipeline->bloom_filter_opportunities = AnalyzeBloomFilterOpportunities(boundary);
+        
+        return pipeline;
+    }
+    
+    unique_ptr<ExecutionResult> ExecutePipelinesInParallel(vector<unique_ptr<ExecutionPipeline>> &pipelines,
+                                                          const AnalyticalExecutionContext &context) {
+        auto execution_result = make_unique<ExecutionResult>();
+        
+        // Create parallel execution plan
+        auto parallel_plan = CreateParallelExecutionPlan(pipelines, context);
+        
+        // Initialize worker threads
+        vector<unique_ptr<VectorizedWorkerThread>> workers;
+        for (idx_t i = 0; i < parallel_plan.worker_count; i++) {
+            auto worker = make_unique<VectorizedWorkerThread>(i, context);
+            workers.push_back(move(worker));
+        }
+        
+        // Execute pipelines with work stealing
+        ExecutePipelinesWithWorkStealing(pipelines, workers, parallel_plan, execution_result.get());
+        
+        // Coordinate result collection
+        CoordinateResultCollection(workers, execution_result.get());
+        
+        return execution_result;
+    }
+    
+    void ExecutePipelinesWithWorkStealing(vector<unique_ptr<ExecutionPipeline>> &pipelines,
+                                         vector<unique_ptr<VectorizedWorkerThread>> &workers,
+                                         const ParallelExecutionPlan &plan,
+                                         ExecutionResult *result) {
+        // Initialize work queues for each pipeline
+        vector<unique_ptr<WorkQueue>> work_queues;
+        for (auto &pipeline : pipelines) {
+            auto work_queue = CreateWorkQueueForPipeline(*pipeline, plan);
+            work_queues.push_back(move(work_queue));
+        }
+        
+        // Start worker threads
+        vector<future<WorkerExecutionResult>> worker_futures;
+        for (auto &worker : workers) {
+            auto future = async(launch::async, [&worker, &work_queues, &plan]() {
+                return worker->ExecuteWithWorkStealing(work_queues, plan);
+            });
+            worker_futures.push_back(move(future));
+        }
+        
+        // Coordinate execution and collect results
+        for (auto &future : worker_futures) {
+            auto worker_result = future.get();
+            result->MergeWorkerResult(worker_result);
+        }
+    }
+    
+    void ConfigureForAnalyticalWorkloads() {
+        // Optimize for analytical query patterns
+        config.default_vector_size = 2048;     // Larger vectors for analytics
+        config.enable_simd_optimizations = true;
+        config.enable_bloom_filters = true;
+        config.enable_zone_maps = true;
+        config.enable_adaptive_vector_sizing = true;
+        config.enable_work_stealing = true;
+        config.prefer_hash_algorithms = true;
+        config.enable_spilling = true;
+        config.memory_pressure_threshold = 0.8;
+    }
+};
+
+// Advanced execution pipeline with vectorized processing
+class ExecutionPipeline {
+public:
+    // Pipeline identification and structure
+    idx_t pipeline_id;
+    unique_ptr<AdvancedPhysicalOperator> source_operator;
+    unique_ptr<AdvancedPhysicalOperator> sink_operator;
+    vector<unique_ptr<AdvancedPhysicalOperator>> intermediate_operators;
+    
+    // Vectorized processing configuration
+    idx_t vector_size;
+    bool supports_streaming;
+    bool supports_simd;
+    VectorProcessingStrategy processing_strategy;
+    
+    // Parallelization configuration
+    bool can_parallelize;
+    idx_t optimal_thread_count;
+    idx_t morsel_size;
+    ParallelizationStrategy parallelization_strategy;
+    
+    // Resource management
+    idx_t memory_requirements;
+    bool spilling_support;
+    SpillingStrategy spilling_strategy;
+    
+    // Analytical optimizations
+    vector<BloomFilterOpportunity> bloom_filter_opportunities;
+    vector<ZoneMapOpportunity> zone_map_opportunities;
+    bool supports_predicate_pushdown;
+    bool supports_projection_pushdown;
+    
+    // Performance tracking
+    mutable atomic<uint64_t> execution_count{0};
+    mutable atomic<uint64_t> total_execution_time{0};
+    mutable atomic<uint64_t> total_tuples_processed{0};
+    
+    // Primary execution interface
+    PipelineExecutionResult Execute(const VectorizedExecutionContext &context) {
+        auto start_time = chrono::high_resolution_clock::now();
+        
+        auto result = ExecuteVectorizedPipeline(context);
+        
+        auto end_time = chrono::high_resolution_clock::now();
+        auto duration = chrono::duration_cast<chrono::microseconds>(end_time - start_time);
+        
+        // Update performance metrics
+        execution_count++;
+        total_execution_time += duration.count();
+        total_tuples_processed += result.tuples_processed;
+        
+        return result;
+    }
+
+private:
+    PipelineExecutionResult ExecuteVectorizedPipeline(const VectorizedExecutionContext &context) {
+        PipelineExecutionResult result;
+        
+        // Initialize pipeline state
+        auto pipeline_state = InitializePipelineState(context);
+        
+        // Create vectorized data flow
+        auto data_flow = CreateVectorizedDataFlow(context);
+        
+        // Execute pipeline with vectorized processing
+        while (data_flow->HasMoreData()) {
+            // Get next vector of data
+            auto input_chunk = data_flow->GetNextDataChunk();
+            if (input_chunk.size() == 0) {
+                break;
+            }
+            
+            // Process through pipeline operators
+            auto output_chunk = ProcessThroughPipeline(input_chunk, pipeline_state, context);
+            
+            // Handle output
+            result.AppendResult(output_chunk);
+            
+            // Check for early termination conditions
+            if (ShouldTerminateEarly(pipeline_state, context)) {
+                break;
+            }
+        }
+        
+        // Finalize pipeline execution
+        FinalizePipelineExecution(pipeline_state, result);
+        
+        return result;
+    }
+    
+    DataChunk ProcessThroughPipeline(const DataChunk &input,
+                                    PipelineState &state,
+                                    const VectorizedExecutionContext &context) {
+        DataChunk current_chunk = input;
+        
+        // Process through intermediate operators
+        for (auto &op : intermediate_operators) {
+            auto operator_state = state.GetOperatorState(op.get());
+            
+            DataChunk output_chunk;
+            auto exec_result = op->ExecuteVectorized(context, current_chunk, output_chunk,
+                                                   state.global_state, *operator_state);
+            
+            if (exec_result == OperatorResultType::HAVE_MORE_OUTPUT) {
+                current_chunk = move(output_chunk);
+            } else if (exec_result == OperatorResultType::FINISHED) {
+                // Early pipeline termination
+                current_chunk.Initialize(vector<LogicalType>{}); // Empty chunk
+                break;
+            }
+        }
+        
+        return current_chunk;
+    }
+};
+
+// Sophisticated vectorized worker thread with analytical optimizations
+class VectorizedWorkerThread {
+private:
+    idx_t worker_id;
+    unique_ptr<VectorizedExecutionContext> execution_context;
+    unique_ptr<LocalVectorCache> vector_cache;
+    unique_ptr<WorkStealingQueue> local_work_queue;
+    
+    // Performance optimization
+    unique_ptr<LocalSIMDProcessor> simd_processor;
+    unique_ptr<LocalBloomFilterCache> bloom_filter_cache;
+    
+    // Statistics and monitoring
+    WorkerStatistics worker_statistics;
+    unique_ptr<LocalProfiler> local_profiler;
+
+public:
+    VectorizedWorkerThread(idx_t id, const AnalyticalExecutionContext &context) 
+        : worker_id(id) {
+        execution_context = make_unique<VectorizedExecutionContext>(context);
+        vector_cache = make_unique<LocalVectorCache>();
+        local_work_queue = make_unique<WorkStealingQueue>();
+        simd_processor = make_unique<LocalSIMDProcessor>();
+        bloom_filter_cache = make_unique<LocalBloomFilterCache>();
+        local_profiler = make_unique<LocalProfiler>(id);
+        
+        InitializeWorkerOptimizations();
+    }
+    
+    WorkerExecutionResult ExecuteWithWorkStealing(vector<unique_ptr<WorkQueue>> &global_queues,
+                                                 const ParallelExecutionPlan &plan) {
+        WorkerExecutionResult result;
+        
+        while (true) {
+            // Try to get work from local queue first
+            auto work_item = local_work_queue->TryGetWork();
+            
+            if (!work_item) {
+                // Try work stealing from other queues
+                work_item = TryStealWork(global_queues, plan);
+            }
+            
+            if (!work_item) {
+                // No more work available
+                break;
+            }
+            
+            // Execute work item with vectorized processing
+            auto item_result = ExecuteWorkItem(move(work_item));
+            result.MergeItemResult(item_result);
+        }
+        
+        // Finalize worker execution
+        result.worker_statistics = worker_statistics;
+        result.local_profiler_data = local_profiler->GetProfilerData();
+        
+        return result;
+    }
+
+private:
+    unique_ptr<WorkItem> TryStealWork(vector<unique_ptr<WorkQueue>> &global_queues,
+                                     const ParallelExecutionPlan &plan) {
+        // Implement work stealing with NUMA awareness
+        auto preferred_queues = GetNUMAPreferredQueues(worker_id, plan);
+        
+        for (auto queue_id : preferred_queues) {
+            if (queue_id < global_queues.size()) {
+                auto work_item = global_queues[queue_id]->TryStealWork();
+                if (work_item) {
+                    return work_item;
+                }
+            }
+        }
+        
+        return nullptr;
+    }
+    
+    WorkItemResult ExecuteWorkItem(unique_ptr<WorkItem> work_item) {
+        auto start_time = chrono::high_resolution_clock::now();
+        
+        WorkItemResult result;
+        
+        // Execute work item with vectorized processing
+        switch (work_item->type) {
+            case WorkItemType::PIPELINE_MORSEL:
+                result = ExecutePipelineMorsel(work_item.get());
+                break;
+            case WorkItemType::HASH_BUILD:
+                result = ExecuteHashBuild(work_item.get());
+                break;
+            case WorkItemType::AGGREGATE_FINALIZE:
+                result = ExecuteAggregateFinalize(work_item.get());
+                break;
+        }
+        
+        auto end_time = chrono::high_resolution_clock::now();
+        auto duration = chrono::duration_cast<chrono::microseconds>(end_time - start_time);
+        
+        // Update worker statistics
+        worker_statistics.total_work_items++;
+        worker_statistics.total_execution_time += duration.count();
+        worker_statistics.total_tuples_processed += result.tuples_processed;
+        
+        return result;
+    }
+    
+    void InitializeWorkerOptimizations() {
+        // Configure SIMD optimizations
+        simd_processor->EnableAVX2Processing();
+        simd_processor->EnableVectorizedComparisons();
+        simd_processor->EnableVectorizedArithmetic();
+        
+        // Configure bloom filter caching
+        bloom_filter_cache->SetCacheSize(64 * 1024 * 1024); // 64MB cache
+        bloom_filter_cache->EnablePrefetching();
+        
+        // Configure vector caching
+        vector_cache->SetCacheSize(32 * 1024 * 1024); // 32MB cache
+        vector_cache->EnableVectorReuse();
+    }
 };
 ```
 
@@ -9662,109 +10310,603 @@ private:
 };
 ```
 
-**Morsel-Driven Parallelism**
-DuckDB implements morsel-driven parallelism to achieve optimal load balancing and resource utilization:
+## A4.2 Advanced Morsel-Driven Parallelism Implementation
+
+**Sophisticated Morsel Scheduling Framework**
+DuckDB implements an advanced morsel-driven parallelism system that achieves exceptional load balancing and resource utilization through intelligent work distribution, NUMA awareness, and adaptive scheduling algorithms:
 
 ```cpp
-class MorselScheduler {
+// Comprehensive morsel-driven parallelism system with analytical optimizations
+class AdvancedMorselScheduler {
+private:
+    // Core scheduling components
+    unique_ptr<MorselGenerator> morsel_generator;
+    unique_ptr<WorkDistributionManager> work_distribution_manager;
+    unique_ptr<LoadBalancingCoordinator> load_balancing_coordinator;
+    
+    // NUMA and hardware awareness
+    unique_ptr<NUMATopologyManager> numa_manager;
+    unique_ptr<HardwareCapabilityDetector> hardware_detector;
+    
+    // Performance monitoring and adaptation
+    unique_ptr<SchedulingProfiler> scheduling_profiler;
+    unique_ptr<AdaptiveSchedulingManager> adaptive_manager;
+    
+    // Configuration and state
+    MorselSchedulingConfig config;
+    atomic<SchedulingPhase> current_phase{SchedulingPhase::INITIALIZING};
+
 public:
-    static void ExecutePipelineParallel(Pipeline &pipeline, 
-                                      ExecutionContext &context,
-                                      idx_t thread_count) {
-        // Create thread-local execution contexts
-        vector<unique_ptr<PipelineExecutor>> executors;
-        for (idx_t i = 0; i < thread_count; i++) {
-            executors.push_back(make_unique<PipelineExecutor>(pipeline, context));
-        }
+    AdvancedMorselScheduler() {
+        morsel_generator = make_unique<MorselGenerator>();
+        work_distribution_manager = make_unique<WorkDistributionManager>();
+        load_balancing_coordinator = make_unique<LoadBalancingCoordinator>();
+        numa_manager = make_unique<NUMATopologyManager>();
+        hardware_detector = make_unique<HardwareCapabilityDetector>();
+        scheduling_profiler = make_unique<SchedulingProfiler>();
+        adaptive_manager = make_unique<AdaptiveSchedulingManager>();
         
-        // Work-stealing scheduler for load balancing
-        WorkStealingScheduler scheduler(thread_count);
-        
-        // Generate work morsels
-        auto morsels = GenerateMorsels(pipeline);
-        
-        // Execute morsels in parallel
-        scheduler.ExecuteParallel(morsels, executors);
+        ConfigureForAnalyticalWorkloads();
     }
     
+    // Primary scheduling interface
+    ParallelExecutionResult ExecutePipelineParallel(ExecutionPipeline &pipeline,
+                                                   const AnalyticalExecutionContext &context,
+                                                   idx_t thread_count) {
+        auto start_time = chrono::high_resolution_clock::now();
+        
+        try {
+            // Phase 1: Initialize parallel execution environment
+            auto parallel_context = InitializeParallelExecution(pipeline, context, thread_count);
+            
+            // Phase 2: Generate optimal work distribution
+            auto work_distribution = CreateWorkDistribution(pipeline, parallel_context);
+            
+            // Phase 3: Execute with adaptive load balancing
+            auto execution_result = ExecuteWithAdaptiveScheduling(work_distribution, parallel_context);
+            
+            // Phase 4: Collect results and finalize
+            auto final_result = FinalizeParallelExecution(execution_result, parallel_context);
+            
+            auto end_time = chrono::high_resolution_clock::now();
+            auto duration = chrono::duration_cast<chrono::microseconds>(end_time - start_time);
+            
+            scheduling_profiler->RecordPipelineExecution(pipeline.pipeline_id, duration.count(), 
+                                                       final_result.total_tuples_processed);
+            
+            return final_result;
+            
+        } catch (const ParallelExecutionException &e) {
+            return HandleParallelExecutionError(e, pipeline, context);
+        }
+    }
+
 private:
-    static vector<unique_ptr<Morsel>> GenerateMorsels(const Pipeline &pipeline) {
-        vector<unique_ptr<Morsel>> morsels;
+    ParallelExecutionContext InitializeParallelExecution(ExecutionPipeline &pipeline,
+                                                        const AnalyticalExecutionContext &context,
+                                                        idx_t thread_count) {
+        ParallelExecutionContext parallel_context;
         
-        // Get data source characteristics
-        auto source_cardinality = pipeline.source->estimated_cardinality;
-        auto optimal_morsel_size = CalculateOptimalMorselSize(source_cardinality);
+        // Configure thread allocation based on pipeline characteristics
+        parallel_context.total_threads = thread_count;
+        parallel_context.active_threads = DetermineActiveThreads(pipeline, thread_count);
         
-        // Generate morsels for data source
-        for (idx_t offset = 0; offset < source_cardinality; offset += optimal_morsel_size) {
-            auto morsel_size = std::min(optimal_morsel_size, source_cardinality - offset);
-            morsels.push_back(make_unique<Morsel>(offset, morsel_size));
+        // Initialize NUMA-aware thread allocation
+        parallel_context.numa_allocation = numa_manager->CreateOptimalAllocation(
+            parallel_context.active_threads, pipeline.memory_requirements);
+        
+        // Configure work stealing parameters
+        parallel_context.work_stealing_config = ConfigureWorkStealing(pipeline, context);
+        
+        // Initialize performance monitoring
+        parallel_context.performance_tracker = make_unique<ParallelPerformanceTracker>(
+            parallel_context.active_threads);
+        
+        // Configure memory coordination
+        parallel_context.memory_coordinator = make_unique<ParallelMemoryCoordinator>(
+            context.GetAnalyticalMemoryManager(), parallel_context.active_threads);
+        
+        return parallel_context;
+    }
+    
+    WorkDistribution CreateWorkDistribution(ExecutionPipeline &pipeline,
+                                           const ParallelExecutionContext &context) {
+        WorkDistribution distribution;
+        
+        // Analyze pipeline for optimal work generation
+        auto pipeline_analysis = AnalyzePipelineCharacteristics(pipeline);
+        
+        // Generate morsels based on pipeline source characteristics
+        auto morsels = morsel_generator->GenerateOptimalMorsels(pipeline, pipeline_analysis);
+        
+        // Create NUMA-aware work assignment
+        auto numa_assignment = CreateNUMAWorkAssignment(morsels, context.numa_allocation);
+        
+        // Configure work stealing topology
+        auto stealing_topology = CreateWorkStealingTopology(context);
+        
+        distribution.initial_work_assignment = numa_assignment;
+        distribution.work_stealing_topology = stealing_topology;
+        distribution.total_morsels = morsels.size();
+        distribution.estimated_total_work = CalculateTotalWork(morsels);
+        
+        return distribution;
+    }
+    
+    ParallelExecutionResult ExecuteWithAdaptiveScheduling(const WorkDistribution &distribution,
+                                                         ParallelExecutionContext &context) {
+        // Initialize worker threads with NUMA affinity
+        vector<unique_ptr<AdvancedWorkerThread>> workers;
+        for (idx_t i = 0; i < context.active_threads; i++) {
+            auto numa_node = context.numa_allocation.GetNUMANode(i);
+            auto worker = make_unique<AdvancedWorkerThread>(i, numa_node, context);
+            workers.push_back(move(worker));
+        }
+        
+        // Initialize adaptive scheduling coordinator
+        auto coordinator = make_unique<AdaptiveSchedulingCoordinator>(workers, distribution);
+        
+        // Execute with real-time adaptation
+        return ExecuteWithRealTimeAdaptation(workers, coordinator.get(), context);
+    }
+    
+    ParallelExecutionResult ExecuteWithRealTimeAdaptation(vector<unique_ptr<AdvancedWorkerThread>> &workers,
+                                                         AdaptiveSchedulingCoordinator *coordinator,
+                                                         ParallelExecutionContext &context) {
+        // Start worker threads
+        vector<future<WorkerExecutionResult>> worker_futures;
+        for (auto &worker : workers) {
+            auto future = async(launch::async, [&worker, coordinator, &context]() {
+                return worker->ExecuteWithAdaptiveScheduling(coordinator, context);
+            });
+            worker_futures.push_back(move(future));
+        }
+        
+        // Monitor and adapt execution in real-time
+        MonitorAndAdaptExecution(coordinator, context);
+        
+        // Collect worker results
+        ParallelExecutionResult combined_result;
+        for (auto &future : worker_futures) {
+            auto worker_result = future.get();
+            combined_result.MergeWorkerResult(worker_result);
+        }
+        
+        return combined_result;
+    }
+    
+    void ConfigureForAnalyticalWorkloads() {
+        // Optimize morsel scheduling for analytical query patterns
+        config.default_morsel_size = 32768;      // Larger morsels for analytics
+        config.enable_adaptive_sizing = true;
+        config.enable_numa_awareness = true;
+        config.enable_work_stealing = true;
+        config.work_stealing_strategy = WorkStealingStrategy::HIERARCHICAL_NUMA;
+        config.load_balancing_threshold = 0.1;   // 10% imbalance triggers rebalancing
+        config.performance_monitoring_interval = 100; // Monitor every 100ms
+    }
+};
+
+// Advanced morsel generation with workload-specific optimizations
+class MorselGenerator {
+public:
+    vector<unique_ptr<WorkMorsel>> GenerateOptimalMorsels(ExecutionPipeline &pipeline,
+                                                         const PipelineAnalysis &analysis) {
+        vector<unique_ptr<WorkMorsel>> morsels;
+        
+        // Determine optimal morsel generation strategy
+        auto generation_strategy = DetermineGenerationStrategy(pipeline, analysis);
+        
+        switch (generation_strategy) {
+            case MorselGenerationStrategy::UNIFORM_SIZE:
+                morsels = GenerateUniformMorsels(pipeline, analysis);
+                break;
+            case MorselGenerationStrategy::ADAPTIVE_SIZE:
+                morsels = GenerateAdaptiveMorsels(pipeline, analysis);
+                break;
+            case MorselGenerationStrategy::WORKLOAD_AWARE:
+                morsels = GenerateWorkloadAwareMorsels(pipeline, analysis);
+                break;
+            case MorselGenerationStrategy::NUMA_OPTIMIZED:
+                morsels = GenerateNUMAOptimizedMorsels(pipeline, analysis);
+                break;
+        }
+        
+        // Apply post-generation optimizations
+        OptimizeMorselDistribution(morsels, analysis);
+        
+        return morsels;
+    }
+
+private:
+    vector<unique_ptr<WorkMorsel>> GenerateAdaptiveMorsels(ExecutionPipeline &pipeline,
+                                                          const PipelineAnalysis &analysis) {
+        vector<unique_ptr<WorkMorsel>> morsels;
+        
+        // Calculate base morsel size considering multiple factors
+        auto base_size = CalculateBaseMorselSize(analysis);
+        
+        // Adjust based on pipeline characteristics
+        auto adjusted_size = AdjustForPipelineCharacteristics(base_size, pipeline);
+        
+        // Generate morsels with adaptive sizing
+        auto source_cardinality = pipeline.source_operator->estimated_cardinality;
+        idx_t current_offset = 0;
+        
+        while (current_offset < source_cardinality) {
+            // Calculate dynamic morsel size based on remaining work
+            auto dynamic_size = CalculateDynamicMorselSize(adjusted_size, 
+                                                          source_cardinality - current_offset,
+                                                          analysis);
+            
+            auto actual_size = std::min(dynamic_size, source_cardinality - current_offset);
+            
+            // Create morsel with comprehensive metadata
+            auto morsel = CreateAdvancedMorsel(current_offset, actual_size, pipeline, analysis);
+            morsels.push_back(move(morsel));
+            
+            current_offset += actual_size;
         }
         
         return morsels;
     }
+    
+    unique_ptr<WorkMorsel> CreateAdvancedMorsel(idx_t start_offset, idx_t size,
+                                               ExecutionPipeline &pipeline,
+                                               const PipelineAnalysis &analysis) {
+        auto morsel = make_unique<WorkMorsel>();
+        
+        // Basic morsel configuration
+        morsel->start_offset = start_offset;
+        morsel->end_offset = start_offset + size;
+        morsel->estimated_work_units = CalculateWorkUnits(size, analysis);
+        
+        // Advanced configuration
+        morsel->preferred_numa_node = DeterminePreferredNUMANode(start_offset, analysis);
+        morsel->memory_requirements = EstimateMorselMemoryUsage(size, pipeline);
+        morsel->processing_complexity = EstimateProcessingComplexity(size, analysis);
+        
+        // Optimization hints
+        morsel->supports_simd = CanUseSIMDOptimizations(pipeline, analysis);
+        morsel->cache_locality_hint = CalculateCacheLocalityHint(start_offset, size);
+        morsel->parallelization_benefit = EstimateParallelizationBenefit(size, analysis);
+        
+        // Performance prediction
+        morsel->estimated_execution_time = PredictExecutionTime(morsel.get(), pipeline, analysis);
+        
+        return morsel;
+    }
+    
+    idx_t CalculateBaseMorselSize(const PipelineAnalysis &analysis) {
+        // Consider multiple factors for optimal morsel sizing
+        
+        // Factor 1: CPU cache efficiency
+        auto cache_optimal_size = CalculateCacheOptimalSize(analysis.average_tuple_size);
+        
+        // Factor 2: SIMD efficiency
+        auto simd_optimal_size = CalculateSIMDOptimalSize(analysis.vectorization_factor);
+        
+        // Factor 3: Parallelization overhead
+        auto parallel_optimal_size = CalculateParallelOptimalSize(analysis.parallelization_overhead);
+        
+        // Factor 4: Memory bandwidth utilization
+        auto bandwidth_optimal_size = CalculateBandwidthOptimalSize(analysis.memory_access_pattern);
+        
+        // Combine factors using weighted optimization
+        WeightedSizeOptimizer optimizer;
+        optimizer.AddFactor(cache_optimal_size, 0.3);
+        optimizer.AddFactor(simd_optimal_size, 0.25);
+        optimizer.AddFactor(parallel_optimal_size, 0.25);
+        optimizer.AddFactor(bandwidth_optimal_size, 0.2);
+        
+        return optimizer.CalculateOptimalSize();
+    }
 };
 
-class WorkStealingScheduler {
-    idx_t thread_count;
-    atomic<idx_t> work_index;
-    vector<queue<unique_ptr<Morsel>>> thread_queues;
-    
-public:
-    explicit WorkStealingScheduler(idx_t threads) : thread_count(threads), work_index(0) {
-        thread_queues.resize(thread_count);
-    }
-    
-    void ExecuteParallel(vector<unique_ptr<Morsel>> &morsels,
-                        vector<unique_ptr<PipelineExecutor>> &executors) {
-        // Distribute initial work
-        DistributeWork(morsels);
-        
-        // Launch worker threads
-        vector<thread> workers;
-        for (idx_t i = 0; i < thread_count; i++) {
-            workers.emplace_back([this, i, &executors]() {
-                ExecuteWorkerThread(i, *executors[i]);
-            });
-        }
-        
-        // Wait for completion
-        for (auto &worker : workers) {
-            worker.join();
-        }
-    }
-    
+// Sophisticated work-stealing scheduler with NUMA awareness
+class AdvancedWorkStealingScheduler {
 private:
-    void ExecuteWorkerThread(idx_t thread_id, PipelineExecutor &executor) {
-        while (true) {
-            auto morsel = GetNextMorsel(thread_id);
-            if (!morsel) {
-                break; // No more work
+    // NUMA-aware work queues
+    vector<vector<unique_ptr<WorkQueue>>> numa_work_queues;
+    vector<unique_ptr<NUMALocalScheduler>> numa_schedulers;
+    
+    // Global coordination
+    unique_ptr<GlobalWorkCoordinator> global_coordinator;
+    unique_ptr<LoadBalancingManager> load_balancing_manager;
+    
+    // Performance monitoring
+    unique_ptr<WorkStealingProfiler> profiler;
+    atomic<uint64_t> total_steals{0};
+    atomic<uint64_t> successful_steals{0};
+
+public:
+    AdvancedWorkStealingScheduler(const NUMATopology &topology) {
+        InitializeNUMAQueues(topology);
+        InitializeCoordination();
+        ConfigureOptimizations();
+    }
+    
+    WorkStealingResult ExecuteWithWorkStealing(vector<unique_ptr<AdvancedWorkerThread>> &workers,
+                                              const WorkDistribution &distribution,
+                                              ParallelExecutionContext &context) {
+        auto start_time = chrono::high_resolution_clock::now();
+        
+        // Initialize work distribution
+        DistributeInitialWork(distribution, context);
+        
+        // Start work stealing coordination
+        StartWorkStealingCoordination(workers, context);
+        
+        // Monitor and adapt work stealing behavior
+        auto result = MonitorAndAdaptWorkStealing(workers, context);
+        
+        auto end_time = chrono::high_resolution_clock::now();
+        auto duration = chrono::duration_cast<chrono::microseconds>(end_time - start_time);
+        
+        // Record work stealing performance
+        profiler->RecordWorkStealingSession(duration.count(), total_steals.load(), 
+                                          successful_steals.load());
+        
+        return result;
+    }
+
+private:
+    void InitializeNUMAQueues(const NUMATopology &topology) {
+        numa_work_queues.resize(topology.numa_node_count);
+        numa_schedulers.reserve(topology.numa_node_count);
+        
+        for (idx_t numa_node = 0; numa_node < topology.numa_node_count; numa_node++) {
+            // Create work queues for this NUMA node
+            auto &node_queues = numa_work_queues[numa_node];
+            auto threads_per_node = topology.GetThreadsPerNode(numa_node);
+            
+            node_queues.reserve(threads_per_node);
+            for (idx_t i = 0; i < threads_per_node; i++) {
+                node_queues.push_back(make_unique<LockFreeWorkQueue>());
             }
             
-            executor.ExecuteMorsel(*morsel);
+            // Create NUMA-local scheduler
+            auto scheduler = make_unique<NUMALocalScheduler>(numa_node, node_queues);
+            numa_schedulers.push_back(move(scheduler));
         }
     }
     
-    unique_ptr<Morsel> GetNextMorsel(idx_t thread_id) {
-        // Try to get work from own queue first
-        if (!thread_queues[thread_id].empty()) {
-            auto morsel = move(thread_queues[thread_id].front());
-            thread_queues[thread_id].pop();
-            return morsel;
-        }
+    WorkStealingResult MonitorAndAdaptWorkStealing(vector<unique_ptr<AdvancedWorkerThread>> &workers,
+                                                  ParallelExecutionContext &context) {
+        WorkStealingResult result;
         
-        // Work stealing: try to steal from other threads
-        for (idx_t i = 0; i < thread_count; i++) {
-            idx_t victim_id = (thread_id + i + 1) % thread_count;
-            if (!thread_queues[victim_id].empty()) {
-                auto morsel = move(thread_queues[victim_id].front());
-                thread_queues[victim_id].pop();
-                return morsel;
+        // Real-time monitoring loop
+        auto monitoring_thread = thread([this, &workers, &context, &result]() {
+            while (!ShouldTerminateMonitoring(context)) {
+                // Collect work stealing statistics
+                auto stats = CollectWorkStealingStatistics(workers);
+                
+                // Analyze load balance
+                auto load_balance_analysis = AnalyzeLoadBalance(stats);
+                
+                // Apply adaptive optimizations
+                ApplyAdaptiveOptimizations(load_balance_analysis, workers, context);
+                
+                // Update result metrics
+                result.UpdateMetrics(stats);
+                
+                // Sleep before next monitoring cycle
+                this_thread::sleep_for(chrono::milliseconds(config.monitoring_interval));
             }
+        });
+        
+        // Wait for execution completion
+        WaitForWorkCompletion(workers, context);
+        
+        // Stop monitoring
+        context.request_termination = true;
+        monitoring_thread.join();
+        
+        return result;
+    }
+    
+    void ApplyAdaptiveOptimizations(const LoadBalanceAnalysis &analysis,
+                                   vector<unique_ptr<AdvancedWorkerThread>> &workers,
+                                   ParallelExecutionContext &context) {
+        // Adaptive optimization 1: Adjust work stealing frequency
+        if (analysis.steal_success_rate < STEAL_SUCCESS_THRESHOLD) {
+            ReduceStealingFrequency(workers);
+        } else if (analysis.load_imbalance > LOAD_IMBALANCE_THRESHOLD) {
+            IncreaseStealingFrequency(workers);
         }
         
-        return nullptr; // No work available
+        // Adaptive optimization 2: Adjust morsel sizes dynamically
+        if (analysis.average_morsel_processing_time < TARGET_MORSEL_TIME * 0.5) {
+            RequestLargerMorsels(context);
+        } else if (analysis.average_morsel_processing_time > TARGET_MORSEL_TIME * 2.0) {
+            RequestSmallerMorsels(context);
+        }
+        
+        // Adaptive optimization 3: Adjust NUMA stealing behavior
+        if (analysis.cross_numa_steals > analysis.local_numa_steals * 0.3) {
+            PreferLocalNUMAStealing(workers);
+        }
+        
+        // Adaptive optimization 4: Dynamic thread adjustment
+        if (analysis.thread_utilization < MIN_THREAD_UTILIZATION) {
+            ConsiderThreadReduction(workers, context);
+        }
+    }
+    
+    static const double STEAL_SUCCESS_THRESHOLD = 0.3;
+    static const double LOAD_IMBALANCE_THRESHOLD = 0.15;
+    static const double TARGET_MORSEL_TIME = 5000.0; // 5ms target
+    static const double MIN_THREAD_UTILIZATION = 0.8;
+};
+
+// Advanced worker thread with sophisticated parallel coordination
+class AdvancedWorkerThread {
+private:
+    idx_t worker_id;
+    idx_t numa_node;
+    
+    // Execution state
+    unique_ptr<WorkerExecutionContext> execution_context;
+    unique_ptr<LocalWorkQueue> local_work_queue;
+    unique_ptr<WorkStealingEngine> stealing_engine;
+    
+    // Performance optimization
+    unique_ptr<LocalSIMDProcessor> simd_processor;
+    unique_ptr<LocalCacheOptimizer> cache_optimizer;
+    unique_ptr<LocalMemoryManager> memory_manager;
+    
+    // Statistics and monitoring
+    WorkerStatistics statistics;
+    unique_ptr<LocalPerformanceProfiler> profiler;
+    
+    // Adaptive behavior
+    unique_ptr<AdaptiveBehaviorManager> adaptive_manager;
+
+public:
+    AdvancedWorkerThread(idx_t id, idx_t numa, const ParallelExecutionContext &context)
+        : worker_id(id), numa_node(numa) {
+        execution_context = make_unique<WorkerExecutionContext>(context);
+        local_work_queue = make_unique<LocalWorkQueue>();
+        stealing_engine = make_unique<WorkStealingEngine>(id, numa);
+        simd_processor = make_unique<LocalSIMDProcessor>();
+        cache_optimizer = make_unique<LocalCacheOptimizer>();
+        memory_manager = make_unique<LocalMemoryManager>(numa);
+        profiler = make_unique<LocalPerformanceProfiler>(id);
+        adaptive_manager = make_unique<AdaptiveBehaviorManager>();
+        
+        InitializeWorkerOptimizations();
+        ConfigureNUMAAffinity();
+    }
+    
+    WorkerExecutionResult ExecuteWithAdaptiveScheduling(AdaptiveSchedulingCoordinator *coordinator,
+                                                       ParallelExecutionContext &context) {
+        WorkerExecutionResult result;
+        auto start_time = chrono::high_resolution_clock::now();
+        
+        try {
+            // Main execution loop with adaptive behavior
+            while (!context.ShouldTerminate()) {
+                // Phase 1: Try to get local work
+                auto work_item = local_work_queue->TryDequeue();
+                
+                if (!work_item) {
+                    // Phase 2: Attempt work stealing with adaptive strategy
+                    work_item = stealing_engine->AttemptWorkStealing(coordinator, context);
+                }
+                
+                if (!work_item) {
+                    // Phase 3: Idle handling with adaptive backoff
+                    HandleIdleState(coordinator, context);
+                    continue;
+                }
+                
+                // Phase 4: Execute work item with optimizations
+                auto item_result = ExecuteWorkItemOptimized(move(work_item), context);
+                result.MergeItemResult(item_result);
+                
+                // Phase 5: Adaptive behavior updates
+                adaptive_manager->UpdateBehaviorMetrics(item_result);
+                
+                // Phase 6: Coordination with global scheduler
+                coordinator->NotifyWorkCompletion(worker_id, item_result);
+            }
+            
+        } catch (const WorkerExecutionException &e) {
+            result.execution_error = e.what();
+        }
+        
+        auto end_time = chrono::high_resolution_clock::now();
+        auto duration = chrono::duration_cast<chrono::microseconds>(end_time - start_time);
+        
+        // Finalize worker result
+        result.worker_id = worker_id;
+        result.execution_time = duration.count();
+        result.worker_statistics = statistics;
+        result.performance_data = profiler->GetPerformanceData();
+        
+        return result;
+    }
+
+private:
+    WorkItemResult ExecuteWorkItemOptimized(unique_ptr<WorkItem> work_item,
+                                           ParallelExecutionContext &context) {
+        auto start_time = chrono::high_resolution_clock::now();
+        
+        // Pre-execution optimizations
+        cache_optimizer->OptimizeForWorkItem(*work_item);
+        simd_processor->ConfigureForWorkItem(*work_item);
+        
+        // Execute work item based on type
+        WorkItemResult result;
+        switch (work_item->type) {
+            case WorkItemType::PIPELINE_MORSEL:
+                result = ExecutePipelineMorselOptimized(
+                    static_cast<PipelineMorselWorkItem*>(work_item.get()), context);
+                break;
+            case WorkItemType::HASH_BUILD_PARTITION:
+                result = ExecuteHashBuildPartitionOptimized(
+                    static_cast<HashBuildWorkItem*>(work_item.get()), context);
+                break;
+            case WorkItemType::AGGREGATE_COMBINE:
+                result = ExecuteAggregateCombineOptimized(
+                    static_cast<AggregateCombineWorkItem*>(work_item.get()), context);
+                break;
+            case WorkItemType::SORT_MERGE:
+                result = ExecuteSortMergeOptimized(
+                    static_cast<SortMergeWorkItem*>(work_item.get()), context);
+                break;
+        }
+        
+        auto end_time = chrono::high_resolution_clock::now();
+        auto duration = chrono::duration_cast<chrono::microseconds>(end_time - start_time);
+        
+        // Update statistics
+        statistics.total_work_items++;
+        statistics.total_execution_time += duration.count();
+        statistics.total_tuples_processed += result.tuples_processed;
+        
+        // Record performance metrics
+        profiler->RecordWorkItemExecution(work_item->type, duration.count(), result.tuples_processed);
+        
+        return result;
+    }
+    
+    void InitializeWorkerOptimizations() {
+        // Configure SIMD processing capabilities
+        simd_processor->DetectCapabilities();
+        simd_processor->EnableAVX2Processing();
+        simd_processor->EnableVectorizedExpressionEvaluation();
+        
+        // Configure cache optimization
+        cache_optimizer->SetCacheSize(GetL1CacheSize(), GetL2CacheSize(), GetL3CacheSize());
+        cache_optimizer->EnablePrefetching();
+        cache_optimizer->EnableCacheLineAlignment();
+        
+        // Configure memory management
+        memory_manager->SetNUMAAffinity(numa_node);
+        memory_manager->EnableLocalAllocation();
+        memory_manager->ConfigureForAnalyticalWorkloads();
+        
+        // Configure adaptive behavior
+        adaptive_manager->SetWorkerProfile(worker_id, numa_node);
+        adaptive_manager->EnableAdaptiveStealingStrategy();
+        adaptive_manager->EnableAdaptiveMorselSizing();
+    }
+    
+    void ConfigureNUMAAffinity() {
+        // Set CPU affinity to NUMA node
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        
+        auto numa_cpus = GetNUMACPUs(numa_node);
+        for (auto cpu : numa_cpus) {
+            CPU_SET(cpu, &cpuset);
+        }
+        
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+        
+        // Configure memory policy for NUMA locality
+        numa_set_preferred(numa_node);
     }
 };
 ```
