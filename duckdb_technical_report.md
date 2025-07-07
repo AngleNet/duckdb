@@ -15425,6 +15425,641 @@ public:
             }
             
             // Update scan state
+            if (column_state.row_index >= row_group.GetRowCount()) {
+                state.row_group_index++;
+                state.row_index = 0;
+            } else {
+                state.row_index = column_state.row_index;
+            }
+            
+            if (result.size() > 0) {
+                break; // Have data to return
+            }
+        }
+        
+        // Check active row group if we've exhausted stored row groups
+        if (state.row_group_index >= row_groups.size() && active_row_group) {
+            ScanActiveRowGroup(state, result, column_ids, filters);
+        }
+    }
+
+private:
+    void FinalizeRowGroup() {
+        if (active_row_group && active_row_group->GetRowCount() > 0) {
+            // Compress row group for storage efficiency
+            active_row_group->Compress();
+            
+            // Move to permanent storage
+            row_groups.push_back(move(active_row_group));
+        }
+    }
+    
+    bool CanSkipRowGroup(const RowGroup &row_group, const TableFilters &filters) {
+        auto &rg_stats = row_group.GetStatistics();
+        
+        for (const auto &filter : filters.filters) {
+            if (!rg_stats.CanPassFilter(filter.second)) {
+                return true; // Can skip this row group
+            }
+        }
+        return false;
+    }
+};
+```
+
+---
+
+## B1: Advanced Columnar Storage Format Implementation
+
+**Sophisticated Column-Oriented Storage Architecture**
+DuckDB implements an advanced columnar storage system that leverages cutting-edge compression algorithms, intelligent data layout optimization, and hardware-aware access patterns to achieve exceptional analytical performance:
+
+```cpp
+// Comprehensive columnar storage system with advanced compression and optimization
+class AdvancedColumnarStorageEngine {
+private:
+    // Core storage management
+    unique_ptr<StorageLayerManager> storage_layer_manager;
+    unique_ptr<CompressionEngine> compression_engine;
+    unique_ptr<ColumnLayoutOptimizer> layout_optimizer;
+    
+    // Data organization and access
+    unique_ptr<RowGroupManager> row_group_manager;
+    unique_ptr<ColumnSegmentManager> segment_manager;
+    unique_ptr<MetadataManager> metadata_manager;
+    
+    // Performance optimization
+    unique_ptr<StoragePerformanceProfiler> storage_profiler;
+    unique_ptr<AccessPatternAnalyzer> access_pattern_analyzer;
+    unique_ptr<CacheOptimizedStorage> cache_optimized_storage;
+    
+    // Configuration and state
+    AdvancedStorageConfig config;
+    atomic<uint64_t> total_data_size{0};
+    atomic<uint64_t> compressed_size{0};
+
+public:
+    AdvancedColumnarStorageEngine() {
+        storage_layer_manager = make_unique<StorageLayerManager>();
+        compression_engine = make_unique<CompressionEngine>();
+        layout_optimizer = make_unique<ColumnLayoutOptimizer>();
+        row_group_manager = make_unique<RowGroupManager>();
+        segment_manager = make_unique<ColumnSegmentManager>();
+        metadata_manager = make_unique<MetadataManager>();
+        storage_profiler = make_unique<StoragePerformanceProfiler>();
+        access_pattern_analyzer = make_unique<AccessPatternAnalyzer>();
+        cache_optimized_storage = make_unique<CacheOptimizedStorage>();
+        
+        InitializeAdvancedStorage();
+    }
+    
+    // Primary storage interface
+    StorageResult StoreColumnData(const ColumnDataRequest &request,
+                                 const AnalyticalContext &context) {
+        auto start_time = chrono::high_resolution_clock::now();
+        
+        try {
+            // Phase 1: Analyze data characteristics and access patterns
+            auto data_analysis = AnalyzeColumnData(request, context);
+            
+            // Phase 2: Optimize column layout and organization
+            auto layout_optimization = OptimizeColumnLayout(request, data_analysis);
+            
+            // Phase 3: Apply intelligent compression strategy
+            auto compression_result = ApplyOptimalCompression(request, layout_optimization);
+            
+            // Phase 4: Store with cache-aware organization
+            auto storage_result = StoreWithCacheOptimization(request, compression_result, context);
+            
+            auto end_time = chrono::high_resolution_clock::now();
+            auto duration = chrono::duration_cast<chrono::microseconds>(end_time - start_time);
+            
+            storage_profiler->RecordStorageOperation(request.data_size, duration.count(),
+                                                   compression_result.compression_ratio);
+            
+            return storage_result;
+            
+        } catch (const StorageException &e) {
+            return HandleStorageError(e, request, context);
+        }
+    }
+
+private:
+    void InitializeAdvancedStorage() {
+        // Configure storage layers for analytical workloads
+        ConfigureStorageLayers();
+        
+        // Initialize compression algorithms
+        InitializeCompressionAlgorithms();
+        
+        // Setup cache-aware storage organization
+        SetupCacheOptimizedStorage();
+        
+        // Configure performance monitoring
+        ConfigurePerformanceMonitoring();
+    }
+    
+    void ConfigureStorageLayers() {
+        // Configure hot storage layer (SSD-optimized)
+        auto hot_layer = make_unique<HotStorageLayer>();
+        hot_layer->ConfigureForAnalyticalWorkloads();
+        storage_layer_manager->RegisterLayer("hot", move(hot_layer));
+        
+        // Configure warm storage layer (balanced performance/capacity)
+        auto warm_layer = make_unique<WarmStorageLayer>();
+        warm_layer->ConfigureForLargeDatasets();
+        storage_layer_manager->RegisterLayer("warm", move(warm_layer));
+        
+        // Configure cold storage layer (capacity-optimized)
+        auto cold_layer = make_unique<ColdStorageLayer>();
+        cold_layer->ConfigureForArchival();
+        storage_layer_manager->RegisterLayer("cold", move(cold_layer));
+    }
+    
+    ColumnDataAnalysis AnalyzeColumnData(const ColumnDataRequest &request,
+                                        const AnalyticalContext &context) {
+        ColumnDataAnalysis analysis;
+        
+        // Analyze data distribution and patterns
+        analysis.data_distribution = AnalyzeDataDistribution(request.data);
+        analysis.value_patterns = AnalyzeValuePatterns(request.data);
+        analysis.temporal_patterns = AnalyzeTemporalPatterns(request.data, context);
+        
+        // Analyze compression opportunities
+        analysis.compression_opportunities = AnalyzeCompressionOpportunities(request.data);
+        analysis.encoding_suitability = AnalyzeEncodingSuitability(request.data);
+        
+        // Analyze access patterns and query characteristics
+        analysis.access_pattern = access_pattern_analyzer->AnalyzeColumnAccess(request.column_id, context);
+        analysis.query_selectivity = EstimateQuerySelectivity(request.column_id, context);
+        
+        // Analyze storage tier suitability
+        analysis.storage_tier_recommendation = DetermineOptimalStorageTier(analysis, context);
+        
+        return analysis;
+    }
+    
+    CompressionResult ApplyOptimalCompression(const ColumnDataRequest &request,
+                                            const LayoutOptimization &layout) {
+        CompressionResult result;
+        
+        // Select optimal compression algorithm based on data analysis
+        auto compression_strategy = compression_engine->SelectOptimalStrategy(
+            request.data, layout.data_analysis);
+        
+        // Apply compression with performance optimization
+        result = ExecuteCompressionStrategy(request.data, compression_strategy);
+        
+        return result;
+    }
+    
+    CompressionResult ExecuteCompressionStrategy(const ColumnData &data,
+                                               const CompressionStrategy &strategy) {
+        CompressionResult result;
+        
+        switch (strategy.primary_algorithm) {
+            case CompressionAlgorithm::ADVANCED_DICTIONARY:
+                result = ApplyAdvancedDictionaryCompression(data, strategy);
+                break;
+            case CompressionAlgorithm::INTELLIGENT_RLE:
+                result = ApplyIntelligentRLECompression(data, strategy);
+                break;
+            case CompressionAlgorithm::ADAPTIVE_BITPACKING:
+                result = ApplyAdaptiveBitpackingCompression(data, strategy);
+                break;
+            case CompressionAlgorithm::FRAME_OF_REFERENCE:
+                result = ApplyFrameOfReferenceCompression(data, strategy);
+                break;
+            case CompressionAlgorithm::DELTA_COMPRESSION:
+                result = ApplyDeltaCompression(data, strategy);
+                break;
+            case CompressionAlgorithm::HYBRID_COMPRESSION:
+                result = ApplyHybridCompression(data, strategy);
+                break;
+        }
+        
+        return result;
+    }
+};
+
+// Advanced dictionary compression with intelligent value ordering
+class AdvancedDictionaryCompressionEngine {
+public:
+    CompressionResult ApplyAdvancedDictionaryCompression(const ColumnData &data,
+                                                        const CompressionStrategy &strategy) {
+        CompressionResult result;
+        
+        // Analyze value distribution for optimal dictionary construction
+        auto value_analysis = AnalyzeValueDistribution(data);
+        
+        // Create optimized dictionary
+        auto dictionary = CreateOptimizedDictionary(data, value_analysis);
+        
+        // Apply intelligent value ordering
+        auto ordered_dictionary = ApplyIntelligentOrdering(dictionary, value_analysis);
+        
+        // Encode data with optimized indices
+        auto encoded_data = EncodeWithOptimizedIndices(data, ordered_dictionary);
+        
+        // Calculate compression statistics
+        result.original_size = data.GetSize();
+        result.compressed_size = dictionary.GetSize() + encoded_data.GetSize();
+        result.compression_ratio = static_cast<double>(result.original_size) / result.compressed_size;
+        result.compression_metadata = CreateCompressionMetadata(dictionary, encoded_data);
+        
+        return result;
+    }
+
+private:
+    ValueDistributionAnalysis AnalyzeValueDistribution(const ColumnData &data) {
+        ValueDistributionAnalysis analysis;
+        
+        // Count value frequencies
+        unordered_map<Value, idx_t> frequency_map;
+        for (idx_t i = 0; i < data.GetCount(); i++) {
+            auto value = data.GetValue(i);
+            frequency_map[value]++;
+        }
+        
+        // Sort by frequency for optimal dictionary ordering
+        vector<pair<Value, idx_t>> frequency_pairs(frequency_map.begin(), frequency_map.end());
+        sort(frequency_pairs.begin(), frequency_pairs.end(),
+             [](const auto &a, const auto &b) { return a.second > b.second; });
+        
+        analysis.value_frequencies = frequency_pairs;
+        analysis.unique_value_count = frequency_pairs.size();
+        analysis.total_value_count = data.GetCount();
+        analysis.cardinality_ratio = static_cast<double>(analysis.unique_value_count) / 
+                                   analysis.total_value_count;
+        
+        // Analyze value patterns
+        analysis.has_null_values = data.HasNullValues();
+        analysis.null_percentage = data.GetNullPercentage();
+        analysis.average_value_size = CalculateAverageValueSize(frequency_pairs);
+        
+        return analysis;
+    }
+    
+    OptimizedDictionary CreateOptimizedDictionary(const ColumnData &data,
+                                                 const ValueDistributionAnalysis &analysis) {
+        OptimizedDictionary dictionary;
+        
+        // Configure dictionary based on cardinality and access patterns
+        if (analysis.cardinality_ratio < 0.1) {
+            // Low cardinality - optimize for space
+            dictionary.encoding_type = DictionaryEncodingType::COMPACT;
+            dictionary.index_bit_width = CalculateMinimalBitWidth(analysis.unique_value_count);
+        } else if (analysis.cardinality_ratio < 0.5) {
+            // Medium cardinality - balance space and performance
+            dictionary.encoding_type = DictionaryEncodingType::BALANCED;
+            dictionary.index_bit_width = CalculateBalancedBitWidth(analysis.unique_value_count);
+        } else {
+            // High cardinality - optimize for performance
+            dictionary.encoding_type = DictionaryEncodingType::PERFORMANCE;
+            dictionary.index_bit_width = 32; // Use 32-bit indices for fast access
+        }
+        
+        // Build dictionary with frequency-based ordering
+        dictionary.values.reserve(analysis.unique_value_count);
+        dictionary.value_to_index.reserve(analysis.unique_value_count);
+        
+        for (idx_t i = 0; i < analysis.value_frequencies.size(); i++) {
+            auto &value = analysis.value_frequencies[i].first;
+            dictionary.values.push_back(value);
+            dictionary.value_to_index[value] = i;
+        }
+        
+        return dictionary;
+    }
+    
+    OptimizedDictionary ApplyIntelligentOrdering(const OptimizedDictionary &dictionary,
+                                                const ValueDistributionAnalysis &analysis) {
+        OptimizedDictionary optimized_dictionary = dictionary;
+        
+        // Apply cache-friendly ordering strategies
+        
+        // Strategy 1: Frequency-based ordering (already applied)
+        // Most frequent values get lower indices for better compression
+        
+        // Strategy 2: Lexicographical ordering for range queries
+        if (analysis.has_range_query_potential) {
+            ApplyLexicographicalOrdering(optimized_dictionary);
+        }
+        
+        // Strategy 3: Clustering similar values for better cache locality
+        if (analysis.has_similarity_patterns) {
+            ApplySimilarityBasedClustering(optimized_dictionary);
+        }
+        
+        return optimized_dictionary;
+    }
+    
+    EncodedColumnData EncodeWithOptimizedIndices(const ColumnData &data,
+                                                const OptimizedDictionary &dictionary) {
+        EncodedColumnData encoded_data;
+        
+        // Configure encoding based on dictionary characteristics
+        encoded_data.index_bit_width = dictionary.index_bit_width;
+        encoded_data.encoding_type = dictionary.encoding_type;
+        
+        // Allocate index array with optimal bit packing
+        auto required_bits = data.GetCount() * dictionary.index_bit_width;
+        auto required_bytes = (required_bits + 7) / 8; // Round up to bytes
+        encoded_data.index_data = make_unique<uint8_t[]>(required_bytes);
+        
+        // Encode values to indices with bit packing
+        BitPackingEncoder encoder(dictionary.index_bit_width);
+        
+        for (idx_t i = 0; i < data.GetCount(); i++) {
+            auto value = data.GetValue(i);
+            auto index = dictionary.value_to_index.at(value);
+            encoder.EncodeValue(encoded_data.index_data.get(), i, index);
+        }
+        
+        encoded_data.encoded_count = data.GetCount();
+        encoded_data.compressed_size = required_bytes;
+        
+        return encoded_data;
+    }
+};
+
+// Intelligent Run-Length Encoding with adaptive segmentation
+class IntelligentRLECompressionEngine {
+public:
+    CompressionResult ApplyIntelligentRLECompression(const ColumnData &data,
+                                                    const CompressionStrategy &strategy) {
+        CompressionResult result;
+        
+        // Analyze run patterns in the data
+        auto run_analysis = AnalyzeRunPatterns(data);
+        
+        // Apply adaptive segmentation for optimal compression
+        auto segments = CreateAdaptiveSegments(data, run_analysis);
+        
+        // Compress each segment with optimal RLE strategy
+        auto compressed_segments = CompressSegmentsWithRLE(segments, run_analysis);
+        
+        // Combine segments and calculate compression statistics
+        result = CombineCompressedSegments(compressed_segments);
+        
+        return result;
+    }
+
+private:
+    RunPatternAnalysis AnalyzeRunPatterns(const ColumnData &data) {
+        RunPatternAnalysis analysis;
+        
+        // Identify runs and their characteristics
+        vector<RunInfo> runs;
+        Value current_value = data.GetValue(0);
+        idx_t run_start = 0;
+        idx_t run_length = 1;
+        
+        for (idx_t i = 1; i < data.GetCount(); i++) {
+            auto value = data.GetValue(i);
+            
+            if (value.Equals(current_value)) {
+                run_length++;
+            } else {
+                // End of current run
+                runs.push_back({current_value, run_start, run_length});
+                
+                current_value = value;
+                run_start = i;
+                run_length = 1;
+            }
+        }
+        
+        // Add final run
+        runs.push_back({current_value, run_start, run_length});
+        
+        // Analyze run characteristics
+        analysis.total_runs = runs.size();
+        analysis.average_run_length = static_cast<double>(data.GetCount()) / runs.size();
+        analysis.max_run_length = 0;
+        analysis.run_length_distribution.resize(21, 0); // 0-19, 20+
+        
+        for (const auto &run : runs) {
+            analysis.max_run_length = max(analysis.max_run_length, run.length);
+            
+            idx_t bucket = min(run.length, 20UL);
+            if (bucket == 20) bucket = 20; // 20+ bucket
+            analysis.run_length_distribution[bucket]++;
+        }
+        
+        // Calculate compression potential
+        analysis.compression_potential = CalculateRLECompressionPotential(runs, data.GetCount());
+        
+        return analysis;
+    }
+    
+    vector<RLESegment> CreateAdaptiveSegments(const ColumnData &data,
+                                             const RunPatternAnalysis &analysis) {
+        vector<RLESegment> segments;
+        
+        // Determine optimal segmentation strategy
+        if (analysis.average_run_length > 10.0) {
+            // Long runs - use large segments
+            segments = CreateLargeSegments(data, analysis);
+        } else if (analysis.average_run_length > 3.0) {
+            // Medium runs - use balanced segments
+            segments = CreateBalancedSegments(data, analysis);
+        } else {
+            // Short runs - use small segments with fallback compression
+            segments = CreateSmallSegmentsWithFallback(data, analysis);
+        }
+        
+        return segments;
+    }
+    
+    double CalculateRLECompressionPotential(const vector<RunInfo> &runs, idx_t total_count) {
+        // Estimate compressed size vs original size
+        
+        // Original size (assuming 8 bytes per value)
+        auto original_size = total_count * 8;
+        
+        // Compressed size: (value + length) per run
+        auto compressed_size = runs.size() * (8 + 4); // 8 bytes for value, 4 for length
+        
+        return static_cast<double>(original_size) / compressed_size;
+    }
+};
+
+// Adaptive bit-packing with optimal bit width selection
+class AdaptiveBitpackingCompressionEngine {
+public:
+    CompressionResult ApplyAdaptiveBitpackingCompression(const ColumnData &data,
+                                                        const CompressionStrategy &strategy) {
+        CompressionResult result;
+        
+        // Analyze value ranges for optimal bit width selection
+        auto range_analysis = AnalyzeValueRanges(data);
+        
+        // Apply frame-of-reference optimization if beneficial
+        auto for_optimization = ApplyFrameOfReferenceOptimization(data, range_analysis);
+        
+        // Select adaptive bit widths for different segments
+        auto bit_width_selection = SelectAdaptiveBitWidths(for_optimization);
+        
+        // Compress with selected bit widths
+        auto compressed_data = CompressWithAdaptiveBitpacking(for_optimization, bit_width_selection);
+        
+        result = CreateBitpackingResult(compressed_data, range_analysis);
+        
+        return result;
+    }
+
+private:
+    ValueRangeAnalysis AnalyzeValueRanges(const ColumnData &data) {
+        ValueRangeAnalysis analysis;
+        
+        if (data.GetCount() == 0) return analysis;
+        
+        // Determine data type and initialize range tracking
+        auto type_id = data.GetType().id();
+        
+        if (type_id == LogicalTypeId::INTEGER) {
+            analysis = AnalyzeIntegerRanges(data);
+        } else if (type_id == LogicalTypeId::BIGINT) {
+            analysis = AnalyzeBigintRanges(data);
+        } else if (type_id == LogicalTypeId::DOUBLE) {
+            analysis = AnalyzeDoubleRanges(data);
+        } else {
+            analysis.bitpacking_feasible = false;
+            return analysis;
+        }
+        
+        return analysis;
+    }
+    
+    ValueRangeAnalysis AnalyzeIntegerRanges(const ColumnData &data) {
+        ValueRangeAnalysis analysis;
+        
+        int32_t min_value = INT32_MAX;
+        int32_t max_value = INT32_MIN;
+        
+        // Find min and max values
+        for (idx_t i = 0; i < data.GetCount(); i++) {
+            if (!data.IsNull(i)) {
+                auto value = data.GetValue(i).GetValue<int32_t>();
+                min_value = min(min_value, value);
+                max_value = max(max_value, value);
+            }
+        }
+        
+        analysis.min_value = min_value;
+        analysis.max_value = max_value;
+        analysis.value_range = static_cast<uint64_t>(max_value) - static_cast<uint64_t>(min_value);
+        
+        // Calculate required bit width
+        analysis.required_bit_width = CalculateRequiredBitWidth(analysis.value_range);
+        analysis.bitpacking_feasible = analysis.required_bit_width < 32;
+        
+        // Analyze frame-of-reference potential
+        analysis.for_potential = analysis.required_bit_width < 24; // Significant savings potential
+        
+        return analysis;
+    }
+    
+    uint8_t CalculateRequiredBitWidth(uint64_t value_range) {
+        if (value_range == 0) return 1;
+        
+        // Calculate minimum bits needed to represent the range
+        uint8_t bit_width = 1;
+        uint64_t max_representable = 1;
+        
+        while (max_representable <= value_range) {
+            bit_width++;
+            max_representable = (max_representable << 1) | 1;
+        }
+        
+        return bit_width;
+    }
+};
+
+// Cache-optimized storage layout with NUMA awareness
+class CacheOptimizedStorage {
+private:
+    // Cache-aware data layout
+    unique_ptr<CacheLayoutOptimizer> layout_optimizer;
+    unique_ptr<NUMAStorageManager> numa_manager;
+    
+    // Access pattern optimization
+    unique_ptr<AccessPatternProfiler> access_profiler;
+    unique_ptr<PreloadingManager> preloading_manager;
+
+public:
+    CacheOptimizedStorage() {
+        layout_optimizer = make_unique<CacheLayoutOptimizer>();
+        numa_manager = make_unique<NUMAStorageManager>();
+        access_profiler = make_unique<AccessPatternProfiler>();
+        preloading_manager = make_unique<PreloadingManager>();
+        
+        InitializeCacheOptimizations();
+    }
+    
+    StorageLayout OptimizeStorageLayout(const ColumnData &data,
+                                       const AccessPattern &pattern) {
+        StorageLayout layout;
+        
+        // Optimize for cache line utilization
+        layout.cache_alignment = OptimizeCacheAlignment(data, pattern);
+        
+        // Configure NUMA-aware placement
+        layout.numa_placement = OptimizeNUMAPlacement(data, pattern);
+        
+        // Setup prefetching strategies
+        layout.prefetching_strategy = ConfigurePrefetchingStrategy(pattern);
+        
+        // Configure compression-aware layout
+        layout.compression_layout = OptimizeCompressionLayout(data);
+        
+        return layout;
+    }
+
+private:
+    CacheAlignment OptimizeCacheAlignment(const ColumnData &data,
+                                         const AccessPattern &pattern) {
+        CacheAlignment alignment;
+        
+        // Configure based on access pattern
+        if (pattern.is_sequential) {
+            // Sequential access - optimize for cache line utilization
+            alignment.block_size = GetL1CacheLineSize();
+            alignment.alignment_boundary = alignment.block_size;
+            alignment.enable_prefetching = true;
+        } else if (pattern.is_columnar_scan) {
+            // Columnar scan - optimize for vector processing
+            alignment.block_size = GetL2CacheSize() / 4; // Use 1/4 of L2 cache
+            alignment.alignment_boundary = 64; // AVX-512 alignment
+            alignment.enable_vectorized_access = true;
+        } else {
+            // Random access - optimize for cache associativity
+            alignment.block_size = GetL1CacheSize() / 8;
+            alignment.alignment_boundary = GetL1CacheLineSize();
+            alignment.enable_cache_blocking = true;
+        }
+        
+        return alignment;
+    }
+    
+    void InitializeCacheOptimizations() {
+        // Detect cache hierarchy
+        auto cache_info = DetectCacheHierarchy();
+        layout_optimizer->ConfigureForCacheHierarchy(cache_info);
+        
+        // Configure NUMA topology
+        auto numa_topology = DetectNUMATopology();
+        numa_manager->ConfigureForTopology(numa_topology);
+        
+        // Setup access pattern profiling
+        access_profiler->EnableContinuousMonitoring();
+    }
+};
+```
+            }
+            
+            // Update scan state
             state.row_index = column_state.row_index;
             
             if (result.size() > 0) {
@@ -18862,6 +19497,552 @@ private:
                 break;
             case WriteOperationType::UPDATE:
                 version->data = write_op.new_data;
+                break;
+            case WriteOperationType::DELETE:
+                // Mark previous version as deleted
+                auto previous_version = FindLatestVersion(write_op.row_id);
+                if (previous_version) {
+                    previous_version->delete_timestamp = transaction.start_timestamp;
+                }
+                break;
+        }
+        
+        return version;
+    }
+};
+```
+
+---
+
+## B2: Advanced Compression Algorithm Implementation
+
+**Sophisticated Multi-Algorithm Compression Framework**
+DuckDB implements an advanced compression system that dynamically selects and applies optimal compression algorithms based on data characteristics, access patterns, and performance requirements:
+
+```cpp
+// Comprehensive compression framework with intelligent algorithm selection
+class AdvancedCompressionFramework {
+private:
+    // Compression algorithm registry
+    unique_ptr<CompressionAlgorithmRegistry> algorithm_registry;
+    unique_ptr<CompressionStrategySelector> strategy_selector;
+    unique_ptr<CompressionPerformanceProfiler> compression_profiler;
+    
+    // Advanced compression techniques
+    unique_ptr<HybridCompressionEngine> hybrid_engine;
+    unique_ptr<StreamingCompressionManager> streaming_manager;
+    unique_ptr<AdaptiveCompressionTuner> adaptive_tuner;
+    
+    // Hardware-aware optimization
+    unique_ptr<HardwareAcceleratedCompression> hardware_compression;
+    unique_ptr<ParallelCompressionEngine> parallel_engine;
+    
+    // Configuration and statistics
+    CompressionFrameworkConfig config;
+    atomic<uint64_t> total_compressed_bytes{0};
+    atomic<uint64_t> total_decompressed_bytes{0};
+
+public:
+    AdvancedCompressionFramework() {
+        algorithm_registry = make_unique<CompressionAlgorithmRegistry>();
+        strategy_selector = make_unique<CompressionStrategySelector>();
+        compression_profiler = make_unique<CompressionPerformanceProfiler>();
+        hybrid_engine = make_unique<HybridCompressionEngine>();
+        streaming_manager = make_unique<StreamingCompressionManager>();
+        adaptive_tuner = make_unique<AdaptiveCompressionTuner>();
+        hardware_compression = make_unique<HardwareAcceleratedCompression>();
+        parallel_engine = make_unique<ParallelCompressionEngine>();
+        
+        InitializeCompressionFramework();
+    }
+    
+    // Primary compression interface
+    CompressionResult CompressColumnData(const ColumnData &data,
+                                        const CompressionRequest &request,
+                                        const AnalyticalContext &context) {
+        auto start_time = chrono::high_resolution_clock::now();
+        
+        try {
+            // Phase 1: Analyze data for optimal compression strategy
+            auto compression_analysis = AnalyzeCompressionOpportunity(data, request, context);
+            
+            // Phase 2: Select optimal compression algorithm combination
+            auto compression_strategy = SelectOptimalCompressionStrategy(compression_analysis);
+            
+            // Phase 3: Apply compression with hardware acceleration
+            auto compression_result = ApplyCompressionStrategy(data, compression_strategy, context);
+            
+            // Phase 4: Validate and optimize compressed output
+            auto validated_result = ValidateAndOptimizeCompression(compression_result, data);
+            
+            auto end_time = chrono::high_resolution_clock::now();
+            auto duration = chrono::duration_cast<chrono::microseconds>(end_time - start_time);
+            
+            compression_profiler->RecordCompressionOperation(
+                data.GetSize(), validated_result.compressed_size, duration.count());
+            
+            return validated_result;
+            
+        } catch (const CompressionException &e) {
+            return HandleCompressionError(e, data, request, context);
+        }
+    }
+
+private:
+    void InitializeCompressionFramework() {
+        // Register all available compression algorithms
+        RegisterCompressionAlgorithms();
+        
+        // Initialize hardware acceleration
+        InitializeHardwareAcceleration();
+        
+        // Configure adaptive tuning
+        ConfigureAdaptiveTuning();
+        
+        // Setup performance monitoring
+        SetupPerformanceMonitoring();
+    }
+    
+    void RegisterCompressionAlgorithms() {
+        // Dictionary compression variants
+        algorithm_registry->RegisterAlgorithm("advanced_dictionary", 
+            make_unique<AdvancedDictionaryCompression>());
+        algorithm_registry->RegisterAlgorithm("frequency_dictionary", 
+            make_unique<FrequencyBasedDictionaryCompression>());
+        algorithm_registry->RegisterAlgorithm("hierarchical_dictionary", 
+            make_unique<HierarchicalDictionaryCompression>());
+        
+        // Run-length encoding variants
+        algorithm_registry->RegisterAlgorithm("adaptive_rle", 
+            make_unique<AdaptiveRunLengthEncoding>());
+        algorithm_registry->RegisterAlgorithm("structured_rle", 
+            make_unique<StructuredRunLengthEncoding>());
+        algorithm_registry->RegisterAlgorithm("hybrid_rle", 
+            make_unique<HybridRunLengthEncoding>());
+        
+        // Bit-packing and frame-of-reference
+        algorithm_registry->RegisterAlgorithm("adaptive_bitpacking", 
+            make_unique<AdaptiveBitPackingCompression>());
+        algorithm_registry->RegisterAlgorithm("frame_of_reference", 
+            make_unique<FrameOfReferenceCompression>());
+        algorithm_registry->RegisterAlgorithm("delta_frame_of_reference", 
+            make_unique<DeltaFrameOfReferenceCompression>());
+        
+        // Advanced mathematical compression
+        algorithm_registry->RegisterAlgorithm("polynomial_compression", 
+            make_unique<PolynomialPatternCompression>());
+        algorithm_registry->RegisterAlgorithm("fourier_compression", 
+            make_unique<FourierTransformCompression>());
+        algorithm_registry->RegisterAlgorithm("wavelet_compression", 
+            make_unique<WaveletCompressionEngine>());
+        
+        // Specialized string compression
+        algorithm_registry->RegisterAlgorithm("string_dictionary", 
+            make_unique<StringDictionaryCompression>());
+        algorithm_registry->RegisterAlgorithm("pattern_string", 
+            make_unique<PatternBasedStringCompression>());
+        algorithm_registry->RegisterAlgorithm("suffix_array", 
+            make_unique<SuffixArrayCompression>());
+    }
+    
+    CompressionAnalysis AnalyzeCompressionOpportunity(const ColumnData &data,
+                                                     const CompressionRequest &request,
+                                                     const AnalyticalContext &context) {
+        CompressionAnalysis analysis;
+        
+        // Analyze data characteristics
+        analysis.data_characteristics = AnalyzeDataCharacteristics(data);
+        analysis.distribution_analysis = AnalyzeDataDistribution(data);
+        analysis.pattern_analysis = AnalyzeDataPatterns(data);
+        
+        // Analyze compression suitability
+        analysis.algorithm_suitability = AnalyzeAlgorithmSuitability(data);
+        analysis.hybrid_opportunities = AnalyzeHybridOpportunities(data);
+        
+        // Analyze performance requirements
+        analysis.performance_requirements = AnalyzePerformanceRequirements(request, context);
+        analysis.access_pattern_impact = AnalyzeAccessPatternImpact(data, context);
+        
+        // Calculate compression potential
+        analysis.compression_potential = EstimateCompressionPotential(data, analysis);
+        
+        return analysis;
+    }
+    
+    CompressionStrategy SelectOptimalCompressionStrategy(const CompressionAnalysis &analysis) {
+        CompressionStrategy strategy;
+        
+        // Use AI/ML-based algorithm selection
+        auto ml_recommendations = GetMLBasedRecommendations(analysis);
+        
+        // Combine with rule-based selection
+        auto rule_based_recommendations = GetRuleBasedRecommendations(analysis);
+        
+        // Hybrid decision making
+        strategy = CombineRecommendations(ml_recommendations, rule_based_recommendations, analysis);
+        
+        // Optimize strategy for specific workload characteristics
+        strategy = OptimizeStrategyForWorkload(strategy, analysis);
+        
+        return strategy;
+    }
+    
+    CompressionResult ApplyCompressionStrategy(const ColumnData &data,
+                                              const CompressionStrategy &strategy,
+                                              const AnalyticalContext &context) {
+        CompressionResult result;
+        
+        switch (strategy.compression_approach) {
+            case CompressionApproach::SINGLE_ALGORITHM:
+                result = ApplySingleAlgorithmCompression(data, strategy, context);
+                break;
+            case CompressionApproach::HYBRID_COMPRESSION:
+                result = ApplyHybridCompression(data, strategy, context);
+                break;
+            case CompressionApproach::CASCADED_COMPRESSION:
+                result = ApplyCascadedCompression(data, strategy, context);
+                break;
+            case CompressionApproach::ADAPTIVE_SEGMENTATION:
+                result = ApplyAdaptiveSegmentationCompression(data, strategy, context);
+                break;
+        }
+        
+        return result;
+    }
+};
+
+// Advanced dictionary compression with multi-level optimization
+class AdvancedDictionaryCompression {
+public:
+    CompressionResult Compress(const ColumnData &data, const CompressionStrategy &strategy) {
+        CompressionResult result;
+        
+        // Analyze optimal dictionary structure
+        auto dictionary_analysis = AnalyzeDictionaryStructure(data);
+        
+        // Select dictionary construction approach
+        auto dictionary_approach = SelectDictionaryApproach(dictionary_analysis);
+        
+        // Build optimized dictionary
+        auto optimized_dictionary = BuildOptimizedDictionary(data, dictionary_approach);
+        
+        // Encode data with advanced techniques
+        auto encoded_data = EncodeWithAdvancedTechniques(data, optimized_dictionary);
+        
+        // Calculate compression metrics
+        result = CalculateCompressionMetrics(data, optimized_dictionary, encoded_data);
+        
+        return result;
+    }
+
+private:
+    DictionaryAnalysis AnalyzeDictionaryStructure(const ColumnData &data) {
+        DictionaryAnalysis analysis;
+        
+        // Basic cardinality analysis
+        analysis.unique_values = CalculateUniqueValues(data);
+        analysis.cardinality_ratio = static_cast<double>(analysis.unique_values) / data.GetCount();
+        
+        // Frequency analysis with advanced distribution modeling
+        analysis.frequency_distribution = AnalyzeFrequencyDistribution(data);
+        analysis.entropy = CalculateShannonsEntropy(analysis.frequency_distribution);
+        analysis.gini_coefficient = CalculateGiniCoefficient(analysis.frequency_distribution);
+        
+        // Value size analysis
+        analysis.average_value_size = CalculateAverageValueSize(data);
+        analysis.value_size_variance = CalculateValueSizeVariance(data);
+        
+        // Compression potential estimation
+        analysis.theoretical_compression_ratio = EstimateTheoreticalCompressionRatio(analysis);
+        analysis.practical_compression_ratio = EstimatePracticalCompressionRatio(analysis);
+        
+        return analysis;
+    }
+    
+    DictionaryApproach SelectDictionaryApproach(const DictionaryAnalysis &analysis) {
+        DictionaryApproach approach;
+        
+        if (analysis.cardinality_ratio < 0.01) {
+            // Very low cardinality - optimize for extreme compression
+            approach.construction_method = DictionaryConstructionMethod::FREQUENCY_OPTIMIZED;
+            approach.encoding_method = DictionaryEncodingMethod::MINIMAL_BITS;
+            approach.indexing_strategy = DictionaryIndexingStrategy::HASH_TABLE;
+        } else if (analysis.cardinality_ratio < 0.1) {
+            // Low cardinality - balance compression and performance
+            approach.construction_method = DictionaryConstructionMethod::BALANCED_FREQUENCY;
+            approach.encoding_method = DictionaryEncodingMethod::BYTE_ALIGNED;
+            approach.indexing_strategy = DictionaryIndexingStrategy::SORTED_ARRAY;
+        } else if (analysis.cardinality_ratio < 0.5) {
+            // Medium cardinality - optimize for performance
+            approach.construction_method = DictionaryConstructionMethod::PERFORMANCE_OPTIMIZED;
+            approach.encoding_method = DictionaryEncodingMethod::FAST_ACCESS;
+            approach.indexing_strategy = DictionaryIndexingStrategy::BTREE;
+        } else {
+            // High cardinality - consider alternative compression
+            approach.construction_method = DictionaryConstructionMethod::HYBRID;
+            approach.encoding_method = DictionaryEncodingMethod::ADAPTIVE;
+            approach.indexing_strategy = DictionaryIndexingStrategy::ADAPTIVE_HASH;
+        }
+        
+        // Configure advanced optimizations
+        approach.enable_hierarchical_dictionary = analysis.has_hierarchical_patterns;
+        approach.enable_prefix_compression = analysis.has_common_prefixes;
+        approach.enable_suffix_compression = analysis.has_common_suffixes;
+        
+        return approach;
+    }
+    
+    OptimizedDictionary BuildOptimizedDictionary(const ColumnData &data,
+                                                const DictionaryApproach &approach) {
+        OptimizedDictionary dictionary;
+        
+        // Phase 1: Collect and analyze values
+        auto value_analysis = CollectAndAnalyzeValues(data);
+        
+        // Phase 2: Apply frequency-based optimization
+        auto frequency_optimized_values = ApplyFrequencyOptimization(value_analysis, approach);
+        
+        // Phase 3: Apply hierarchical compression if enabled
+        if (approach.enable_hierarchical_dictionary) {
+            frequency_optimized_values = ApplyHierarchicalCompression(frequency_optimized_values);
+        }
+        
+        // Phase 4: Apply string-specific optimizations
+        if (data.GetType().IsStringType()) {
+            frequency_optimized_values = ApplyStringOptimizations(frequency_optimized_values, approach);
+        }
+        
+        // Phase 5: Build final dictionary structure
+        dictionary = ConstructFinalDictionary(frequency_optimized_values, approach);
+        
+        return dictionary;
+    }
+    
+    EncodedData EncodeWithAdvancedTechniques(const ColumnData &data,
+                                           const OptimizedDictionary &dictionary) {
+        EncodedData encoded_data;
+        
+        // Configure encoding parameters
+        auto encoding_config = ConfigureEncodingParameters(dictionary);
+        
+        // Apply bit-packing optimization
+        if (encoding_config.enable_bit_packing) {
+            encoded_data = ApplyBitPackedEncoding(data, dictionary, encoding_config);
+        } else {
+            encoded_data = ApplyStandardEncoding(data, dictionary, encoding_config);
+        }
+        
+        // Apply secondary compression if beneficial
+        if (encoding_config.enable_secondary_compression) {
+            encoded_data = ApplySecondaryCompression(encoded_data, encoding_config);
+        }
+        
+        return encoded_data;
+    }
+};
+
+// Polynomial pattern compression for numerical sequences
+class PolynomialPatternCompression {
+public:
+    CompressionResult Compress(const ColumnData &data, const CompressionStrategy &strategy) {
+        CompressionResult result;
+        
+        // Analyze for polynomial patterns
+        auto pattern_analysis = AnalyzePolynomialPatterns(data);
+        
+        if (pattern_analysis.has_strong_polynomial_pattern) {
+            // Apply polynomial compression
+            result = ApplyPolynomialCompression(data, pattern_analysis);
+        } else {
+            // Fallback to segmented polynomial compression
+            result = ApplySegmentedPolynomialCompression(data, pattern_analysis);
+        }
+        
+        return result;
+    }
+
+private:
+    PolynomialPatternAnalysis AnalyzePolynomialPatterns(const ColumnData &data) {
+        PolynomialPatternAnalysis analysis;
+        
+        if (!data.GetType().IsNumericType()) {
+            analysis.has_strong_polynomial_pattern = false;
+            return analysis;
+        }
+        
+        // Convert data to numerical sequence
+        auto numerical_sequence = ExtractNumericalSequence(data);
+        
+        // Test for different polynomial degrees
+        for (idx_t degree = 1; degree <= MAX_POLYNOMIAL_DEGREE; degree++) {
+            auto polynomial_fit = FitPolynomial(numerical_sequence, degree);
+            
+            if (polynomial_fit.r_squared > POLYNOMIAL_FIT_THRESHOLD) {
+                analysis.has_strong_polynomial_pattern = true;
+                analysis.optimal_degree = degree;
+                analysis.polynomial_coefficients = polynomial_fit.coefficients;
+                analysis.fit_quality = polynomial_fit.r_squared;
+                analysis.residual_variance = polynomial_fit.residual_variance;
+                break;
+            }
+        }
+        
+        // Analyze residuals for secondary compression
+        if (analysis.has_strong_polynomial_pattern) {
+            analysis.residual_analysis = AnalyzeResiduals(numerical_sequence, analysis);
+        }
+        
+        return analysis;
+    }
+    
+    PolynomialFit FitPolynomial(const vector<double> &sequence, idx_t degree) {
+        PolynomialFit fit;
+        fit.degree = degree;
+        
+        // Use least squares fitting
+        auto design_matrix = CreatePolynomialDesignMatrix(sequence.size(), degree);
+        auto coefficients = SolveLeastSquares(design_matrix, sequence);
+        
+        fit.coefficients = coefficients;
+        
+        // Calculate R-squared
+        fit.r_squared = CalculateRSquared(sequence, coefficients, degree);
+        
+        // Calculate residuals
+        fit.residuals = CalculateResiduals(sequence, coefficients, degree);
+        fit.residual_variance = CalculateVariance(fit.residuals);
+        
+        return fit;
+    }
+    
+    CompressionResult ApplyPolynomialCompression(const ColumnData &data,
+                                               const PolynomialPatternAnalysis &analysis) {
+        CompressionResult result;
+        
+        // Store polynomial coefficients
+        auto coefficients_size = analysis.polynomial_coefficients.size() * sizeof(double);
+        
+        // Compress residuals using optimal algorithm
+        auto residual_compression = CompressResiduals(analysis.residual_analysis);
+        
+        // Calculate total compressed size
+        result.compressed_size = coefficients_size + residual_compression.compressed_size + 
+                               sizeof(PolynomialCompressionMetadata);
+        result.original_size = data.GetSize();
+        result.compression_ratio = static_cast<double>(result.original_size) / result.compressed_size;
+        
+        // Store compression metadata
+        result.compression_metadata = CreatePolynomialCompressionMetadata(analysis, residual_compression);
+        
+        return result;
+    }
+    
+    static const idx_t MAX_POLYNOMIAL_DEGREE = 5;
+    static constexpr double POLYNOMIAL_FIT_THRESHOLD = 0.95;
+};
+
+// Hardware-accelerated compression with SIMD and parallel processing
+class HardwareAcceleratedCompression {
+private:
+    // SIMD optimization engines
+    unique_ptr<SIMDCompressionEngine> simd_engine;
+    unique_ptr<VectorizedCompressionProcessor> vectorized_processor;
+    
+    // Parallel processing coordination
+    unique_ptr<ParallelCompressionCoordinator> parallel_coordinator;
+    unique_ptr<ThreadPoolManager> thread_pool_manager;
+
+public:
+    HardwareAcceleratedCompression() {
+        simd_engine = make_unique<SIMDCompressionEngine>();
+        vectorized_processor = make_unique<VectorizedCompressionProcessor>();
+        parallel_coordinator = make_unique<ParallelCompressionCoordinator>();
+        thread_pool_manager = make_unique<ThreadPoolManager>();
+        
+        InitializeHardwareAcceleration();
+    }
+    
+    CompressionResult AccelerateCompression(const ColumnData &data,
+                                           const CompressionAlgorithm &algorithm,
+                                           const CompressionStrategy &strategy) {
+        CompressionResult result;
+        
+        // Determine optimal acceleration strategy
+        auto acceleration_strategy = DetermineAccelerationStrategy(data, algorithm, strategy);
+        
+        switch (acceleration_strategy.primary_acceleration) {
+            case AccelerationType::SIMD_VECTORIZATION:
+                result = ApplySIMDAcceleration(data, algorithm, acceleration_strategy);
+                break;
+            case AccelerationType::PARALLEL_PROCESSING:
+                result = ApplyParallelAcceleration(data, algorithm, acceleration_strategy);
+                break;
+            case AccelerationType::HYBRID_ACCELERATION:
+                result = ApplyHybridAcceleration(data, algorithm, acceleration_strategy);
+                break;
+        }
+        
+        return result;
+    }
+
+private:
+    AccelerationStrategy DetermineAccelerationStrategy(const ColumnData &data,
+                                                      const CompressionAlgorithm &algorithm,
+                                                      const CompressionStrategy &strategy) {
+        AccelerationStrategy acceleration_strategy;
+        
+        // Analyze data size and characteristics
+        auto data_size = data.GetSize();
+        auto data_characteristics = AnalyzeDataCharacteristics(data);
+        
+        // Determine optimal acceleration approach
+        if (data_size > PARALLEL_THRESHOLD && algorithm.SupportsParallelization()) {
+            if (data_characteristics.is_simd_friendly) {
+                acceleration_strategy.primary_acceleration = AccelerationType::HYBRID_ACCELERATION;
+            } else {
+                acceleration_strategy.primary_acceleration = AccelerationType::PARALLEL_PROCESSING;
+            }
+        } else if (data_characteristics.is_simd_friendly && algorithm.SupportsSIMD()) {
+            acceleration_strategy.primary_acceleration = AccelerationType::SIMD_VECTORIZATION;
+        } else {
+            acceleration_strategy.primary_acceleration = AccelerationType::NONE;
+        }
+        
+        // Configure acceleration parameters
+        acceleration_strategy.parallel_thread_count = CalculateOptimalThreadCount(data_size);
+        acceleration_strategy.simd_vector_width = DetermineOptimalVectorWidth(data.GetType());
+        acceleration_strategy.memory_alignment = CalculateOptimalAlignment(data_characteristics);
+        
+        return acceleration_strategy;
+    }
+    
+    CompressionResult ApplySIMDAcceleration(const ColumnData &data,
+                                           const CompressionAlgorithm &algorithm,
+                                           const AccelerationStrategy &strategy) {
+        // Configure SIMD-optimized compression
+        auto simd_config = ConfigureSIMDOptimizations(strategy);
+        
+        // Apply SIMD-accelerated compression algorithm
+        return simd_engine->CompressWithSIMD(data, algorithm, simd_config);
+    }
+    
+    void InitializeHardwareAcceleration() {
+        // Detect available SIMD instruction sets
+        auto simd_capabilities = DetectSIMDCapabilities();
+        simd_engine->ConfigureForCapabilities(simd_capabilities);
+        
+        // Initialize thread pool for parallel compression
+        auto cpu_count = thread::hardware_concurrency();
+        thread_pool_manager->InitializeThreadPool(cpu_count);
+        
+        // Configure vectorized processing
+        vectorized_processor->EnableAVX2Optimizations();
+        vectorized_processor->EnableAVX512Optimizations();
+    }
+    
+    static const size_t PARALLEL_THRESHOLD = 1024 * 1024; // 1MB
+};
+```
                 // Mark previous version as deleted
                 MarkVersionDeleted(write_op.row_id, transaction.start_timestamp);
                 break;
