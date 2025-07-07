@@ -8184,167 +8184,911 @@ private:
 
 ## 2.4.4 Advanced Optimization Techniques
 
-### Common Subexpression Elimination
+### Advanced Common Subexpression Elimination Framework
 
-**Expression Deduplication and Caching**
-DuckDB implements comprehensive common subexpression elimination to avoid redundant computation:
+**Sophisticated Expression Deduplication and Optimization**
+DuckDB implements a comprehensive common subexpression elimination system that goes beyond simple deduplication to include advanced analytical optimizations and performance-aware expression caching:
 
 ```cpp
-class CommonSubexpressionEliminator {
+// Advanced CSE system with performance-aware optimization and analytical specializations
+class AdvancedCommonSubexpressionEliminator {
+private:
+    // Expression analysis and caching infrastructure
+    struct ExpressionMetadata {
+        string canonical_form;
+        double computation_cost;
+        idx_t usage_frequency;
+        bool is_deterministic;
+        bool supports_vectorization;
+        vector<ColumnBinding> column_dependencies;
+        
+        // Analytical-specific metadata
+        bool is_aggregate_context;
+        bool is_window_context;
+        WindowFrameType window_frame;
+    };
+    
+    // Sophisticated expression registry with cost analysis
+    unordered_map<string, unique_ptr<ExpressionMetadata>> expression_registry;
+    unordered_map<string, unique_ptr<Expression>> cached_expressions;
+    
+    // Performance tracking and optimization
+    unique_ptr<ExpressionCostEstimator> cost_estimator;
+    unique_ptr<ExpressionProfiler> profiler;
+    
+    // Configuration for different optimization strategies
+    CSEConfiguration config;
+
 public:
-    unique_ptr<LogicalOperator> EliminateCommonSubexpressions(unique_ptr<LogicalOperator> plan) {
-        ExpressionMap expression_map;
-        return EliminateCSE(move(plan), expression_map);
+    AdvancedCommonSubexpressionEliminator() {
+        cost_estimator = make_unique<ExpressionCostEstimator>();
+        profiler = make_unique<ExpressionProfiler>();
+        ConfigureForAnalyticalWorkloads();
     }
     
+    // Comprehensive CSE optimization with cost-benefit analysis
+    unique_ptr<LogicalOperator> EliminateCommonSubexpressions(unique_ptr<LogicalOperator> plan,
+                                                             const OptimizationContext &context) {
+        auto start_time = chrono::high_resolution_clock::now();
+        
+        try {
+            // Phase 1: Expression discovery and cost analysis
+            AnalyzeExpressionUsage(plan.get(), context);
+            
+            // Phase 2: Identify beneficial CSE opportunities
+            auto cse_opportunities = IdentifyCSEOpportunities(context);
+            
+            // Phase 3: Apply CSE transformations
+            plan = ApplyCSETransformations(move(plan), cse_opportunities, context);
+            
+            // Phase 4: Create expression computation plan
+            plan = CreateExpressionComputationPlan(move(plan), cse_opportunities);
+            
+            auto end_time = chrono::high_resolution_clock::now();
+            auto duration = chrono::duration_cast<chrono::microseconds>(end_time - start_time);
+            
+            profiler->RecordCSESession(cse_opportunities.size(), duration.count());
+            
+            return plan;
+            
+        } catch (const CSEException &e) {
+            // Fallback to basic CSE if advanced optimization fails
+            return ApplyBasicCSE(move(plan), e, context);
+        }
+    }
+
 private:
-    using ExpressionMap = unordered_map<string, unique_ptr<Expression>>;
+    void AnalyzeExpressionUsage(LogicalOperator *op, const OptimizationContext &context) {
+        // Recursively analyze all expressions in the plan tree
+        ExpressionUsageTracker usage_tracker;
+        AnalyzeOperatorExpressions(op, usage_tracker, context);
+        
+        // Build expression metadata based on usage analysis
+        BuildExpressionMetadata(usage_tracker, context);
+    }
     
-    unique_ptr<LogicalOperator> EliminateCSE(unique_ptr<LogicalOperator> op, 
-                                           ExpressionMap &expression_map) {
-        // First, recursively process children
-        for (auto &child : op->children) {
-            child = EliminateCSE(move(child), expression_map);
+    void AnalyzeOperatorExpressions(LogicalOperator *op, 
+                                   ExpressionUsageTracker &tracker,
+                                   const OptimizationContext &context) {
+        // Analyze expressions in current operator
+        for (const auto &expr : op->expressions) {
+            AnalyzeExpressionRecursive(expr.get(), tracker, context);
         }
         
-        // Then process expressions in this operator
+        // Handle operator-specific expression contexts
+        switch (op->type) {
+            case LogicalOperatorType::LOGICAL_AGGREGATE: {
+                auto agg_op = static_cast<LogicalAggregate*>(op);
+                AnalyzeAggregateExpressions(agg_op, tracker, context);
+                break;
+            }
+            
+            case LogicalOperatorType::LOGICAL_WINDOW: {
+                auto window_op = static_cast<LogicalWindow*>(op);
+                AnalyzeWindowExpressions(window_op, tracker, context);
+                break;
+            }
+            
+            case LogicalOperatorType::LOGICAL_JOIN: {
+                auto join_op = static_cast<LogicalJoin*>(op);
+                AnalyzeJoinExpressions(join_op, tracker, context);
+                break;
+            }
+        }
+        
+        // Recursively analyze children
+        for (auto &child : op->children) {
+            AnalyzeOperatorExpressions(child.get(), tracker, context);
+        }
+    }
+    
+    void AnalyzeExpressionRecursive(Expression *expr,
+                                   ExpressionUsageTracker &tracker,
+                                   const OptimizationContext &context) {
+        if (!expr) return;
+        
+        // Generate canonical form for expression
+        string canonical_form = GenerateCanonicalForm(*expr);
+        
+        // Track usage frequency
+        tracker.RecordUsage(canonical_form, CalculateExpressionCost(*expr));
+        
+        // Analyze expression characteristics
+        ExpressionCharacteristics characteristics;
+        characteristics.is_deterministic = IsDeterministic(*expr);
+        characteristics.supports_vectorization = SupportsVectorization(*expr);
+        characteristics.computation_cost = cost_estimator->EstimateCost(*expr, context);
+        characteristics.column_dependencies = ExtractColumnDependencies(*expr);
+        
+        tracker.RecordCharacteristics(canonical_form, characteristics);
+        
+        // Recursively analyze child expressions
+        for (const auto &child : expr->children) {
+            AnalyzeExpressionRecursive(child.get(), tracker, context);
+        }
+    }
+    
+    vector<CSEOpportunity> IdentifyCSEOpportunities(const OptimizationContext &context) {
+        vector<CSEOpportunity> opportunities;
+        
+        for (const auto &[canonical_form, metadata] : expression_registry) {
+            if (ShouldEliminateExpression(*metadata, context)) {
+                CSEOpportunity opportunity;
+                opportunity.canonical_form = canonical_form;
+                opportunity.estimated_benefit = CalculateCSEBenefit(*metadata, context);
+                opportunity.complexity_threshold = metadata->computation_cost;
+                opportunity.usage_frequency = metadata->usage_frequency;
+                
+                opportunities.push_back(opportunity);
+            }
+        }
+        
+        // Sort opportunities by estimated benefit
+        sort(opportunities.begin(), opportunities.end(),
+             [](const CSEOpportunity &a, const CSEOpportunity &b) {
+                 return a.estimated_benefit > b.estimated_benefit;
+             });
+        
+        return opportunities;
+    }
+    
+    bool ShouldEliminateExpression(const ExpressionMetadata &metadata,
+                                  const OptimizationContext &context) {
+        // Only eliminate expressions that appear multiple times
+        if (metadata.usage_frequency < config.min_usage_threshold) {
+            return false;
+        }
+        
+        // Only eliminate expensive expressions
+        if (metadata.computation_cost < config.min_cost_threshold) {
+            return false;
+        }
+        
+        // Must be deterministic for correctness
+        if (!metadata.is_deterministic) {
+            return false;
+        }
+        
+        // Calculate cost-benefit ratio
+        double total_cost_without_cse = metadata.usage_frequency * metadata.computation_cost;
+        double total_cost_with_cse = metadata.computation_cost + 
+                                   (metadata.usage_frequency * config.reference_cost);
+        
+        return total_cost_with_cse < total_cost_without_cse * config.benefit_threshold;
+    }
+    
+    unique_ptr<LogicalOperator> ApplyCSETransformations(unique_ptr<LogicalOperator> plan,
+                                                       const vector<CSEOpportunity> &opportunities,
+                                                       const OptimizationContext &context) {
+        if (opportunities.empty()) {
+            return plan;
+        }
+        
+        // Create expression computation operator at the bottom of the plan
+        auto expr_compute = CreateExpressionComputeOperator(opportunities, context);
+        
+        // Transform expressions throughout the plan to use computed references
+        plan = TransformPlanExpressions(move(plan), opportunities);
+        
+        // Insert expression computation operator
+        expr_compute->children.push_back(move(plan));
+        return move(expr_compute);
+    }
+    
+    unique_ptr<LogicalOperator> CreateExpressionComputeOperator(const vector<CSEOpportunity> &opportunities,
+                                                               const OptimizationContext &context) {
+        auto expr_compute = make_unique<LogicalExpressionCompute>();
+        
+        for (const auto &opportunity : opportunities) {
+            // Create computed expression entry
+            ComputedExpression computed_expr;
+            computed_expr.canonical_form = opportunity.canonical_form;
+            computed_expr.expression = ReconstructExpression(opportunity.canonical_form);
+            computed_expr.alias = GenerateExpressionAlias(opportunity.canonical_form);
+            computed_expr.type = computed_expr.expression->return_type;
+            
+            expr_compute->computed_expressions.push_back(move(computed_expr));
+        }
+        
+        return move(expr_compute);
+    }
+    
+    unique_ptr<LogicalOperator> TransformPlanExpressions(unique_ptr<LogicalOperator> op,
+                                                        const vector<CSEOpportunity> &opportunities) {
+        // Transform expressions in current operator
         for (auto &expr : op->expressions) {
-            expr = EliminateCSEExpression(move(expr), expression_map);
+            expr = TransformExpression(move(expr), opportunities);
+        }
+        
+        // Handle operator-specific expression transformations
+        switch (op->type) {
+            case LogicalOperatorType::LOGICAL_PROJECTION: {
+                auto proj = static_cast<LogicalProjection*>(op.get());
+                for (auto &select_expr : proj->select_list) {
+                    select_expr = TransformExpression(move(select_expr), opportunities);
+                }
+                break;
+            }
+            
+            case LogicalOperatorType::LOGICAL_FILTER: {
+                auto filter = static_cast<LogicalFilter*>(op.get());
+                for (auto &filter_expr : filter->expressions) {
+                    filter_expr = TransformExpression(move(filter_expr), opportunities);
+                }
+                break;
+            }
+            
+            case LogicalOperatorType::LOGICAL_AGGREGATE: {
+                auto agg = static_cast<LogicalAggregate*>(op.get());
+                for (auto &group_expr : agg->groups) {
+                    group_expr = TransformExpression(move(group_expr), opportunities);
+                }
+                for (auto &agg_expr : agg->aggregates) {
+                    agg_expr = TransformExpression(move(agg_expr), opportunities);
+                }
+                break;
+            }
+        }
+        
+        // Recursively transform children
+        for (auto &child : op->children) {
+            child = TransformPlanExpressions(move(child), opportunities);
         }
         
         return op;
     }
     
-    unique_ptr<Expression> EliminateCSEExpression(unique_ptr<Expression> expr,
-                                                 ExpressionMap &expression_map) {
-        // Generate canonical string representation of expression
-        auto expr_string = expr->ToString();
+    unique_ptr<Expression> TransformExpression(unique_ptr<Expression> expr,
+                                              const vector<CSEOpportunity> &opportunities) {
+        string canonical_form = GenerateCanonicalForm(*expr);
         
-        // Check if we've seen this expression before
-        auto it = expression_map.find(expr_string);
-        if (it != expression_map.end()) {
-            // Return reference to previously computed expression
-            return CreateExpressionReference(it->second.get());
+        // Check if this expression should be replaced with a reference
+        for (const auto &opportunity : opportunities) {
+            if (opportunity.canonical_form == canonical_form) {
+                return CreateExpressionReference(opportunity);
+            }
         }
         
-        // Recursively process child expressions
+        // Recursively transform child expressions
         for (auto &child : expr->children) {
-            child = EliminateCSEExpression(move(child), expression_map);
-        }
-        
-        // Add this expression to the map if it's complex enough to benefit from CSE
-        if (IsComplexExpression(*expr)) {
-            expression_map[expr_string] = expr->Copy();
+            child = TransformExpression(move(child), opportunities);
         }
         
         return expr;
     }
     
-    bool IsComplexExpression(const Expression &expr) {
-        // Consider expressions complex if they involve:
-        // - Function calls (except simple operators)
-        // - Subqueries
-        // - Complex arithmetic operations
-        // - String operations
+    string GenerateCanonicalForm(const Expression &expr) {
+        // Create a canonical string representation that ignores irrelevant differences
+        stringstream canonical;
+        GenerateCanonicalFormRecursive(expr, canonical);
+        return canonical.str();
+    }
+    
+    void GenerateCanonicalFormRecursive(const Expression &expr, stringstream &canonical) {
+        canonical << static_cast<int>(expr.type) << ":";
         
         switch (expr.type) {
-            case ExpressionType::FUNCTION:
-                return true;
-            case ExpressionType::SUBQUERY:
-                return true;
-            case ExpressionType::CASE_EXPR:
-                return true;
+            case ExpressionType::BOUND_FUNCTION: {
+                const auto &func = static_cast<const BoundFunctionExpression&>(expr);
+                canonical << func.function.name << "(";
+                for (size_t i = 0; i < func.arguments.size(); i++) {
+                    if (i > 0) canonical << ",";
+                    GenerateCanonicalFormRecursive(*func.arguments[i], canonical);
+                }
+                canonical << ")";
+                break;
+            }
+            
+            case ExpressionType::BOUND_COLUMN_REF: {
+                const auto &colref = static_cast<const BoundColumnRefExpression&>(expr);
+                canonical << colref.binding.table_index << "." << colref.binding.column_index;
+                break;
+            }
+            
+            case ExpressionType::VALUE_CONSTANT: {
+                const auto &constant = static_cast<const BoundConstantExpression&>(expr);
+                canonical << constant.value.ToString();
+                break;
+            }
+            
+            case ExpressionType::BOUND_COMPARISON: {
+                const auto &comp = static_cast<const BoundComparisonExpression&>(expr);
+                canonical << static_cast<int>(comp.type) << "(";
+                GenerateCanonicalFormRecursive(*comp.left, canonical);
+                canonical << ",";
+                GenerateCanonicalFormRecursive(*comp.right, canonical);
+                canonical << ")";
+                break;
+            }
+            
             default:
-                return false;
+                // Generic handling for other expression types
+                canonical << "expr(";
+                for (size_t i = 0; i < expr.children.size(); i++) {
+                    if (i > 0) canonical << ",";
+                    GenerateCanonicalFormRecursive(*expr.children[i], canonical);
+                }
+                canonical << ")";
+                break;
         }
+    }
+    
+    double CalculateCSEBenefit(const ExpressionMetadata &metadata,
+                              const OptimizationContext &context) {
+        // Calculate total computation cost without CSE
+        double cost_without_cse = metadata.usage_frequency * metadata.computation_cost;
+        
+        // Calculate total computation cost with CSE
+        double cost_with_cse = metadata.computation_cost + // One-time computation
+                              (metadata.usage_frequency * config.reference_cost); // References
+        
+        // Factor in memory usage for storing intermediate results
+        double memory_overhead = EstimateMemoryOverhead(metadata, context);
+        cost_with_cse += memory_overhead;
+        
+        // Calculate net benefit
+        return cost_without_cse - cost_with_cse;
+    }
+    
+    void ConfigureForAnalyticalWorkloads() {
+        // Configure CSE for analytical query patterns
+        config.min_usage_threshold = 2;        // Eliminate expressions used 2+ times
+        config.min_cost_threshold = 5.0;       // Only expensive expressions
+        config.benefit_threshold = 0.8;        // Must save at least 20% cost
+        config.reference_cost = 0.1;           // Very cheap to reference computed value
+        config.enable_window_cse = true;       // Optimize window function expressions
+        config.enable_aggregate_cse = true;    // Optimize aggregate expressions
+        config.max_expression_size = 1000;     // Limit expression complexity
+    }
+};
+
+// Sophisticated expression cost estimation for CSE optimization
+class ExpressionCostEstimator {
+private:
+    // Cost parameters for different expression types
+    struct CostParameters {
+        double function_call_base_cost = 10.0;
+        double arithmetic_operation_cost = 1.0;
+        double comparison_operation_cost = 1.5;
+        double string_operation_cost = 5.0;
+        double type_conversion_cost = 2.0;
+        double subquery_base_cost = 100.0;
+        double case_expression_cost = 3.0;
+        
+        // Analytical function costs
+        double aggregate_function_cost = 15.0;
+        double window_function_cost = 20.0;
+        double analytical_function_cost = 25.0;
+    };
+    
+    CostParameters cost_params;
+
+public:
+    double EstimateCost(const Expression &expr, const OptimizationContext &context) {
+        return EstimateCostRecursive(expr, context);
+    }
+
+private:
+    double EstimateCostRecursive(const Expression &expr, const OptimizationContext &context) {
+        double base_cost = 0.0;
+        
+        switch (expr.type) {
+            case ExpressionType::BOUND_FUNCTION: {
+                const auto &func = static_cast<const BoundFunctionExpression&>(expr);
+                base_cost = EstimateFunctionCost(func, context);
+                break;
+            }
+            
+            case ExpressionType::BOUND_COMPARISON: {
+                base_cost = cost_params.comparison_operation_cost;
+                break;
+            }
+            
+            case ExpressionType::BOUND_CASE: {
+                const auto &case_expr = static_cast<const BoundCaseExpression&>(expr);
+                base_cost = cost_params.case_expression_cost * case_expr.case_checks.size();
+                break;
+            }
+            
+            case ExpressionType::SUBQUERY: {
+                base_cost = cost_params.subquery_base_cost;
+                break;
+            }
+            
+            case ExpressionType::BOUND_COLUMN_REF:
+            case ExpressionType::VALUE_CONSTANT:
+                base_cost = 0.1; // Very cheap operations
+                break;
+            
+            default:
+                base_cost = 1.0; // Default cost
+                break;
+        }
+        
+        // Add costs for child expressions
+        for (const auto &child : expr.children) {
+            base_cost += EstimateCostRecursive(*child, context);
+        }
+        
+        return base_cost;
+    }
+    
+    double EstimateFunctionCost(const BoundFunctionExpression &func, 
+                               const OptimizationContext &context) {
+        double function_cost = cost_params.function_call_base_cost;
+        
+        // Adjust cost based on function type
+        if (func.is_aggregate) {
+            function_cost = cost_params.aggregate_function_cost;
+        } else if (func.is_window) {
+            function_cost = cost_params.window_function_cost;
+        }
+        
+        // Adjust for specific function characteristics
+        if (IsStringFunction(func.function.name)) {
+            function_cost *= 2.0; // String functions are generally more expensive
+        }
+        
+        if (IsComplexMathFunction(func.function.name)) {
+            function_cost *= 3.0; // Complex math functions are expensive
+        }
+        
+        return function_cost;
     }
 };
 ```
 
-### IN Clause Optimization
+### Advanced IN Clause Optimization Framework
 
-**Large IN Clause Transformation**
-DuckDB implements sophisticated optimizations for IN clauses, particularly important for analytical workloads:
+**Sophisticated IN Clause Transformation and Analysis**
+DuckDB implements comprehensive IN clause optimizations that include cost-based analysis, bloom filter generation, and adaptive execution strategies specifically designed for analytical workloads:
 
 ```cpp
-class InClauseOptimizer {
+// Advanced IN clause optimizer with multiple transformation strategies
+class AdvancedInClauseOptimizer {
+private:
+    // Configuration for different IN clause optimization strategies
+    struct InClauseConfiguration {
+        size_t large_in_threshold = 20;           // Transform to semi-join
+        size_t very_large_in_threshold = 1000;    // Use bloom filter
+        size_t small_in_threshold = 5;            // Keep as simple comparison
+        double semi_join_selectivity_threshold = 0.1;  // Selectivity for semi-join
+        bool enable_bloom_filter_optimization = true;
+        bool enable_hash_table_optimization = true;
+        bool enable_sorted_in_optimization = true;
+    };
+    
+    InClauseConfiguration config;
+    
+    // Cost estimation for IN clause strategies
+    unique_ptr<InClauseCostEstimator> cost_estimator;
+    
+    // Statistics for adaptive optimization
+    unique_ptr<InClauseStatistics> statistics_collector;
+
 public:
-    unique_ptr<LogicalOperator> OptimizeInClauses(unique_ptr<LogicalOperator> plan) {
-        return OptimizeInClausesRecursive(move(plan));
+    AdvancedInClauseOptimizer() {
+        cost_estimator = make_unique<InClauseCostEstimator>();
+        statistics_collector = make_unique<InClauseStatistics>();
+        ConfigureForAnalyticalWorkloads();
     }
     
+    // Comprehensive IN clause optimization with multiple strategies
+    unique_ptr<LogicalOperator> OptimizeInClauses(unique_ptr<LogicalOperator> plan,
+                                                 const OptimizationContext &context) {
+        return OptimizeInClausesRecursive(move(plan), context);
+    }
+
 private:
-    unique_ptr<LogicalOperator> OptimizeInClausesRecursive(unique_ptr<LogicalOperator> op) {
+    unique_ptr<LogicalOperator> OptimizeInClausesRecursive(unique_ptr<LogicalOperator> op,
+                                                          const OptimizationContext &context) {
         // First optimize children
         for (auto &child : op->children) {
-            child = OptimizeInClausesRecursive(move(child));
+            child = OptimizeInClausesRecursive(move(child), context);
         }
         
-        // Then optimize expressions in this operator
-        if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
-            auto filter = unique_ptr_cast<LogicalFilter>(move(op));
-            return OptimizeFilterInClauses(move(filter));
+        // Then optimize IN clauses in this operator
+        switch (op->type) {
+            case LogicalOperatorType::LOGICAL_FILTER:
+                return OptimizeFilterInClauses(unique_ptr_cast<LogicalFilter>(move(op)), context);
+            case LogicalOperatorType::LOGICAL_JOIN:
+                return OptimizeJoinInClauses(unique_ptr_cast<LogicalJoin>(move(op)), context);
+            default:
+                return op;
         }
-        
-        return op;
     }
     
-    unique_ptr<LogicalOperator> OptimizeFilterInClauses(unique_ptr<LogicalFilter> filter) {
-        for (size_t i = 0; i < filter->expressions.size(); i++) {
-            auto &expr = filter->expressions[i];
-            
-            if (IsLargeInClause(*expr)) {
-                // Transform large IN clause to semi-join with VALUES table
-                auto in_expr = unique_ptr_cast<InClauseExpression>(move(expr));
-                auto semi_join = TransformInClauseToSemiJoin(move(in_expr), move(filter->children[0]));
-                
-                // Remove this expression from filter
-                filter->expressions.erase(filter->expressions.begin() + i);
-                
-                // If no more expressions, return the semi-join directly
-                if (filter->expressions.empty()) {
-                    return semi_join;
+    unique_ptr<LogicalOperator> OptimizeFilterInClauses(unique_ptr<LogicalFilter> filter,
+                                                       const OptimizationContext &context) {
+        vector<unique_ptr<Expression>> remaining_expressions;
+        vector<InClauseTransformation> transformations;
+        
+        // Analyze all IN clause expressions
+        for (auto &expr : filter->expressions) {
+            if (IsInClauseExpression(*expr)) {
+                auto transformation = AnalyzeInClause(*expr, context);
+                if (transformation.should_transform) {
+                    transformations.push_back(transformation);
                 } else {
-                    // Otherwise, add remaining filter above semi-join
-                    filter->children[0] = move(semi_join);
-                    return move(filter);
+                    remaining_expressions.push_back(move(expr));
                 }
+            } else {
+                remaining_expressions.push_back(move(expr));
             }
         }
         
-        return move(filter);
-    }
-    
-    bool IsLargeInClause(const Expression &expr) {
-        if (expr.type != ExpressionType::COMPARE_IN) {
-            return false;
+        // Apply transformations
+        unique_ptr<LogicalOperator> current_plan = move(filter->children[0]);
+        
+        for (const auto &transformation : transformations) {
+            current_plan = ApplyInClauseTransformation(move(current_plan), transformation, context);
         }
         
-        auto &in_expr = static_cast<const InClauseExpression&>(expr);
-        return in_expr.value_list.size() >= IN_CLAUSE_THRESHOLD;
+        // If remaining expressions exist, add filter operator
+        if (!remaining_expressions.empty()) {
+            filter->expressions = move(remaining_expressions);
+            filter->children[0] = move(current_plan);
+            return move(filter);
+        }
+        
+        return current_plan;
     }
     
-    unique_ptr<LogicalOperator> TransformInClauseToSemiJoin(unique_ptr<InClauseExpression> in_expr,
-                                                          unique_ptr<LogicalOperator> child) {
-        // Create VALUES table from IN clause values
-        auto values_table = CreateValuesTable(in_expr->value_list);
+    struct InClauseTransformation {
+        InClauseStrategy strategy;
+        unique_ptr<Expression> in_expression;
+        vector<Value> value_list;
+        bool should_transform;
+        double estimated_benefit;
         
-        // Create semi-join
+        // Strategy-specific parameters
+        bool use_bloom_filter;
+        bool use_hash_table;
+        bool sort_values;
+        size_t estimated_memory_usage;
+    };
+    
+    InClauseTransformation AnalyzeInClause(const Expression &expr, 
+                                          const OptimizationContext &context) {
+        InClauseTransformation transformation;
+        transformation.should_transform = false;
+        
+        if (expr.type != ExpressionType::COMPARE_IN) {
+            return transformation;
+        }
+        
+        const auto &in_expr = static_cast<const InClauseExpression&>(expr);
+        transformation.in_expression = expr.Copy();
+        transformation.value_list = ExtractValueList(in_expr);
+        
+        size_t value_count = transformation.value_list.size();
+        
+        // Analyze IN clause characteristics
+        InClauseCharacteristics characteristics = AnalyzeInClauseCharacteristics(in_expr, context);
+        
+        // Determine optimal strategy based on size and characteristics
+        if (value_count >= config.very_large_in_threshold) {
+            transformation.strategy = InClauseStrategy::BLOOM_FILTER_SEMI_JOIN;
+            transformation.use_bloom_filter = true;
+            transformation.should_transform = true;
+        } else if (value_count >= config.large_in_threshold) {
+            if (characteristics.has_duplicates || characteristics.is_unsorted) {
+                transformation.strategy = InClauseStrategy::HASH_TABLE_SEMI_JOIN;
+                transformation.use_hash_table = true;
+            } else {
+                transformation.strategy = InClauseStrategy::SORTED_SEMI_JOIN;
+                transformation.sort_values = true;
+            }
+            transformation.should_transform = true;
+        } else if (value_count >= config.small_in_threshold) {
+            // Cost-based decision for medium-sized IN clauses
+            double in_clause_cost = cost_estimator->EstimateInClauseCost(in_expr, context);
+            double semi_join_cost = cost_estimator->EstimateSemiJoinCost(in_expr, context);
+            
+            if (semi_join_cost < in_clause_cost * 0.8) {
+                transformation.strategy = InClauseStrategy::SIMPLE_SEMI_JOIN;
+                transformation.should_transform = true;
+            }
+        }
+        
+        if (transformation.should_transform) {
+            transformation.estimated_benefit = CalculateTransformationBenefit(
+                transformation, characteristics, context);
+        }
+        
+        return transformation;
+    }
+    
+    unique_ptr<LogicalOperator> ApplyInClauseTransformation(unique_ptr<LogicalOperator> plan,
+                                                           const InClauseTransformation &transformation,
+                                                           const OptimizationContext &context) {
+        switch (transformation.strategy) {
+            case InClauseStrategy::SIMPLE_SEMI_JOIN:
+                return CreateSimpleSemiJoin(move(plan), transformation, context);
+            case InClauseStrategy::HASH_TABLE_SEMI_JOIN:
+                return CreateHashTableSemiJoin(move(plan), transformation, context);
+            case InClauseStrategy::SORTED_SEMI_JOIN:
+                return CreateSortedSemiJoin(move(plan), transformation, context);
+            case InClauseStrategy::BLOOM_FILTER_SEMI_JOIN:
+                return CreateBloomFilterSemiJoin(move(plan), transformation, context);
+            default:
+                return plan;
+        }
+    }
+    
+    unique_ptr<LogicalOperator> CreateBloomFilterSemiJoin(unique_ptr<LogicalOperator> plan,
+                                                          const InClauseTransformation &transformation,
+                                                          const OptimizationContext &context) {
+        // Create VALUES table from IN clause values
+        auto values_table = CreateOptimizedValuesTable(transformation.value_list, 
+                                                       transformation.sort_values);
+        
+        // Create bloom filter generation operator
+        auto bloom_filter_build = make_unique<LogicalBloomFilterBuild>();
+        bloom_filter_build->bloom_filter_column = 0; // First column of VALUES table
+        bloom_filter_build->estimated_unique_count = EstimateUniqueValues(transformation.value_list);
+        bloom_filter_build->children.push_back(move(values_table));
+        
+        // Create bloom filter probe operator
+        auto bloom_filter_probe = make_unique<LogicalBloomFilterProbe>();
+        bloom_filter_probe->probe_expression = ExtractInClauseExpression(*transformation.in_expression);
+        bloom_filter_probe->children.push_back(move(plan));
+        bloom_filter_probe->children.push_back(move(bloom_filter_build));
+        
+        // Create semi-join with remaining tuples that pass bloom filter
         auto semi_join = make_unique<LogicalJoin>(JoinType::SEMI);
-        semi_join->children.push_back(move(child));
-        semi_join->children.push_back(move(values_table));
+        semi_join->join_type = JoinType::SEMI;
+        
+        // Extract and recreate VALUES table for join (bloom filter consumed original)
+        auto join_values_table = CreateOptimizedValuesTable(transformation.value_list, true);
+        
+        semi_join->children.push_back(move(bloom_filter_probe));
+        semi_join->children.push_back(move(join_values_table));
         
         // Create join condition
         JoinCondition condition;
-        condition.left = move(in_expr->expression);
-        condition.right = CreateColumnReference(0, 0);  // Reference to VALUES column
+        condition.left = ExtractInClauseExpression(*transformation.in_expression);
+        condition.right = CreateColumnReference(0, 0); // Reference to VALUES column
         condition.comparison = ExpressionType::COMPARE_EQUAL;
         semi_join->conditions.push_back(move(condition));
         
         return move(semi_join);
     }
     
-    static const size_t IN_CLAUSE_THRESHOLD = 20;
+    unique_ptr<LogicalOperator> CreateHashTableSemiJoin(unique_ptr<LogicalOperator> plan,
+                                                        const InClauseTransformation &transformation,
+                                                        const OptimizationContext &context) {
+        // Create optimized VALUES table with hash table hint
+        auto values_table = CreateHashOptimizedValuesTable(transformation.value_list);
+        
+        // Create semi-join
+        auto semi_join = make_unique<LogicalJoin>(JoinType::SEMI);
+        semi_join->children.push_back(move(plan));
+        semi_join->children.push_back(move(values_table));
+        
+        // Create join condition with hash optimization hint
+        JoinCondition condition;
+        condition.left = ExtractInClauseExpression(*transformation.in_expression);
+        condition.right = CreateColumnReference(0, 0);
+        condition.comparison = ExpressionType::COMPARE_EQUAL;
+        condition.enable_hash_optimization = true;
+        semi_join->conditions.push_back(move(condition));
+        
+        // Set optimization hints
+        semi_join->preferred_join_algorithm = JoinAlgorithm::HASH_JOIN;
+        semi_join->enable_bloom_filter = (transformation.value_list.size() > 100);
+        
+        return move(semi_join);
+    }
+    
+    unique_ptr<LogicalOperator> CreateSortedSemiJoin(unique_ptr<LogicalOperator> plan,
+                                                    const InClauseTransformation &transformation,
+                                                    const OptimizationContext &context) {
+        // Create sorted VALUES table
+        auto sorted_values = transformation.value_list;
+        sort(sorted_values.begin(), sorted_values.end());
+        auto values_table = CreateOptimizedValuesTable(sorted_values, false);
+        
+        // Add sort operator to VALUES table
+        auto sort_op = make_unique<LogicalSort>();
+        OrderByNode order;
+        order.expression = CreateColumnReference(0, 0);
+        order.type = OrderType::ASCENDING;
+        sort_op->orders.push_back(order);
+        sort_op->children.push_back(move(values_table));
+        
+        // Create semi-join with sort-merge hint
+        auto semi_join = make_unique<LogicalJoin>(JoinType::SEMI);
+        semi_join->children.push_back(move(plan));
+        semi_join->children.push_back(move(sort_op));
+        
+        // Create join condition
+        JoinCondition condition;
+        condition.left = ExtractInClauseExpression(*transformation.in_expression);
+        condition.right = CreateColumnReference(0, 0);
+        condition.comparison = ExpressionType::COMPARE_EQUAL;
+        semi_join->conditions.push_back(move(condition));
+        
+        // Prefer sort-merge join for sorted data
+        semi_join->preferred_join_algorithm = JoinAlgorithm::SORT_MERGE_JOIN;
+        
+        return move(semi_join);
+    }
+    
+    struct InClauseCharacteristics {
+        bool has_duplicates;
+        bool is_sorted;
+        bool is_unsorted;
+        bool all_constants;
+        double estimated_selectivity;
+        LogicalType value_type;
+        size_t estimated_unique_count;
+        
+        // Value distribution analysis
+        bool has_nulls;
+        bool is_numeric;
+        bool is_string;
+        size_t average_string_length;
+    };
+    
+    InClauseCharacteristics AnalyzeInClauseCharacteristics(const InClauseExpression &expr,
+                                                          const OptimizationContext &context) {
+        InClauseCharacteristics characteristics;
+        
+        auto values = ExtractValueList(expr);
+        characteristics.value_type = values.empty() ? LogicalType::INVALID : values[0].type();
+        characteristics.all_constants = true;
+        characteristics.has_nulls = false;
+        
+        // Analyze value distribution
+        unordered_set<string> unique_values;
+        bool is_ascending = true;
+        bool is_descending = true;
+        
+        for (size_t i = 0; i < values.size(); i++) {
+            const auto &value = values[i];
+            
+            if (value.IsNull()) {
+                characteristics.has_nulls = true;
+            }
+            
+            string value_str = value.ToString();
+            unique_values.insert(value_str);
+            
+            if (i > 0) {
+                if (is_ascending && value < values[i-1]) {
+                    is_ascending = false;
+                }
+                if (is_descending && value > values[i-1]) {
+                    is_descending = false;
+                }
+            }
+        }
+        
+        characteristics.has_duplicates = (unique_values.size() < values.size());
+        characteristics.estimated_unique_count = unique_values.size();
+        characteristics.is_sorted = is_ascending || is_descending;
+        characteristics.is_unsorted = !characteristics.is_sorted;
+        
+        // Type-specific analysis
+        characteristics.is_numeric = IsNumericType(characteristics.value_type);
+        characteristics.is_string = IsStringType(characteristics.value_type);
+        
+        if (characteristics.is_string) {
+            size_t total_length = 0;
+            for (const auto &value : values) {
+                if (!value.IsNull()) {
+                    total_length += value.GetValueUnsafe<string>().length();
+                }
+            }
+            characteristics.average_string_length = values.empty() ? 0 : total_length / values.size();
+        }
+        
+        // Estimate selectivity based on unique count and data distribution
+        characteristics.estimated_selectivity = EstimateInClauseSelectivity(expr, context);
+        
+        return characteristics;
+    }
+    
+    void ConfigureForAnalyticalWorkloads() {
+        // Configure for analytical query patterns
+        config.large_in_threshold = 15;           // Lower threshold for analytics
+        config.very_large_in_threshold = 500;     // Aggressive bloom filter usage
+        config.enable_bloom_filter_optimization = true;
+        config.enable_hash_table_optimization = true;
+        config.enable_sorted_in_optimization = true;
+        config.semi_join_selectivity_threshold = 0.05; // More aggressive transformation
+    }
+};
+
+// Advanced cost estimation for IN clause optimization strategies
+class InClauseCostEstimator {
+private:
+    struct CostParameters {
+        double in_clause_comparison_cost = 1.0;
+        double hash_table_build_cost = 2.0;
+        double hash_table_probe_cost = 1.5;
+        double bloom_filter_build_cost = 1.0;
+        double bloom_filter_probe_cost = 0.5;
+        double sort_cost_factor = 3.0;
+        double semi_join_overhead = 5.0;
+    };
+    
+    CostParameters cost_params;
+
+public:
+    double EstimateInClauseCost(const InClauseExpression &expr, 
+                               const OptimizationContext &context) {
+        auto values = ExtractValueList(expr);
+        auto probe_cardinality = EstimateProbeCardinality(expr, context);
+        
+        // Cost of evaluating IN clause for each probe tuple
+        double comparison_cost = values.size() * cost_params.in_clause_comparison_cost;
+        return probe_cardinality * comparison_cost;
+    }
+    
+    double EstimateSemiJoinCost(const InClauseExpression &expr,
+                               const OptimizationContext &context) {
+        auto values = ExtractValueList(expr);
+        auto probe_cardinality = EstimateProbeCardinality(expr, context);
+        
+        // Hash table build cost
+        double build_cost = values.size() * cost_params.hash_table_build_cost;
+        
+        // Hash table probe cost
+        double probe_cost = probe_cardinality * cost_params.hash_table_probe_cost;
+        
+        // Semi-join overhead
+        double overhead = cost_params.semi_join_overhead;
+        
+        return build_cost + probe_cost + overhead;
+    }
+    
+    double EstimateBloomFilterCost(const InClauseExpression &expr,
+                                  const OptimizationContext &context) {
+        auto values = ExtractValueList(expr);
+        auto probe_cardinality = EstimateProbeCardinality(expr, context);
+        
+        // Bloom filter build cost
+        double build_cost = values.size() * cost_params.bloom_filter_build_cost;
+        
+        // Bloom filter probe cost (very cheap)
+        double probe_cost = probe_cardinality * cost_params.bloom_filter_probe_cost;
+        
+        // Remaining semi-join cost for surviving tuples
+        double estimated_selectivity = EstimateBloomFilterSelectivity(values);
+        double semi_join_cost = EstimateSemiJoinCost(expr, context) * estimated_selectivity;
+        
+        return build_cost + probe_cost + semi_join_cost;
+    }
+
+private:
+    double EstimateBloomFilterSelectivity(const vector<Value> &values) {
+        // Estimate false positive rate based on bloom filter configuration
+        // This is a simplified estimation
+        double estimated_fpr = 0.01; // 1% false positive rate
+        return estimated_fpr + (static_cast<double>(EstimateUniqueValues(values)) / 1000000.0);
+    }
 };
 ```
 
