@@ -4254,3 +4254,4915 @@ private:
 This comprehensive query optimizer implementation demonstrates the sophisticated algorithms and techniques that enable DuckDB to deliver exceptional analytical performance. The combination of cost-based optimization, rule-based transformations, and specialized analytical optimizations creates a powerful optimization framework that automatically generates efficient execution plans without requiring manual tuning or hints from users.
 
 ---
+
+# 3. Physical Execution Engine
+
+The physical execution engine represents the culmination of DuckDB's query processing pipeline, transforming optimized logical plans into concrete execution strategies that leverage modern hardware capabilities while maintaining the system's commitment to simplicity and performance. This engine embodies DuckDB's most significant innovations: vectorized processing, push-based execution, and automatic parallelization.
+
+# 3.1 Physical Plan Generation
+
+## 3.1.1 Logical to Physical Operator Mapping
+
+### Physical Operator Architecture
+
+The transition from logical to physical planning represents a critical transformation where abstract query semantics are mapped to concrete execution strategies that consider hardware characteristics, resource availability, and performance optimization opportunities.
+
+**Physical Operator Hierarchy**
+DuckDB's physical operators form a sophisticated hierarchy that mirrors logical operators while adding execution-specific functionality:
+
+```cpp
+class PhysicalOperator {
+public:
+    PhysicalOperatorType type;
+    vector<unique_ptr<PhysicalOperator>> children;
+    vector<LogicalType> types;
+    idx_t estimated_cardinality;
+    
+    // Execution state management
+    unique_ptr<OperatorState> local_state;
+    unique_ptr<GlobalOperatorState> global_state;
+    
+    // Performance characteristics
+    bool can_be_parallelized;
+    bool preserves_insertion_order;
+    bool requires_sorted_input;
+    
+    // Resource management
+    idx_t estimated_memory_usage;
+    double cpu_cost_factor;
+    
+    virtual unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) = 0;
+    virtual unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) = 0;
+    virtual OperatorResultType Execute(ExecutionContext &context,
+                                     DataChunk &input,
+                                     DataChunk &chunk,
+                                     GlobalOperatorState &gstate,
+                                     OperatorState &state) = 0;
+};
+```
+
+**Execution Context Integration**
+Physical operators integrate with DuckDB's execution context to manage resources and coordinate parallel execution:
+
+```cpp
+class ExecutionContext {
+    ClientContext &client;
+    ThreadContext thread_context;
+    unique_ptr<TaskScheduler> task_scheduler;
+    
+public:
+    // Resource management
+    BufferManager &GetBufferManager() { return client.GetBufferManager(); }
+    MemoryManager &GetMemoryManager() { return client.GetMemoryManager(); }
+    
+    // Parallel execution coordination
+    void ScheduleTask(unique_ptr<Task> task);
+    void WaitForTasks();
+    bool ShouldContinueExecution();
+    
+    // Performance monitoring
+    ProfilerInterface &GetProfiler() { return client.GetProfiler(); }
+    void RecordOperatorTiming(PhysicalOperatorType type, double execution_time);
+};
+```
+
+### Operator Selection and Instantiation
+
+**Algorithm Selection Framework**
+The physical plan generator selects concrete algorithms based on data characteristics, resource availability, and expected performance:
+
+```cpp
+class PhysicalPlanGenerator {
+public:
+    unique_ptr<PhysicalOperator> CreatePlan(unique_ptr<LogicalOperator> logical_plan) {
+        PhysicalPlanContext context;
+        return CreatePhysicalOperator(move(logical_plan), context);
+    }
+    
+private:
+    unique_ptr<PhysicalOperator> CreatePhysicalOperator(unique_ptr<LogicalOperator> logical_op,
+                                                       PhysicalPlanContext &context) {
+        switch (logical_op->type) {
+            case LogicalOperatorType::LOGICAL_GET:
+                return CreateScanOperator(unique_ptr_cast<LogicalGet>(move(logical_op)), context);
+            case LogicalOperatorType::LOGICAL_JOIN:
+                return CreateJoinOperator(unique_ptr_cast<LogicalJoin>(move(logical_op)), context);
+            case LogicalOperatorType::LOGICAL_AGGREGATE:
+                return CreateAggregateOperator(unique_ptr_cast<LogicalAggregate>(move(logical_op)), context);
+            case LogicalOperatorType::LOGICAL_FILTER:
+                return CreateFilterOperator(unique_ptr_cast<LogicalFilter>(move(logical_op)), context);
+            default:
+                throw NotImplementedException("Physical operator not implemented");
+        }
+    }
+    
+    unique_ptr<PhysicalOperator> CreateJoinOperator(unique_ptr<LogicalJoin> logical_join,
+                                                   PhysicalPlanContext &context) {
+        // Select join algorithm based on cost estimates and data characteristics
+        auto join_algorithm = SelectJoinAlgorithm(*logical_join, context);
+        
+        switch (join_algorithm) {
+            case JoinAlgorithm::HASH_JOIN:
+                return CreateHashJoin(move(logical_join), context);
+            case JoinAlgorithm::SORT_MERGE_JOIN:
+                return CreateSortMergeJoin(move(logical_join), context);
+            case JoinAlgorithm::NESTED_LOOP_JOIN:
+                return CreateNestedLoopJoin(move(logical_join), context);
+            case JoinAlgorithm::INDEX_JOIN:
+                return CreateIndexJoin(move(logical_join), context);
+        }
+    }
+};
+```
+
+**Hash Join Implementation Selection**
+Hash joins receive sophisticated algorithm selection based on memory availability and data characteristics:
+
+```cpp
+class HashJoinSelector {
+public:
+    static unique_ptr<PhysicalOperator> CreateOptimalHashJoin(unique_ptr<LogicalJoin> logical_join,
+                                                             PhysicalPlanContext &context) {
+        auto left_cardinality = EstimateCardinality(*logical_join->children[0]);
+        auto right_cardinality = EstimateCardinality(*logical_join->children[1]);
+        
+        // Determine build and probe sides
+        auto build_side = SelectBuildSide(left_cardinality, right_cardinality, logical_join->conditions);
+        
+        if (RequiresPartitioning(logical_join.get(), context)) {
+            return CreatePartitionedHashJoin(move(logical_join), build_side, context);
+        } else {
+            return CreateSimpleHashJoin(move(logical_join), build_side, context);
+        }
+    }
+    
+private:
+    static BuildSide SelectBuildSide(idx_t left_cardinality, 
+                                   idx_t right_cardinality,
+                                   const vector<JoinCondition> &conditions) {
+        // Generally build on smaller side, but consider other factors
+        if (right_cardinality < left_cardinality * BUILD_SIDE_THRESHOLD) {
+            return BuildSide::RIGHT;
+        }
+        
+        // Check for foreign key relationships that might favor one side
+        if (HasUniqueConstraint(conditions, BuildSide::LEFT)) {
+            return BuildSide::LEFT;
+        }
+        
+        if (HasUniqueConstraint(conditions, BuildSide::RIGHT)) {
+            return BuildSide::RIGHT;
+        }
+        
+        return right_cardinality < left_cardinality ? BuildSide::RIGHT : BuildSide::LEFT;
+    }
+    
+    static const double BUILD_SIDE_THRESHOLD = 0.8;
+};
+```
+
+## 3.1.2 Resource Estimation and Allocation
+
+### Memory Usage Estimation
+
+**Operator Memory Profiling**
+DuckDB implements sophisticated memory estimation to ensure efficient resource allocation and prevent out-of-memory conditions:
+
+```cpp
+class MemoryEstimator {
+public:
+    static idx_t EstimateOperatorMemoryUsage(const PhysicalOperator &op, 
+                                           const ExecutionContext &context) {
+        switch (op.type) {
+            case PhysicalOperatorType::HASH_JOIN:
+                return EstimateHashJoinMemory(static_cast<const PhysicalHashJoin&>(op));
+            case PhysicalOperatorType::AGGREGATE:
+                return EstimateAggregateMemory(static_cast<const PhysicalHashAggregate&>(op));
+            case PhysicalOperatorType::ORDER_BY:
+                return EstimateSortMemory(static_cast<const PhysicalSort&>(op));
+            default:
+                return EstimateGenericMemory(op);
+        }
+    }
+    
+private:
+    static idx_t EstimateHashJoinMemory(const PhysicalHashJoin &hash_join) {
+        // Estimate hash table size based on build side cardinality
+        auto build_cardinality = hash_join.children[hash_join.build_side]->estimated_cardinality;
+        auto tuple_size = EstimateTupleSize(hash_join.children[hash_join.build_side]->types);
+        
+        // Hash table overhead: pointers, hash values, collision handling
+        auto hash_table_overhead = build_cardinality * (sizeof(void*) + sizeof(hash_t));
+        auto data_size = build_cardinality * tuple_size;
+        
+        // Include space for bloom filters and statistics
+        auto bloom_filter_size = BloomFilter::EstimateSize(build_cardinality);
+        
+        return data_size + hash_table_overhead + bloom_filter_size;
+    }
+    
+    static idx_t EstimateAggregateMemory(const PhysicalHashAggregate &aggregate) {
+        auto estimated_groups = EstimateGroupCount(aggregate);
+        auto group_size = EstimateTupleSize(aggregate.group_types);
+        auto aggregate_size = EstimateAggregateStateSize(aggregate.aggregates);
+        
+        // Hash table for groups plus aggregate states
+        auto hash_table_size = estimated_groups * (group_size + aggregate_size);
+        auto hash_overhead = estimated_groups * sizeof(void*);
+        
+        return hash_table_size + hash_overhead;
+    }
+};
+```
+
+**Dynamic Memory Management**
+Physical operators implement dynamic memory management that adapts to available resources:
+
+```cpp
+class AdaptiveMemoryManager {
+public:
+    static void ConfigureOperatorMemory(PhysicalOperator &op, 
+                                      const MemoryConfiguration &config) {
+        auto estimated_memory = MemoryEstimator::EstimateOperatorMemoryUsage(op, config.context);
+        auto available_memory = config.available_memory;
+        
+        if (estimated_memory <= available_memory) {
+            // Sufficient memory - configure for optimal performance
+            ConfigureInMemoryExecution(op, estimated_memory);
+        } else {
+            // Limited memory - configure for out-of-core execution
+            ConfigureSpillingExecution(op, available_memory);
+        }
+    }
+    
+private:
+    static void ConfigureSpillingExecution(PhysicalOperator &op, idx_t available_memory) {
+        switch (op.type) {
+            case PhysicalOperatorType::HASH_JOIN: {
+                auto &hash_join = static_cast<PhysicalHashJoin&>(op);
+                hash_join.enable_partitioning = true;
+                hash_join.partition_count = CalculateOptimalPartitions(available_memory);
+                break;
+            }
+            case PhysicalOperatorType::AGGREGATE: {
+                auto &aggregate = static_cast<PhysicalHashAggregate&>(op);
+                aggregate.enable_external_aggregation = true;
+                aggregate.memory_limit = available_memory * 0.8; // Reserve some memory
+                break;
+            }
+            case PhysicalOperatorType::ORDER_BY: {
+                auto &sort = static_cast<PhysicalSort&>(op);
+                sort.enable_external_sort = true;
+                sort.max_memory_usage = available_memory;
+                break;
+            }
+        }
+    }
+};
+```
+
+### Parallelization Strategy
+
+**Automatic Parallelization Planning**
+DuckDB automatically determines optimal parallelization strategies for physical operators:
+
+```cpp
+class ParallelizationPlanner {
+public:
+    static void PlanParallelExecution(PhysicalOperator &root_op, 
+                                    const ExecutionContext &context) {
+        ParallelizationContext parallel_context;
+        parallel_context.available_threads = context.GetThreadCount();
+        parallel_context.memory_per_thread = context.GetMemoryPerThread();
+        
+        PlanOperatorParallelization(root_op, parallel_context);
+    }
+    
+private:
+    static void PlanOperatorParallelization(PhysicalOperator &op,
+                                          ParallelizationContext &context) {
+        // First, plan parallelization for children
+        for (auto &child : op.children) {
+            PlanOperatorParallelization(*child, context);
+        }
+        
+        // Then determine parallelization strategy for this operator
+        switch (op.type) {
+            case PhysicalOperatorType::TABLE_SCAN:
+                PlanScanParallelization(static_cast<PhysicalTableScan&>(op), context);
+                break;
+            case PhysicalOperatorType::HASH_JOIN:
+                PlanJoinParallelization(static_cast<PhysicalHashJoin&>(op), context);
+                break;
+            case PhysicalOperatorType::AGGREGATE:
+                PlanAggregateParallelization(static_cast<PhysicalHashAggregate&>(op), context);
+                break;
+        }
+    }
+    
+    static void PlanScanParallelization(PhysicalTableScan &scan,
+                                      ParallelizationContext &context) {
+        // Calculate optimal number of parallel scan threads
+        auto estimated_work = scan.estimated_cardinality * scan.GetCostPerTuple();
+        auto optimal_threads = CalculateOptimalThreadCount(estimated_work, context.available_threads);
+        
+        scan.parallel_scan_count = optimal_threads;
+        scan.morsel_size = CalculateOptimalMorselSize(scan.estimated_cardinality, optimal_threads);
+    }
+    
+    static void PlanJoinParallelization(PhysicalHashJoin &join,
+                                      ParallelizationContext &context) {
+        // Parallel build phase
+        join.parallel_build = CanParallelizeBuild(join);
+        
+        // Parallel probe phase
+        join.parallel_probe = true; // Generally always beneficial
+        join.probe_thread_count = context.available_threads;
+        
+        // Partitioned joins for very large datasets
+        if (RequiresPartitioning(join, context)) {
+            join.enable_partitioning = true;
+            join.partition_count = CalculateOptimalPartitions(join, context);
+        }
+    }
+};
+```
+
+## 3.1.3 Pipeline Construction and Execution Flow
+
+### Pipeline-Based Execution Model
+
+**Pipeline Architecture**
+DuckDB organizes physical operators into execution pipelines that enable efficient data flow and automatic parallelization:
+
+```cpp
+class Pipeline {
+public:
+    vector<unique_ptr<PhysicalOperator>> operators;
+    unique_ptr<PhysicalOperator> source;
+    unique_ptr<PhysicalOperator> sink;
+    
+    // Pipeline characteristics
+    bool requires_batch_index;
+    bool is_order_dependent;
+    bool can_be_parallelized;
+    
+    // Resource management
+    idx_t estimated_cardinality;
+    idx_t max_memory_usage;
+    
+    void Execute(ExecutionContext &context);
+    void ExecuteParallel(ExecutionContext &context, idx_t thread_count);
+    
+private:
+    // Pipeline execution state
+    unique_ptr<PipelineExecutor> executor;
+    unique_ptr<GlobalSinkState> global_sink_state;
+    vector<unique_ptr<LocalSinkState>> local_sink_states;
+};
+
+class PipelineBuilder {
+public:
+    static vector<unique_ptr<Pipeline>> BuildPipelines(PhysicalOperator &root_op) {
+        vector<unique_ptr<Pipeline>> pipelines;
+        PipelineContext context;
+        
+        BuildPipelinesRecursive(root_op, pipelines, context);
+        return pipelines;
+    }
+    
+private:
+    static void BuildPipelinesRecursive(PhysicalOperator &op,
+                                      vector<unique_ptr<Pipeline>> &pipelines,
+                                      PipelineContext &context) {
+        if (IsPipelineBreaker(op)) {
+            // Start new pipeline
+            FinalizePipeline(context.current_pipeline, pipelines);
+            context.current_pipeline = make_unique<Pipeline>();
+            context.current_pipeline->sink = &op;
+        }
+        
+        // Add operator to current pipeline
+        context.current_pipeline->operators.push_back(&op);
+        
+        // Process children
+        for (auto &child : op.children) {
+            BuildPipelinesRecursive(*child, pipelines, context);
+        }
+    }
+    
+    static bool IsPipelineBreaker(const PhysicalOperator &op) {
+        // Pipeline breakers require materialization or special handling
+        switch (op.type) {
+            case PhysicalOperatorType::HASH_JOIN:
+                return true; // Build phase requires materialization
+            case PhysicalOperatorType::AGGREGATE:
+                return true; // Grouping requires materialization
+            case PhysicalOperatorType::ORDER_BY:
+                return true; // Sorting requires materialization
+            case PhysicalOperatorType::WINDOW:
+                return true; // Window functions may require materialization
+            default:
+                return false;
+        }
+    }
+};
+```
+
+**Morsel-Driven Parallelism**
+DuckDB implements morsel-driven parallelism to achieve optimal load balancing and resource utilization:
+
+```cpp
+class MorselScheduler {
+public:
+    static void ExecutePipelineParallel(Pipeline &pipeline, 
+                                      ExecutionContext &context,
+                                      idx_t thread_count) {
+        // Create thread-local execution contexts
+        vector<unique_ptr<PipelineExecutor>> executors;
+        for (idx_t i = 0; i < thread_count; i++) {
+            executors.push_back(make_unique<PipelineExecutor>(pipeline, context));
+        }
+        
+        // Work-stealing scheduler for load balancing
+        WorkStealingScheduler scheduler(thread_count);
+        
+        // Generate work morsels
+        auto morsels = GenerateMorsels(pipeline);
+        
+        // Execute morsels in parallel
+        scheduler.ExecuteParallel(morsels, executors);
+    }
+    
+private:
+    static vector<unique_ptr<Morsel>> GenerateMorsels(const Pipeline &pipeline) {
+        vector<unique_ptr<Morsel>> morsels;
+        
+        // Get data source characteristics
+        auto source_cardinality = pipeline.source->estimated_cardinality;
+        auto optimal_morsel_size = CalculateOptimalMorselSize(source_cardinality);
+        
+        // Generate morsels for data source
+        for (idx_t offset = 0; offset < source_cardinality; offset += optimal_morsel_size) {
+            auto morsel_size = std::min(optimal_morsel_size, source_cardinality - offset);
+            morsels.push_back(make_unique<Morsel>(offset, morsel_size));
+        }
+        
+        return morsels;
+    }
+};
+
+class WorkStealingScheduler {
+    idx_t thread_count;
+    atomic<idx_t> work_index;
+    vector<queue<unique_ptr<Morsel>>> thread_queues;
+    
+public:
+    explicit WorkStealingScheduler(idx_t threads) : thread_count(threads), work_index(0) {
+        thread_queues.resize(thread_count);
+    }
+    
+    void ExecuteParallel(vector<unique_ptr<Morsel>> &morsels,
+                        vector<unique_ptr<PipelineExecutor>> &executors) {
+        // Distribute initial work
+        DistributeWork(morsels);
+        
+        // Launch worker threads
+        vector<thread> workers;
+        for (idx_t i = 0; i < thread_count; i++) {
+            workers.emplace_back([this, i, &executors]() {
+                ExecuteWorkerThread(i, *executors[i]);
+            });
+        }
+        
+        // Wait for completion
+        for (auto &worker : workers) {
+            worker.join();
+        }
+    }
+    
+private:
+    void ExecuteWorkerThread(idx_t thread_id, PipelineExecutor &executor) {
+        while (true) {
+            auto morsel = GetNextMorsel(thread_id);
+            if (!morsel) {
+                break; // No more work
+            }
+            
+            executor.ExecuteMorsel(*morsel);
+        }
+    }
+    
+    unique_ptr<Morsel> GetNextMorsel(idx_t thread_id) {
+        // Try to get work from own queue first
+        if (!thread_queues[thread_id].empty()) {
+            auto morsel = move(thread_queues[thread_id].front());
+            thread_queues[thread_id].pop();
+            return morsel;
+        }
+        
+        // Work stealing: try to steal from other threads
+        for (idx_t i = 0; i < thread_count; i++) {
+            idx_t victim_id = (thread_id + i + 1) % thread_count;
+            if (!thread_queues[victim_id].empty()) {
+                auto morsel = move(thread_queues[victim_id].front());
+                thread_queues[victim_id].pop();
+                return morsel;
+            }
+        }
+        
+        return nullptr; // No work available
+    }
+};
+```
+
+### Performance Monitoring and Optimization
+
+**Runtime Performance Tracking**
+Physical operators include comprehensive performance monitoring to enable optimization and debugging:
+
+```cpp
+class OperatorProfiler {
+public:
+    struct OperatorMetrics {
+        double execution_time;
+        idx_t processed_tuples;
+        idx_t memory_usage;
+        idx_t cache_misses;
+        idx_t network_bytes;
+        
+        double GetTupleProcessingRate() const {
+            return execution_time > 0 ? processed_tuples / execution_time : 0;
+        }
+    };
+    
+    void RecordOperatorExecution(PhysicalOperatorType type,
+                               const OperatorMetrics &metrics) {
+        operator_metrics_[type].push_back(metrics);
+        UpdateAggregateMetrics(type, metrics);
+    }
+    
+    OperatorMetrics GetAggregateMetrics(PhysicalOperatorType type) const {
+        auto it = aggregate_metrics_.find(type);
+        return it != aggregate_metrics_.end() ? it->second : OperatorMetrics{};
+    }
+    
+private:
+    unordered_map<PhysicalOperatorType, vector<OperatorMetrics>> operator_metrics_;
+    unordered_map<PhysicalOperatorType, OperatorMetrics> aggregate_metrics_;
+    
+    void UpdateAggregateMetrics(PhysicalOperatorType type, const OperatorMetrics &metrics) {
+        auto &aggregate = aggregate_metrics_[type];
+        aggregate.execution_time += metrics.execution_time;
+        aggregate.processed_tuples += metrics.processed_tuples;
+        aggregate.memory_usage = std::max(aggregate.memory_usage, metrics.memory_usage);
+    }
+};
+
+class AdaptiveOptimizer {
+public:
+    static void OptimizeBasedOnExecution(Pipeline &pipeline, 
+                                       const OperatorProfiler &profiler) {
+        for (auto &op : pipeline.operators) {
+            auto metrics = profiler.GetAggregateMetrics(op->type);
+            ApplyAdaptiveOptimizations(*op, metrics);
+        }
+    }
+    
+private:
+    static void ApplyAdaptiveOptimizations(PhysicalOperator &op,
+                                         const OperatorProfiler::OperatorMetrics &metrics) {
+        switch (op.type) {
+            case PhysicalOperatorType::HASH_JOIN: {
+                auto &hash_join = static_cast<PhysicalHashJoin&>(op);
+                
+                // Adjust hash table size based on observed performance
+                if (metrics.cache_misses > CACHE_MISS_THRESHOLD) {
+                    hash_join.hash_table_size_factor *= 0.8; // Reduce for better cache performance
+                }
+                
+                // Adjust parallelization based on efficiency
+                auto efficiency = metrics.GetTupleProcessingRate();
+                if (efficiency < EFFICIENCY_THRESHOLD) {
+                    hash_join.probe_thread_count = std::max(1u, hash_join.probe_thread_count - 1);
+                }
+                break;
+            }
+            
+            case PhysicalOperatorType::TABLE_SCAN: {
+                auto &scan = static_cast<PhysicalTableScan&>(op);
+                
+                // Adjust morsel size based on processing rate
+                auto processing_rate = metrics.GetTupleProcessingRate();
+                if (processing_rate < TARGET_PROCESSING_RATE) {
+                    scan.morsel_size *= 1.2; // Larger morsels for better amortization
+                } else if (processing_rate > TARGET_PROCESSING_RATE * 2) {
+                    scan.morsel_size *= 0.8; // Smaller morsels for better parallelism
+                }
+                break;
+            }
+        }
+    }
+    
+    static const idx_t CACHE_MISS_THRESHOLD = 1000;
+    static const double EFFICIENCY_THRESHOLD = 100000; // Tuples per second
+    static const double TARGET_PROCESSING_RATE = 500000; // Target tuples per second
+};
+```
+
+This comprehensive physical plan generation framework provides the foundation for DuckDB's exceptional execution performance. The combination of intelligent operator selection, adaptive resource management, and sophisticated parallelization strategies enables DuckDB to automatically generate efficient execution plans that leverage modern hardware capabilities while maintaining simplicity for users.
+
+---
+
+# 3.2 Vectorized Execution Model
+
+## 3.2.1 Push-Based Execution Architecture
+
+### Execution Model Philosophy
+
+DuckDB's vectorized execution model represents a fundamental departure from traditional tuple-at-a-time processing, implementing a push-based architecture where operators actively send batches of data (vectors) to downstream operators. This approach enables sophisticated optimizations including automatic parallelization, efficient memory utilization, and SIMD instruction utilization while maintaining the conceptual simplicity that characterizes DuckDB's design philosophy.
+
+**Push vs. Pull Execution Paradigms**
+The distinction between push-based and pull-based execution models has profound implications for system performance and parallelization capabilities:
+
+```cpp
+// Pull-based execution (traditional approach)
+class PullBasedOperator {
+public:
+    virtual unique_ptr<DataChunk> GetNextChunk() = 0;
+    
+    void Execute() {
+        while (auto chunk = GetNextChunk()) {
+            ProcessChunk(*chunk);
+        }
+    }
+};
+
+// Push-based execution (DuckDB approach)
+class PushBasedOperator {
+public:
+    virtual void ProcessChunk(DataChunk &chunk, OperatorSinkState &state) = 0;
+    virtual void Finalize(OperatorSinkState &state) = 0;
+    
+    void PushChunk(DataChunk &chunk, OperatorSinkState &state) {
+        ProcessChunk(chunk, state);
+        
+        // Automatically push to children
+        for (auto &child : children) {
+            child->PushChunk(chunk, state);
+        }
+    }
+};
+```
+
+**Push-Based Architecture Benefits**
+The push-based model provides several critical advantages for analytical workloads:
+
+**Automatic Backpressure Management**
+Operators can pause execution when downstream operators are busy, enabling natural flow control:
+
+```cpp
+class BackpressureManager {
+    atomic<bool> should_pause;
+    condition_variable resume_signal;
+    
+public:
+    void PauseExecution() {
+        should_pause = true;
+    }
+    
+    void ResumeExecution() {
+        should_pause = false;
+        resume_signal.notify_all();
+    }
+    
+    void CheckBackpressure() {
+        unique_lock<mutex> lock(pause_mutex);
+        resume_signal.wait(lock, [this] { return !should_pause.load(); });
+    }
+};
+
+class PushOperator : public PhysicalOperator {
+    BackpressureManager backpressure_manager;
+    
+    void ExecuteInternal(DataChunk &input, DataChunk &result) {
+        // Check if we should pause due to downstream backpressure
+        backpressure_manager.CheckBackpressure();
+        
+        // Process the chunk
+        ProcessChunk(input, result);
+        
+        // Push to sink if available
+        if (sink) {
+            sink->Sink(result);
+        }
+    }
+};
+```
+
+**Independent Parallelization Strategies**
+Each operator can determine its own optimal parallelization approach without requiring global coordination:
+
+```cpp
+class ParallelAwareOperator : public PhysicalOperator {
+protected:
+    idx_t optimal_parallelism;
+    ParallelizationType parallelization_type;
+    
+public:
+    virtual void DetermineParallelization(const ExecutionContext &context) {
+        // Each operator decides its own parallelization strategy
+        auto available_threads = context.GetAvailableThreads();
+        auto estimated_work = EstimateWorkload();
+        
+        if (estimated_work > PARALLEL_THRESHOLD) {
+            optimal_parallelism = std::min(available_threads, 
+                                         CalculateOptimalThreads(estimated_work));
+            parallelization_type = ParallelizationType::DATA_PARALLEL;
+        } else {
+            optimal_parallelism = 1;
+            parallelization_type = ParallelizationType::SEQUENTIAL;
+        }
+    }
+    
+    void ExecuteParallel(vector<unique_ptr<OperatorState>> &states,
+                        vector<unique_ptr<DataChunk>> &chunks) {
+        if (parallelization_type == ParallelizationType::DATA_PARALLEL) {
+            ExecuteDataParallel(states, chunks);
+        } else {
+            ExecuteSequential(states[0], chunks[0]);
+        }
+    }
+    
+private:
+    static const idx_t PARALLEL_THRESHOLD = 10000;
+};
+```
+
+### DataChunk Organization and Processing
+
+**DataChunk Architecture**
+The DataChunk represents DuckDB's fundamental unit of vectorized processing, designed to optimize CPU cache utilization while providing sufficient parallelism for SIMD operations:
+
+```cpp
+class DataChunk {
+public:
+    static const idx_t STANDARD_VECTOR_SIZE = 2048;
+    
+    vector<Vector> data;                    // Column vectors
+    idx_t size;                            // Number of tuples in this chunk
+    SelectionVector *sel_vector;           // Selection vector for filtered data
+    
+    // Chunk metadata
+    idx_t base_row_id;                     // Base row identifier for this chunk
+    shared_ptr<ChunkMetadata> metadata;     // Additional metadata
+    
+    // Memory management
+    ArenaAllocator allocator;              // Memory allocator for this chunk
+    
+public:
+    DataChunk() : size(0), sel_vector(nullptr), base_row_id(0) {}
+    
+    void Initialize(const vector<LogicalType> &types) {
+        data.clear();
+        data.reserve(types.size());
+        
+        for (const auto &type : types) {
+            data.emplace_back(type, nullptr);
+        }
+        
+        Reset();
+    }
+    
+    void Reset() {
+        size = 0;
+        sel_vector = nullptr;
+        
+        for (auto &vector : data) {
+            vector.Reset();
+        }
+    }
+    
+    void SetCardinality(idx_t new_size) {
+        D_ASSERT(new_size <= STANDARD_VECTOR_SIZE);
+        size = new_size;
+        
+        for (auto &vector : data) {
+            vector.SetCount(new_size);
+        }
+    }
+    
+    void Slice(const SelectionVector &selection, idx_t count) {
+        SetCardinality(count);
+        sel_vector = &selection;
+        
+        for (auto &vector : data) {
+            vector.Slice(selection, count);
+        }
+    }
+};
+```
+
+**Vector Size Optimization**
+The choice of 2,048 tuples per vector represents a carefully optimized balance between multiple performance factors:
+
+```cpp
+class VectorSizeOptimizer {
+public:
+    static idx_t CalculateOptimalVectorSize() {
+        // Factors considered:
+        // 1. L2 cache size (typical 256KB-1MB)
+        // 2. SIMD register width (128-512 bits)
+        // 3. Function call overhead amortization
+        // 4. Memory bandwidth utilization
+        
+        auto l2_cache_size = GetL2CacheSize();
+        auto typical_tuple_size = EstimateAverageTupleSize();
+        
+        // Target using ~1/4 of L2 cache for working set
+        auto cache_based_size = (l2_cache_size / 4) / typical_tuple_size;
+        
+        // Ensure alignment with SIMD operations
+        auto simd_aligned_size = AlignToSIMD(cache_based_size);
+        
+        // Clamp to reasonable bounds
+        return std::clamp(simd_aligned_size, 
+                         MIN_VECTOR_SIZE, 
+                         MAX_VECTOR_SIZE);
+    }
+    
+private:
+    static const idx_t MIN_VECTOR_SIZE = 64;
+    static const idx_t MAX_VECTOR_SIZE = 8192;
+    static const idx_t TYPICAL_TUPLE_SIZE = 32; // Estimated average
+    
+    static idx_t AlignToSIMD(idx_t size) {
+        // Align to 64-tuple boundaries for optimal SIMD utilization
+        const idx_t SIMD_ALIGNMENT = 64;
+        return (size / SIMD_ALIGNMENT) * SIMD_ALIGNMENT;
+    }
+};
+```
+
+### Execution Flow and Coordination
+
+**Pipeline Execution Coordination**
+Push-based execution enables sophisticated pipeline coordination that automatically handles complex execution scenarios:
+
+```cpp
+class PipelineExecutor {
+    Pipeline &pipeline;
+    ExecutionContext &context;
+    
+public:
+    PipelineExecutor(Pipeline &p, ExecutionContext &ctx) : pipeline(p), context(ctx) {}
+    
+    void Execute() {
+        // Initialize operator states
+        InitializeOperatorStates();
+        
+        // Execute source-driven pipeline
+        ExecuteSourceDriven();
+        
+        // Finalize all operators
+        FinalizeOperators();
+    }
+    
+private:
+    void ExecuteSourceDriven() {
+        auto source = pipeline.GetSource();
+        DataChunk current_chunk;
+        current_chunk.Initialize(source->GetTypes());
+        
+        while (true) {
+            current_chunk.Reset();
+            
+            // Get data from source
+            auto source_result = source->GetChunk(context, current_chunk, source_state);
+            
+            if (source_result == OperatorResultType::FINISHED) {
+                break;
+            }
+            
+            if (source_result == OperatorResultType::HAVE_MORE_OUTPUT) {
+                // Push chunk through pipeline
+                ExecutePipelineChunk(current_chunk);
+            }
+            
+            // Handle backpressure
+            if (source_result == OperatorResultType::BLOCKED) {
+                HandleBackpressure();
+            }
+        }
+    }
+    
+    void ExecutePipelineChunk(DataChunk &chunk) {
+        DataChunk intermediate_chunk;
+        DataChunk *current_chunk = &chunk;
+        
+        // Process through intermediate operators
+        for (auto &op : pipeline.GetIntermediateOperators()) {
+            intermediate_chunk.Initialize(op->GetTypes());
+            
+            auto result = op->Execute(context, *current_chunk, intermediate_chunk, 
+                                    *global_states[op.get()], *local_states[op.get()]);
+            
+            if (result == OperatorResultType::HAVE_MORE_OUTPUT) {
+                current_chunk = &intermediate_chunk;
+            } else if (result == OperatorResultType::NEED_MORE_INPUT) {
+                return; // Wait for more input
+            }
+        }
+        
+        // Send to sink
+        auto sink = pipeline.GetSink();
+        if (sink && current_chunk->size() > 0) {
+            sink->Sink(context, *current_chunk, *sink_state);
+        }
+    }
+};
+```
+
+## 3.2.2 Vector Data Structures and Formats
+
+### Vector Type Hierarchy
+
+**Unified Vector Interface**
+DuckDB implements a sophisticated vector type system that can represent data in multiple formats while providing a unified interface for operations:
+
+```cpp
+class Vector {
+public:
+    LogicalType type;
+    VectorType vector_type;
+    data_ptr_t data;
+    
+    // Vector metadata
+    idx_t count;
+    ValidityMask validity;
+    unique_ptr<VectorBuffer> buffer;
+    unique_ptr<VectorAuxiliaryData> auxiliary;
+    
+    Vector(LogicalType type, data_ptr_t data = nullptr);
+    Vector(LogicalType type, idx_t count);
+    Vector(const Vector &other);
+    
+    // Type-specific accessors
+    template<class T>
+    T *GetData() {
+        return reinterpret_cast<T*>(data);
+    }
+    
+    template<class T>
+    T GetValue(idx_t index) const {
+        D_ASSERT(index < count);
+        switch (vector_type) {
+            case VectorType::FLAT_VECTOR:
+                return GetData<T>()[index];
+            case VectorType::CONSTANT_VECTOR:
+                return GetData<T>()[0];
+            case VectorType::DICTIONARY_VECTOR:
+                return GetDictionaryValue<T>(index);
+            default:
+                throw InternalException("Unsupported vector type");
+        }
+    }
+    
+    void SetValue(idx_t index, const Value &value) {
+        ConvertToFlatVector();
+        FlatVector::SetValue(*this, index, value);
+    }
+    
+    // Vector type conversions
+    void ConvertToFlatVector();
+    void ConvertToConstantVector(const Value &value);
+    void ConvertToDictionaryVector(unique_ptr<Vector> dictionary);
+};
+```
+
+**Flat Vector Implementation**
+Flat vectors represent the standard column-oriented storage format optimized for sequential access and SIMD operations:
+
+```cpp
+class FlatVector {
+public:
+    static void Initialize(Vector &vector, idx_t count) {
+        vector.vector_type = VectorType::FLAT_VECTOR;
+        vector.count = count;
+        
+        // Allocate aligned data buffer
+        auto data_size = GetTypeIdSize(vector.type.InternalType()) * count;
+        vector.buffer = make_unique<VectorBuffer>(data_size);
+        vector.data = vector.buffer->GetData();
+        
+        // Initialize validity mask
+        vector.validity.Initialize(count);
+    }
+    
+    template<class T>
+    static T *GetData(Vector &vector) {
+        D_ASSERT(vector.vector_type == VectorType::FLAT_VECTOR);
+        return reinterpret_cast<T*>(vector.data);
+    }
+    
+    template<class T>
+    static void SetValue(Vector &vector, idx_t index, T value) {
+        D_ASSERT(vector.vector_type == VectorType::FLAT_VECTOR);
+        D_ASSERT(index < vector.count);
+        
+        GetData<T>(vector)[index] = value;
+        vector.validity.SetValid(index);
+    }
+    
+    static void SetNull(Vector &vector, idx_t index) {
+        D_ASSERT(vector.vector_type == VectorType::FLAT_VECTOR);
+        D_ASSERT(index < vector.count);
+        
+        vector.validity.SetInvalid(index);
+    }
+    
+    // SIMD-optimized operations
+    template<class T, class OP>
+    static void BinaryOperation(Vector &left, Vector &right, Vector &result, idx_t count) {
+        D_ASSERT(left.vector_type == VectorType::FLAT_VECTOR);
+        D_ASSERT(right.vector_type == VectorType::FLAT_VECTOR);
+        
+        auto left_data = GetData<T>(left);
+        auto right_data = GetData<T>(right);
+        auto result_data = GetData<T>(result);
+        
+        // Vectorized operation with SIMD when available
+        VectorizedBinaryOperation<T, OP>(left_data, right_data, result_data, count);
+        
+        // Combine validity masks
+        CombineValidityMasks(left.validity, right.validity, result.validity, count);
+    }
+};
+```
+
+**Constant Vector Optimization**
+Constant vectors represent columns where all values are identical, enabling significant memory and computational savings:
+
+```cpp
+class ConstantVector {
+public:
+    static void Initialize(Vector &vector, const Value &value, idx_t count) {
+        vector.vector_type = VectorType::CONSTANT_VECTOR;
+        vector.count = count;
+        
+        // Allocate single value storage
+        auto data_size = GetTypeIdSize(vector.type.InternalType());
+        vector.buffer = make_unique<VectorBuffer>(data_size);
+        vector.data = vector.buffer->GetData();
+        
+        // Store the constant value
+        StoreValue(vector, value);
+        
+        // Set validity for all elements
+        if (value.IsNull()) {
+            vector.validity.SetAllInvalid(count);
+        } else {
+            vector.validity.SetAllValid(count);
+        }
+    }
+    
+    template<class T>
+    static T GetConstantValue(const Vector &vector) {
+        D_ASSERT(vector.vector_type == VectorType::CONSTANT_VECTOR);
+        return reinterpret_cast<const T*>(vector.data)[0];
+    }
+    
+    // Optimized operations for constant vectors
+    template<class T, class OP>
+    static void BinaryOperationConstant(Vector &left, Vector &right, Vector &result, idx_t count) {
+        // Both operands are constant - compute single result
+        if (left.vector_type == VectorType::CONSTANT_VECTOR && 
+            right.vector_type == VectorType::CONSTANT_VECTOR) {
+            
+            auto left_val = GetConstantValue<T>(left);
+            auto right_val = GetConstantValue<T>(right);
+            auto result_val = OP::Operation(left_val, right_val);
+            
+            ConstantVector::Initialize(result, Value::CreateValue(result_val), count);
+        }
+        // One operand constant - optimized loop
+        else if (left.vector_type == VectorType::CONSTANT_VECTOR) {
+            BinaryOperationConstantLeft<T, OP>(left, right, result, count);
+        }
+        else {
+            BinaryOperationConstantRight<T, OP>(left, right, result, count);
+        }
+    }
+};
+```
+
+**Dictionary Vector Compression**
+Dictionary vectors provide compression for columns with low cardinality by storing unique values separately from indices:
+
+```cpp
+class DictionaryVector {
+public:
+    static void Initialize(Vector &vector, unique_ptr<Vector> dictionary, 
+                          unique_ptr<Vector> selection_vector, idx_t count) {
+        vector.vector_type = VectorType::DICTIONARY_VECTOR;
+        vector.count = count;
+        
+        // Store dictionary and selection vector
+        auto aux_data = make_unique<DictionaryAuxiliaryData>();
+        aux_data->dictionary = move(dictionary);
+        aux_data->selection_vector = move(selection_vector);
+        
+        vector.auxiliary = move(aux_data);
+        vector.data = aux_data->selection_vector->data;
+    }
+    
+    static Vector &GetDictionary(Vector &vector) {
+        D_ASSERT(vector.vector_type == VectorType::DICTIONARY_VECTOR);
+        auto aux_data = static_cast<DictionaryAuxiliaryData*>(vector.auxiliary.get());
+        return *aux_data->dictionary;
+    }
+    
+    static Vector &GetSelectionVector(Vector &vector) {
+        D_ASSERT(vector.vector_type == VectorType::DICTIONARY_VECTOR);
+        auto aux_data = static_cast<DictionaryAuxiliaryData*>(vector.auxiliary.get());
+        return *aux_data->selection_vector;
+    }
+    
+    template<class T>
+    static T GetValue(const Vector &vector, idx_t index) {
+        D_ASSERT(vector.vector_type == VectorType::DICTIONARY_VECTOR);
+        
+        auto aux_data = static_cast<const DictionaryAuxiliaryData*>(vector.auxiliary.get());
+        auto selection_data = FlatVector::GetData<sel_t>(*aux_data->selection_vector);
+        auto dict_index = selection_data[index];
+        
+        return FlatVector::GetData<T>(*aux_data->dictionary)[dict_index];
+    }
+    
+    // Optimized operations that work directly on indices when possible
+    template<class T, class OP>
+    static void BinaryOperation(Vector &left, Vector &right, Vector &result, idx_t count) {
+        // If both vectors use the same dictionary, operate on indices
+        if (SameDictionary(left, right)) {
+            BinaryOperationSameDictionary<T, OP>(left, right, result, count);
+        } else {
+            // Materialize and operate on values
+            BinaryOperationMaterialized<T, OP>(left, right, result, count);
+        }
+    }
+    
+private:
+    struct DictionaryAuxiliaryData : VectorAuxiliaryData {
+        unique_ptr<Vector> dictionary;
+        unique_ptr<Vector> selection_vector;
+    };
+};
+```
+
+### Memory-Efficient Vector Operations
+
+**Lazy Evaluation and Materialization**
+DuckDB implements lazy evaluation strategies that defer materialization until absolutely necessary:
+
+```cpp
+class LazyVectorEvaluator {
+public:
+    static void EvaluateExpression(Vector &result, const Expression &expr, 
+                                 const DataChunk &input, const ExecutionContext &context) {
+        switch (expr.type) {
+            case ExpressionType::BOUND_COLUMN_REF:
+                // Column reference - create reference vector
+                ReferenceVector::Initialize(result, input.data[expr.column_index]);
+                break;
+                
+            case ExpressionType::BOUND_CONSTANT:
+                // Constant expression - create constant vector
+                ConstantVector::Initialize(result, expr.constant_value, input.size());
+                break;
+                
+            case ExpressionType::BOUND_FUNCTION:
+                // Function call - evaluate lazily
+                EvaluateFunctionLazy(result, expr, input, context);
+                break;
+                
+            default:
+                // Complex expression - materialize and evaluate
+                MaterializeAndEvaluate(result, expr, input, context);
+        }
+    }
+    
+private:
+    static void EvaluateFunctionLazy(Vector &result, const Expression &expr,
+                                   const DataChunk &input, const ExecutionContext &context) {
+        // Try to avoid materialization for simple functions
+        auto &function_expr = static_cast<const BoundFunctionExpression&>(expr);
+        
+        if (function_expr.function.can_evaluate_lazy) {
+            // Function supports lazy evaluation
+            function_expr.function.lazy_function(input, result, context);
+        } else {
+            // Materialize arguments and evaluate
+            MaterializeArgumentsAndEvaluate(result, function_expr, input, context);
+        }
+    }
+};
+```
+
+## 3.2.3 SIMD Optimization and Hardware Utilization
+
+### SIMD Instruction Integration
+
+**Automatic SIMD Detection and Utilization**
+DuckDB automatically detects available SIMD instruction sets and selects optimal implementations:
+
+```cpp
+class SIMDDetector {
+public:
+    static SIMDCapabilities DetectCapabilities() {
+        SIMDCapabilities caps;
+        
+        // Detect available instruction sets
+        caps.has_sse41 = __builtin_cpu_supports("sse4.1");
+        caps.has_avx = __builtin_cpu_supports("avx");
+        caps.has_avx2 = __builtin_cpu_supports("avx2");
+        caps.has_avx512 = __builtin_cpu_supports("avx512f");
+        
+        // ARM NEON detection
+        #ifdef __ARM_NEON
+        caps.has_neon = true;
+        #endif
+        
+        return caps;
+    }
+    
+    static void InitializeOptimalImplementations() {
+        auto caps = DetectCapabilities();
+        
+        if (caps.has_avx512) {
+            RegisterAVX512Implementations();
+        } else if (caps.has_avx2) {
+            RegisterAVX2Implementations();
+        } else if (caps.has_sse41) {
+            RegisterSSE41Implementations();
+        } else if (caps.has_neon) {
+            RegisterNEONImplementations();
+        } else {
+            RegisterScalarImplementations();
+        }
+    }
+};
+
+class VectorizedOperations {
+public:
+    // Function pointer for vectorized operations
+    using BinaryOperationFunction = void (*)(const void* left, const void* right, 
+                                            void* result, idx_t count, ValidityMask& validity);
+    
+    static unordered_map<string, BinaryOperationFunction> binary_operations;
+    
+    template<class T, class OP>
+    static void RegisterBinaryOperation(const string& name) {
+        if (SIMDDetector::DetectCapabilities().has_avx2) {
+            binary_operations[name] = BinaryOperationAVX2<T, OP>;
+        } else if (SIMDDetector::DetectCapabilities().has_sse41) {
+            binary_operations[name] = BinaryOperationSSE41<T, OP>;
+        } else {
+            binary_operations[name] = BinaryOperationScalar<T, OP>;
+        }
+    }
+};
+```
+
+**AVX2 Optimized Operations**
+DuckDB includes hand-optimized AVX2 implementations for critical operations:
+
+```cpp
+// AVX2-optimized integer addition
+template<>
+void BinaryOperationAVX2<int32_t, AddOperator>(const void* left_ptr, const void* right_ptr,
+                                               void* result_ptr, idx_t count, ValidityMask& validity) {
+    const int32_t* left = static_cast<const int32_t*>(left_ptr);
+    const int32_t* right = static_cast<const int32_t*>(right_ptr);
+    int32_t* result = static_cast<int32_t*>(result_ptr);
+    
+    // Process 8 integers at a time with AVX2
+    idx_t vector_count = count - (count % 8);
+    
+    for (idx_t i = 0; i < vector_count; i += 8) {
+        // Load 8 integers into AVX2 registers
+        __m256i left_vec = _mm256_loadu_si256((__m256i*)(left + i));
+        __m256i right_vec = _mm256_loadu_si256((__m256i*)(right + i));
+        
+        // Perform vectorized addition
+        __m256i result_vec = _mm256_add_epi32(left_vec, right_vec);
+        
+        // Store result
+        _mm256_storeu_si256((__m256i*)(result + i), result_vec);
+    }
+    
+    // Handle remaining elements with scalar operations
+    for (idx_t i = vector_count; i < count; i++) {
+        result[i] = AddOperator::Operation(left[i], right[i]);
+    }
+}
+
+// AVX2-optimized floating point operations with NaN handling
+template<>
+void BinaryOperationAVX2<double, AddOperator>(const void* left_ptr, const void* right_ptr,
+                                              void* result_ptr, idx_t count, ValidityMask& validity) {
+    const double* left = static_cast<const double*>(left_ptr);
+    const double* right = static_cast<const double*>(right_ptr);
+    double* result = static_cast<double*>(result_ptr);
+    
+    // Process 4 doubles at a time with AVX2
+    idx_t vector_count = count - (count % 4);
+    
+    for (idx_t i = 0; i < vector_count; i += 4) {
+        __m256d left_vec = _mm256_loadu_pd(left + i);
+        __m256d right_vec = _mm256_loadu_pd(right + i);
+        
+        // Perform vectorized addition
+        __m256d result_vec = _mm256_add_pd(left_vec, right_vec);
+        
+        // Check for NaN/infinity results
+        __m256d nan_mask = _mm256_cmp_pd(result_vec, result_vec, _CMP_UNORD_Q);
+        
+        // Store result
+        _mm256_storeu_pd(result + i, result_vec);
+        
+        // Update validity mask for NaN values
+        int mask_int = _mm256_movemask_pd(nan_mask);
+        if (mask_int != 0) {
+            UpdateValidityMaskAVX2(validity, i, mask_int);
+        }
+    }
+    
+    // Handle remaining elements
+    for (idx_t i = vector_count; i < count; i++) {
+        result[i] = AddOperator::Operation(left[i], right[i]);
+        if (!Value::DoubleIsFinite(result[i])) {
+            validity.SetInvalid(i);
+        }
+    }
+}
+```
+
+**ARM NEON Optimizations**
+For ARM processors, DuckDB includes NEON-optimized implementations:
+
+```cpp
+#ifdef __ARM_NEON
+template<>
+void BinaryOperationNEON<int32_t, AddOperator>(const void* left_ptr, const void* right_ptr,
+                                               void* result_ptr, idx_t count, ValidityMask& validity) {
+    const int32_t* left = static_cast<const int32_t*>(left_ptr);
+    const int32_t* right = static_cast<const int32_t*>(right_ptr);
+    int32_t* result = static_cast<int32_t*>(result_ptr);
+    
+    // Process 4 integers at a time with NEON
+    idx_t vector_count = count - (count % 4);
+    
+    for (idx_t i = 0; i < vector_count; i += 4) {
+        // Load 4 integers into NEON registers
+        int32x4_t left_vec = vld1q_s32(left + i);
+        int32x4_t right_vec = vld1q_s32(right + i);
+        
+        // Perform vectorized addition
+        int32x4_t result_vec = vaddq_s32(left_vec, right_vec);
+        
+        // Store result
+        vst1q_s32(result + i, result_vec);
+    }
+    
+    // Handle remaining elements
+    for (idx_t i = vector_count; i < count; i++) {
+        result[i] = AddOperator::Operation(left[i], right[i]);
+    }
+}
+#endif
+```
+
+### Cache-Aware Vector Processing
+
+**Memory Access Pattern Optimization**
+DuckDB's vector processing is designed to maximize cache efficiency through careful memory access patterns:
+
+```cpp
+class CacheOptimizedProcessor {
+public:
+    template<class T, class OP>
+    static void ProcessColumnarData(Vector& result, const Vector& left, const Vector& right, idx_t count) {
+        // Ensure all vectors use flat representation for optimal access patterns
+        left.ConvertToFlatVector();
+        right.ConvertToFlatVector();
+        result.ConvertToFlatVector();
+        
+        auto left_data = FlatVector::GetData<T>(left);
+        auto right_data = FlatVector::GetData<T>(right);
+        auto result_data = FlatVector::GetData<T>(result);
+        
+        // Process in cache-line-sized chunks
+        ProcessInCacheLines<T, OP>(left_data, right_data, result_data, count);
+        
+        // Combine validity masks efficiently
+        OptimizedValidityCombination(left.validity, right.validity, result.validity, count);
+    }
+    
+private:
+    template<class T, class OP>
+    static void ProcessInCacheLines(const T* left, const T* right, T* result, idx_t count) {
+        // Calculate elements per cache line
+        constexpr idx_t CACHE_LINE_SIZE = 64;
+        constexpr idx_t elements_per_line = CACHE_LINE_SIZE / sizeof(T);
+        
+        idx_t processed = 0;
+        
+        // Process complete cache lines
+        while (processed + elements_per_line <= count) {
+            // Prefetch next cache lines
+            __builtin_prefetch(left + processed + elements_per_line, 0, 1);
+            __builtin_prefetch(right + processed + elements_per_line, 0, 1);
+            
+            // Process current cache line with SIMD
+            VectorizedOperation<T, OP>(left + processed, right + processed, 
+                                     result + processed, elements_per_line);
+            
+            processed += elements_per_line;
+        }
+        
+        // Handle remaining elements
+        while (processed < count) {
+            result[processed] = OP::Operation(left[processed], right[processed]);
+            processed++;
+        }
+    }
+};
+```
+
+### Adaptive Vectorization Strategies
+
+**Dynamic Algorithm Selection**
+DuckDB adapts its vectorization strategies based on data characteristics and hardware capabilities:
+
+```cpp
+class AdaptiveVectorProcessor {
+public:
+    template<class T, class OP>
+    static void AdaptiveOperation(Vector& result, const Vector& left, const Vector& right, idx_t count) {
+        // Analyze input characteristics
+        auto left_type = AnalyzeVectorCharacteristics(left);
+        auto right_type = AnalyzeVectorCharacteristics(right);
+        
+        // Select optimal processing strategy
+        if (left_type == VectorCharacteristics::CONSTANT && right_type == VectorCharacteristics::CONSTANT) {
+            ProcessConstantConstant<T, OP>(result, left, right, count);
+        } else if (left_type == VectorCharacteristics::CONSTANT) {
+            ProcessConstantVector<T, OP>(result, left, right, count);
+        } else if (right_type == VectorCharacteristics::CONSTANT) {
+            ProcessVectorConstant<T, OP>(result, left, right, count);
+        } else if (left_type == VectorCharacteristics::DICTIONARY && right_type == VectorCharacteristics::DICTIONARY) {
+            ProcessDictionaryDictionary<T, OP>(result, left, right, count);
+        } else {
+            ProcessGeneral<T, OP>(result, left, right, count);
+        }
+    }
+    
+private:
+    enum class VectorCharacteristics {
+        CONSTANT,
+        DICTIONARY,
+        SEQUENCE,
+        FLAT
+    };
+    
+    static VectorCharacteristics AnalyzeVectorCharacteristics(const Vector& vector) {
+        switch (vector.vector_type) {
+            case VectorType::CONSTANT_VECTOR:
+                return VectorCharacteristics::CONSTANT;
+            case VectorType::DICTIONARY_VECTOR:
+                return VectorCharacteristics::DICTIONARY;
+            case VectorType::SEQUENCE_VECTOR:
+                return VectorCharacteristics::SEQUENCE;
+            default:
+                return VectorCharacteristics::FLAT;
+        }
+    }
+    
+    template<class T, class OP>
+    static void ProcessConstantConstant(Vector& result, const Vector& left, const Vector& right, idx_t count) {
+        // Both operands constant - single computation
+        auto left_val = ConstantVector::GetConstantValue<T>(left);
+        auto right_val = ConstantVector::GetConstantValue<T>(right);
+        auto result_val = OP::Operation(left_val, right_val);
+        
+        ConstantVector::Initialize(result, Value::CreateValue(result_val), count);
+    }
+    
+    template<class T, class OP>
+    static void ProcessConstantVector(Vector& result, const Vector& left, const Vector& right, idx_t count) {
+        // Left operand constant - optimized loop
+        auto constant_val = ConstantVector::GetConstantValue<T>(left);
+        auto right_data = FlatVector::GetData<T>(right);
+        auto result_data = FlatVector::GetData<T>(result);
+        
+        // Vectorized operation with constant on left side
+        VectorizedConstantOperation<T, OP>(constant_val, right_data, result_data, count);
+    }
+};
+```
+
+This comprehensive vectorized execution model represents the core of DuckDB's performance advantages, enabling automatic parallelization, SIMD utilization, and cache-efficient processing while maintaining the simplicity that characterizes DuckDB's user experience. The combination of push-based execution, sophisticated vector types, and adaptive optimization creates a powerful foundation for analytical query processing.
+
+---
+
+# 3.3 Vector Types and Processing
+
+## 3.3.1 Comprehensive Type System
+
+### Primitive Type Implementation
+
+**Numeric Type Vectorization**
+DuckDB implements a sophisticated type system that handles all SQL data types efficiently in vectorized form, with specialized optimizations for each type category:
+
+```cpp
+class NumericVectorOperations {
+public:
+    // Integer type processing with overflow detection
+    template<typename INPUT_TYPE, typename RESULT_TYPE>
+    static void ArithmeticOperation(Vector &left, Vector &right, Vector &result, 
+                                  idx_t count, ArithmeticOperator op) {
+        auto left_data = FlatVector::GetData<INPUT_TYPE>(left);
+        auto right_data = FlatVector::GetData<INPUT_TYPE>(right);
+        auto result_data = FlatVector::GetData<RESULT_TYPE>(result);
+        
+        switch (op) {
+            case ArithmeticOperator::ADD:
+                VectorizedAdd<INPUT_TYPE, RESULT_TYPE>(left_data, right_data, result_data, count);
+                break;
+            case ArithmeticOperator::SUBTRACT:
+                VectorizedSubtract<INPUT_TYPE, RESULT_TYPE>(left_data, right_data, result_data, count);
+                break;
+            case ArithmeticOperator::MULTIPLY:
+                VectorizedMultiply<INPUT_TYPE, RESULT_TYPE>(left_data, right_data, result_data, count);
+                break;
+            case ArithmeticOperator::DIVIDE:
+                VectorizedDivide<INPUT_TYPE, RESULT_TYPE>(left_data, right_data, result_data, count);
+                break;
+        }
+        
+        // Combine validity masks
+        CombineValidityMasks(left.validity, right.validity, result.validity, count);
+    }
+    
+private:
+    template<typename T, typename R>
+    static void VectorizedAdd(const T* left, const T* right, R* result, idx_t count) {
+        // Use SIMD when available and appropriate
+        if constexpr (sizeof(T) == 4 && std::is_integral_v<T>) {
+            VectorizedAddInt32(reinterpret_cast<const int32_t*>(left),
+                              reinterpret_cast<const int32_t*>(right),
+                              reinterpret_cast<int32_t*>(result), count);
+        } else if constexpr (sizeof(T) == 8 && std::is_integral_v<T>) {
+            VectorizedAddInt64(reinterpret_cast<const int64_t*>(left),
+                              reinterpret_cast<const int64_t*>(right),
+                              reinterpret_cast<int64_t*>(result), count);
+        } else {
+            // Fallback to scalar implementation
+            for (idx_t i = 0; i < count; i++) {
+                result[i] = static_cast<R>(left[i] + right[i]);
+            }
+        }
+    }
+    
+    // Overflow-safe integer addition with AVX2
+    static void VectorizedAddInt32(const int32_t* left, const int32_t* right, 
+                                  int32_t* result, idx_t count) {
+        idx_t vector_count = count - (count % 8);
+        
+        for (idx_t i = 0; i < vector_count; i += 8) {
+            __m256i left_vec = _mm256_loadu_si256((__m256i*)(left + i));
+            __m256i right_vec = _mm256_loadu_si256((__m256i*)(right + i));
+            
+            // Perform addition
+            __m256i result_vec = _mm256_add_epi32(left_vec, right_vec);
+            
+            // Check for overflow (simplified - full implementation would be more complex)
+            _mm256_storeu_si256((__m256i*)(result + i), result_vec);
+        }
+        
+        // Handle remaining elements
+        for (idx_t i = vector_count; i < count; i++) {
+            result[i] = left[i] + right[i];
+        }
+    }
+};
+```
+
+**Floating Point Precision Handling**
+DuckDB implements careful floating-point processing that handles edge cases correctly while maintaining vectorization benefits:
+
+```cpp
+class FloatingPointVectorOperations {
+public:
+    static void FloatingPointOperation(Vector &left, Vector &right, Vector &result, 
+                                     idx_t count, FloatingPointOperator op) {
+        if (left.type.id() == LogicalTypeId::FLOAT) {
+            ProcessFloat(left, right, result, count, op);
+        } else if (left.type.id() == LogicalTypeId::DOUBLE) {
+            ProcessDouble(left, right, result, count, op);
+        }
+    }
+    
+private:
+    static void ProcessDouble(Vector &left, Vector &right, Vector &result, 
+                            idx_t count, FloatingPointOperator op) {
+        auto left_data = FlatVector::GetData<double>(left);
+        auto right_data = FlatVector::GetData<double>(right);
+        auto result_data = FlatVector::GetData<double>(result);
+        
+        // Process with AVX2 when available
+        if (CPUInfo::HasAVX2()) {
+            ProcessDoubleAVX2(left_data, right_data, result_data, count, op);
+        } else {
+            ProcessDoubleScalar(left_data, right_data, result_data, count, op);
+        }
+        
+        // Validate results and update validity mask
+        ValidateFloatingPointResults(result, count);
+    }
+    
+    static void ProcessDoubleAVX2(const double* left, const double* right, 
+                                 double* result, idx_t count, FloatingPointOperator op) {
+        idx_t vector_count = count - (count % 4);
+        
+        for (idx_t i = 0; i < vector_count; i += 4) {
+            __m256d left_vec = _mm256_loadu_pd(left + i);
+            __m256d right_vec = _mm256_loadu_pd(right + i);
+            __m256d result_vec;
+            
+            switch (op) {
+                case FloatingPointOperator::ADD:
+                    result_vec = _mm256_add_pd(left_vec, right_vec);
+                    break;
+                case FloatingPointOperator::SUBTRACT:
+                    result_vec = _mm256_sub_pd(left_vec, right_vec);
+                    break;
+                case FloatingPointOperator::MULTIPLY:
+                    result_vec = _mm256_mul_pd(left_vec, right_vec);
+                    break;
+                case FloatingPointOperator::DIVIDE:
+                    result_vec = _mm256_div_pd(left_vec, right_vec);
+                    break;
+            }
+            
+            _mm256_storeu_pd(result + i, result_vec);
+        }
+        
+        // Handle remaining elements
+        for (idx_t i = vector_count; i < count; i++) {
+            switch (op) {
+                case FloatingPointOperator::ADD:
+                    result[i] = left[i] + right[i];
+                    break;
+                case FloatingPointOperator::DIVIDE:
+                    result[i] = left[i] / right[i];
+                    break;
+                // ... other operations
+            }
+        }
+    }
+    
+    static void ValidateFloatingPointResults(Vector &result, idx_t count) {
+        auto result_data = FlatVector::GetData<double>(result);
+        
+        for (idx_t i = 0; i < count; i++) {
+            if (!std::isfinite(result_data[i])) {
+                result.validity.SetInvalid(i);
+            }
+        }
+    }
+};
+```
+
+### String and Variable-Length Type Processing
+
+**String Vector Implementation**
+String processing in DuckDB uses a sophisticated architecture that balances memory efficiency with vectorization benefits:
+
+```cpp
+class StringVector {
+public:
+    struct StringData {
+        uint32_t length;
+        char prefix[4];      // Short string optimization
+        char* pointer;       // For longer strings
+    };
+    
+    static void Initialize(Vector &vector, idx_t count) {
+        vector.vector_type = VectorType::FLAT_VECTOR;
+        vector.count = count;
+        
+        // Allocate string data array
+        auto data_size = sizeof(StringData) * count;
+        vector.buffer = make_unique<VectorBuffer>(data_size);
+        vector.data = vector.buffer->GetData();
+        
+        // Initialize auxiliary data for string storage
+        auto string_heap = make_unique<StringHeap>();
+        auto aux_data = make_unique<StringAuxiliaryData>();
+        aux_data->string_heap = move(string_heap);
+        vector.auxiliary = move(aux_data);
+        
+        vector.validity.Initialize(count);
+    }
+    
+    static string_t GetString(const Vector &vector, idx_t index) {
+        D_ASSERT(vector.vector_type == VectorType::FLAT_VECTOR);
+        auto string_data = GetData(vector);
+        return GetStringFromData(string_data[index]);
+    }
+    
+    static void SetString(Vector &vector, idx_t index, const string &str) {
+        D_ASSERT(vector.vector_type == VectorType::FLAT_VECTOR);
+        auto string_data = GetData(vector);
+        auto aux_data = GetAuxiliaryData(vector);
+        
+        if (str.length() <= 4) {
+            // Short string optimization
+            string_data[index].length = str.length();
+            memcpy(string_data[index].prefix, str.c_str(), str.length());
+            string_data[index].pointer = nullptr;
+        } else {
+            // Store in string heap
+            string_data[index].length = str.length();
+            string_data[index].pointer = aux_data->string_heap->Allocate(str.length());
+            memcpy(string_data[index].pointer, str.c_str(), str.length());
+        }
+        
+        vector.validity.SetValid(index);
+    }
+    
+    // Optimized string operations
+    static void StringCompare(Vector &left, Vector &right, Vector &result, 
+                            idx_t count, ComparisonOperator op) {
+        auto left_data = GetData(left);
+        auto right_data = GetData(right);
+        auto result_data = FlatVector::GetData<bool>(result);
+        
+        // Vectorized string comparison
+        for (idx_t i = 0; i < count; i++) {
+            if (left.validity.RowIsValid(i) && right.validity.RowIsValid(i)) {
+                auto left_str = GetStringFromData(left_data[i]);
+                auto right_str = GetStringFromData(right_data[i]);
+                
+                result_data[i] = CompareStrings(left_str, right_str, op);
+                result.validity.SetValid(i);
+            } else {
+                result.validity.SetInvalid(i);
+            }
+        }
+    }
+    
+private:
+    static StringData* GetData(const Vector &vector) {
+        return reinterpret_cast<StringData*>(vector.data);
+    }
+    
+    static string_t GetStringFromData(const StringData &data) {
+        if (data.length <= 4) {
+            return string_t(data.prefix, data.length);
+        } else {
+            return string_t(data.pointer, data.length);
+        }
+    }
+    
+    struct StringAuxiliaryData : VectorAuxiliaryData {
+        unique_ptr<StringHeap> string_heap;
+    };
+};
+
+class StringHeap {
+public:
+    StringHeap() {
+        current_chunk = make_unique<StringChunk>();
+        chunks.push_back(current_chunk.get());
+    }
+    
+    char* Allocate(idx_t size) {
+        // Align to 8-byte boundary
+        size = AlignValue(size);
+        
+        if (current_chunk->offset + size > StringChunk::CHUNK_SIZE) {
+            // Need new chunk
+            current_chunk = make_unique<StringChunk>();
+            chunks.push_back(current_chunk.get());
+        }
+        
+        char* result = current_chunk->data + current_chunk->offset;
+        current_chunk->offset += size;
+        return result;
+    }
+    
+private:
+    struct StringChunk {
+        static const idx_t CHUNK_SIZE = 4096;
+        char data[CHUNK_SIZE];
+        idx_t offset = 0;
+    };
+    
+    unique_ptr<StringChunk> current_chunk;
+    vector<StringChunk*> chunks;
+    
+    static idx_t AlignValue(idx_t value) {
+        return (value + 7) & ~7; // Align to 8 bytes
+    }
+};
+```
+
+### Complex Type Support
+
+**List Type Vectorization**
+DuckDB supports complex nested types including lists, structs, and maps with full vectorization:
+
+```cpp
+class ListVector {
+public:
+    struct ListData {
+        uint64_t offset;     // Offset into child vector
+        uint64_t length;     // Number of elements
+    };
+    
+    static void Initialize(Vector &vector, Vector &child_vector, idx_t count) {
+        vector.vector_type = VectorType::FLAT_VECTOR;
+        vector.count = count;
+        
+        // Allocate list data array
+        auto data_size = sizeof(ListData) * count;
+        vector.buffer = make_unique<VectorBuffer>(data_size);
+        vector.data = vector.buffer->GetData();
+        
+        // Store child vector
+        auto aux_data = make_unique<ListAuxiliaryData>();
+        aux_data->child_vector = make_unique<Vector>(child_vector);
+        vector.auxiliary = move(aux_data);
+        
+        vector.validity.Initialize(count);
+    }
+    
+    static Vector& GetChildVector(Vector &vector) {
+        D_ASSERT(vector.type.id() == LogicalTypeId::LIST);
+        auto aux_data = GetAuxiliaryData(vector);
+        return *aux_data->child_vector;
+    }
+    
+    static void SetListEntry(Vector &vector, idx_t index, 
+                           const vector<Value> &list_values) {
+        auto list_data = GetData(vector);
+        auto &child_vector = GetChildVector(vector);
+        
+        // Get current child vector size
+        auto child_count = child_vector.count;
+        
+        // Append values to child vector
+        list_data[index].offset = child_count;
+        list_data[index].length = list_values.size();
+        
+        // Expand child vector if necessary
+        if (child_count + list_values.size() > child_vector.capacity) {
+            ResizeChildVector(child_vector, child_count + list_values.size());
+        }
+        
+        // Add values to child vector
+        for (idx_t i = 0; i < list_values.size(); i++) {
+            FlatVector::SetValue(child_vector, child_count + i, list_values[i]);
+        }
+        
+        child_vector.count = child_count + list_values.size();
+        vector.validity.SetValid(index);
+    }
+    
+    // Optimized list operations
+    static void ListSlice(Vector &input, Vector &result, idx_t start, idx_t end) {
+        auto input_data = GetData(input);
+        auto result_data = GetData(result);
+        auto &input_child = GetChildVector(input);
+        auto &result_child = GetChildVector(result);
+        
+        idx_t result_child_offset = 0;
+        
+        for (idx_t i = 0; i < input.size(); i++) {
+            if (input.validity.RowIsValid(i)) {
+                auto list_start = input_data[i].offset;
+                auto list_length = input_data[i].length;
+                
+                // Calculate slice bounds
+                auto slice_start = std::max(start, (idx_t)0);
+                auto slice_end = std::min(end, list_length);
+                
+                if (slice_start < slice_end) {
+                    result_data[i].offset = result_child_offset;
+                    result_data[i].length = slice_end - slice_start;
+                    
+                    // Copy elements to result child vector
+                    CopyVectorRange(input_child, result_child,
+                                  list_start + slice_start, result_child_offset,
+                                  slice_end - slice_start);
+                    
+                    result_child_offset += slice_end - slice_start;
+                } else {
+                    // Empty slice
+                    result_data[i].offset = result_child_offset;
+                    result_data[i].length = 0;
+                }
+                
+                result.validity.SetValid(i);
+            } else {
+                result.validity.SetInvalid(i);
+            }
+        }
+        
+        result_child.count = result_child_offset;
+    }
+    
+private:
+    static ListData* GetData(const Vector &vector) {
+        return reinterpret_cast<ListData*>(vector.data);
+    }
+    
+    struct ListAuxiliaryData : VectorAuxiliaryData {
+        unique_ptr<Vector> child_vector;
+    };
+};
+```
+
+**Struct Type Implementation**
+Struct types enable complex data organization with full vectorization support:
+
+```cpp
+class StructVector {
+public:
+    static void Initialize(Vector &vector, const vector<LogicalType> &child_types, 
+                          const vector<string> &child_names, idx_t count) {
+        vector.vector_type = VectorType::FLAT_VECTOR;
+        vector.count = count;
+        
+        // No data array needed - structs are represented by child vectors
+        vector.data = nullptr;
+        
+        // Create child vectors
+        auto aux_data = make_unique<StructAuxiliaryData>();
+        aux_data->child_vectors.reserve(child_types.size());
+        aux_data->child_names = child_names;
+        
+        for (const auto &child_type : child_types) {
+            auto child_vector = make_unique<Vector>(child_type, count);
+            aux_data->child_vectors.push_back(move(child_vector));
+        }
+        
+        vector.auxiliary = move(aux_data);
+        vector.validity.Initialize(count);
+    }
+    
+    static Vector& GetChildVector(Vector &vector, idx_t child_index) {
+        D_ASSERT(vector.type.id() == LogicalTypeId::STRUCT);
+        auto aux_data = GetAuxiliaryData(vector);
+        D_ASSERT(child_index < aux_data->child_vectors.size());
+        return *aux_data->child_vectors[child_index];
+    }
+    
+    static void SetStructEntry(Vector &vector, idx_t index, 
+                              const vector<Value> &struct_values) {
+        auto aux_data = GetAuxiliaryData(vector);
+        D_ASSERT(struct_values.size() == aux_data->child_vectors.size());
+        
+        for (idx_t child_idx = 0; child_idx < struct_values.size(); child_idx++) {
+            FlatVector::SetValue(*aux_data->child_vectors[child_idx], 
+                               index, struct_values[child_idx]);
+        }
+        
+        vector.validity.SetValid(index);
+    }
+    
+    // Optimized struct operations
+    static void StructExtract(Vector &input, Vector &result, idx_t child_index) {
+        auto &child_vector = GetChildVector(input, child_index);
+        
+        // Struct extraction is essentially a copy of the child vector
+        result.Reference(child_vector);
+        
+        // Combine validity masks
+        CombineValidityMasks(input.validity, child_vector.validity, 
+                           result.validity, input.count);
+    }
+    
+private:
+    struct StructAuxiliaryData : VectorAuxiliaryData {
+        vector<unique_ptr<Vector>> child_vectors;
+        vector<string> child_names;
+    };
+    
+    static StructAuxiliaryData* GetAuxiliaryData(const Vector &vector) {
+        return static_cast<StructAuxiliaryData*>(vector.auxiliary.get());
+    }
+};
+```
+
+## 3.3.2 NULL Value Processing and Validity Masks
+
+### Efficient NULL Handling
+
+**Validity Mask Implementation**
+DuckDB uses bit-packed validity masks to efficiently track NULL values with minimal memory overhead:
+
+```cpp
+class ValidityMask {
+public:
+    static const idx_t BITS_PER_VALUE = sizeof(validity_t) * 8;
+    static const validity_t ALL_VALID = ~validity_t(0);
+    
+private:
+    unique_ptr<validity_t[]> validity_mask;
+    idx_t validity_size;
+    
+public:
+    ValidityMask() : validity_mask(nullptr), validity_size(0) {}
+    
+    explicit ValidityMask(idx_t count) {
+        Initialize(count);
+    }
+    
+    void Initialize(idx_t count) {
+        validity_size = ValidityMask::EntryCount(count);
+        if (validity_size > 0) {
+            validity_mask = make_unique<validity_t[]>(validity_size);
+            SetAllValid(count);
+        }
+    }
+    
+    void SetAllValid(idx_t count) {
+        if (!validity_mask) return;
+        
+        idx_t full_entries = count / BITS_PER_VALUE;
+        for (idx_t i = 0; i < full_entries; i++) {
+            validity_mask[i] = ALL_VALID;
+        }
+        
+        // Handle partial last entry
+        idx_t remaining = count % BITS_PER_VALUE;
+        if (remaining > 0) {
+            validity_mask[full_entries] = (validity_t(1) << remaining) - 1;
+        }
+    }
+    
+    void SetAllInvalid(idx_t count) {
+        if (!validity_mask) {
+            Initialize(count);
+        }
+        
+        memset(validity_mask.get(), 0, validity_size * sizeof(validity_t));
+    }
+    
+    bool RowIsValid(idx_t row_idx) const {
+        if (!validity_mask) return true; // No mask means all valid
+        
+        idx_t entry_idx = row_idx / BITS_PER_VALUE;
+        idx_t bit_idx = row_idx % BITS_PER_VALUE;
+        
+        return (validity_mask[entry_idx] >> bit_idx) & 1;
+    }
+    
+    void SetValid(idx_t row_idx) {
+        EnsureWritable(row_idx + 1);
+        
+        idx_t entry_idx = row_idx / BITS_PER_VALUE;
+        idx_t bit_idx = row_idx % BITS_PER_VALUE;
+        
+        validity_mask[entry_idx] |= (validity_t(1) << bit_idx);
+    }
+    
+    void SetInvalid(idx_t row_idx) {
+        EnsureWritable(row_idx + 1);
+        
+        idx_t entry_idx = row_idx / BITS_PER_VALUE;
+        idx_t bit_idx = row_idx % BITS_PER_VALUE;
+        
+        validity_mask[entry_idx] &= ~(validity_t(1) << bit_idx);
+    }
+    
+    // Vectorized validity operations
+    static void CombineValidityMasks(const ValidityMask &left, const ValidityMask &right,
+                                   ValidityMask &result, idx_t count) {
+        result.Initialize(count);
+        
+        if (!left.validity_mask && !right.validity_mask) {
+            // Both all valid - result is all valid
+            return;
+        }
+        
+        if (!left.validity_mask) {
+            // Left all valid - copy right
+            result.Copy(right, count);
+            return;
+        }
+        
+        if (!right.validity_mask) {
+            // Right all valid - copy left
+            result.Copy(left, count);
+            return;
+        }
+        
+        // Both have validity masks - combine with AND
+        idx_t entry_count = EntryCount(count);
+        for (idx_t i = 0; i < entry_count; i++) {
+            result.validity_mask[i] = left.validity_mask[i] & right.validity_mask[i];
+        }
+    }
+    
+private:
+    void EnsureWritable(idx_t count) {
+        if (!validity_mask) {
+            Initialize(count);
+        } else {
+            idx_t required_size = EntryCount(count);
+            if (required_size > validity_size) {
+                // Resize validity mask
+                auto new_mask = make_unique<validity_t[]>(required_size);
+                memcpy(new_mask.get(), validity_mask.get(), 
+                      validity_size * sizeof(validity_t));
+                validity_mask = move(new_mask);
+                validity_size = required_size;
+            }
+        }
+    }
+    
+    static idx_t EntryCount(idx_t count) {
+        return (count + BITS_PER_VALUE - 1) / BITS_PER_VALUE;
+    }
+};
+```
+
+**SIMD-Optimized NULL Processing**
+DuckDB includes SIMD-optimized operations for processing validity masks efficiently:
+
+```cpp
+class VectorizedValidityOperations {
+public:
+    // AVX2-optimized validity mask combination
+    static void CombineValidityMasksAVX2(const validity_t* left, const validity_t* right,
+                                        validity_t* result, idx_t entry_count) {
+        idx_t vector_count = entry_count - (entry_count % 4);
+        
+        for (idx_t i = 0; i < vector_count; i += 4) {
+            // Load 4 validity entries (256 bits total)
+            __m256i left_vec = _mm256_loadu_si256((__m256i*)(left + i));
+            __m256i right_vec = _mm256_loadu_si256((__m256i*)(right + i));
+            
+            // Combine with AND operation
+            __m256i result_vec = _mm256_and_si256(left_vec, right_vec);
+            
+            // Store result
+            _mm256_storeu_si256((__m256i*)(result + i), result_vec);
+        }
+        
+        // Handle remaining entries
+        for (idx_t i = vector_count; i < entry_count; i++) {
+            result[i] = left[i] & right[i];
+        }
+    }
+    
+    // Count valid entries efficiently
+    static idx_t CountValidEntries(const ValidityMask& mask, idx_t count) {
+        if (!mask.validity_mask) {
+            return count; // All valid
+        }
+        
+        idx_t valid_count = 0;
+        idx_t entry_count = ValidityMask::EntryCount(count);
+        
+        // Use population count for fast bit counting
+        for (idx_t i = 0; i < entry_count; i++) {
+            valid_count += __builtin_popcountll(mask.validity_mask[i]);
+        }
+        
+        // Handle partial last entry
+        idx_t remaining = count % ValidityMask::BITS_PER_VALUE;
+        if (remaining > 0 && entry_count > 0) {
+            validity_t last_entry = mask.validity_mask[entry_count - 1];
+            validity_t mask_bits = (validity_t(1) << remaining) - 1;
+            valid_count -= __builtin_popcountll(last_entry & ~mask_bits);
+        }
+        
+        return valid_count;
+    }
+};
+```
+
+## 3.3.3 Type Conversion and Casting Operations
+
+### Vectorized Type Casting
+
+**Automatic Type Promotion**
+DuckDB implements sophisticated type casting that handles implicit conversions safely while maintaining vectorization:
+
+```cpp
+class VectorCastOperations {
+public:
+    static void CastVector(Vector &source, Vector &result, const LogicalType &target_type, 
+                          idx_t count, bool strict = false) {
+        auto source_type = source.type;
+        
+        if (source_type == target_type) {
+            // No conversion needed
+            result.Reference(source);
+            return;
+        }
+        
+        // Select appropriate casting function
+        auto cast_function = GetCastFunction(source_type, target_type);
+        if (cast_function) {
+            cast_function(source, result, count, strict);
+        } else {
+            throw ConversionException("Cannot cast from %s to %s", 
+                                    source_type.ToString(), target_type.ToString());
+        }
+    }
+    
+private:
+    using CastFunctionType = void (*)(Vector&, Vector&, idx_t, bool);
+    static unordered_map<pair<LogicalTypeId, LogicalTypeId>, CastFunctionType> cast_functions;
+    
+    static CastFunctionType GetCastFunction(const LogicalType &source, 
+                                          const LogicalType &target) {
+        auto key = make_pair(source.id(), target.id());
+        auto it = cast_functions.find(key);
+        return it != cast_functions.end() ? it->second : nullptr;
+    }
+    
+    // Numeric type casting with overflow detection
+    template<typename SOURCE_TYPE, typename TARGET_TYPE>
+    static void NumericCast(Vector &source, Vector &result, idx_t count, bool strict) {
+        auto source_data = FlatVector::GetData<SOURCE_TYPE>(source);
+        auto result_data = FlatVector::GetData<TARGET_TYPE>(result);
+        
+        for (idx_t i = 0; i < count; i++) {
+            if (source.validity.RowIsValid(i)) {
+                if (TryCast<SOURCE_TYPE, TARGET_TYPE>(source_data[i], result_data[i], strict)) {
+                    result.validity.SetValid(i);
+                } else {
+                    result.validity.SetInvalid(i);
+                }
+            } else {
+                result.validity.SetInvalid(i);
+            }
+        }
+    }
+    
+    template<typename SOURCE_TYPE, typename TARGET_TYPE>
+    static bool TryCast(SOURCE_TYPE source, TARGET_TYPE &target, bool strict) {
+        // Check for overflow in numeric conversions
+        if constexpr (std::is_integral_v<SOURCE_TYPE> && std::is_integral_v<TARGET_TYPE>) {
+            if (source > std::numeric_limits<TARGET_TYPE>::max() ||
+                source < std::numeric_limits<TARGET_TYPE>::min()) {
+                if (strict) {
+                    return false; // Overflow
+                } else {
+                    target = static_cast<TARGET_TYPE>(source); // Allow truncation
+                    return true;
+                }
+            }
+        }
+        
+        target = static_cast<TARGET_TYPE>(source);
+        return true;
+    }
+};
+```
+
+**String Conversion Optimizations**
+String conversions receive special optimization for common patterns:
+
+```cpp
+class StringCastOperations {
+public:
+    // Optimized integer to string conversion
+    static void IntegerToString(Vector &source, Vector &result, idx_t count) {
+        StringVector::Initialize(result, count);
+        
+        auto source_data = FlatVector::GetData<int64_t>(source);
+        
+        for (idx_t i = 0; i < count; i++) {
+            if (source.validity.RowIsValid(i)) {
+                auto str = FastIntegerToString(source_data[i]);
+                StringVector::SetString(result, i, str);
+            } else {
+                result.validity.SetInvalid(i);
+            }
+        }
+    }
+    
+    // Optimized string to integer conversion
+    static void StringToInteger(Vector &source, Vector &result, idx_t count, bool strict) {
+        auto result_data = FlatVector::GetData<int64_t>(result);
+        
+        for (idx_t i = 0; i < count; i++) {
+            if (source.validity.RowIsValid(i)) {
+                auto str = StringVector::GetString(source, i);
+                int64_t value;
+                
+                if (TryParseInteger(str, value, strict)) {
+                    result_data[i] = value;
+                    result.validity.SetValid(i);
+                } else {
+                    result.validity.SetInvalid(i);
+                }
+            } else {
+                result.validity.SetInvalid(i);
+            }
+        }
+    }
+    
+private:
+    static string FastIntegerToString(int64_t value) {
+        // Optimized integer to string conversion
+        if (value == 0) return "0";
+        
+        char buffer[32];
+        char* ptr = buffer + sizeof(buffer) - 1;
+        *ptr = '\0';
+        
+        bool negative = value < 0;
+        if (negative) value = -value;
+        
+        while (value > 0) {
+            *--ptr = '0' + (value % 10);
+            value /= 10;
+        }
+        
+        if (negative) *--ptr = '-';
+        
+        return string(ptr);
+    }
+    
+    static bool TryParseInteger(const string_t &str, int64_t &result, bool strict) {
+        // Optimized string to integer parsing with overflow detection
+        const char* data = str.GetDataUnsafe();
+        idx_t len = str.GetSize();
+        
+        if (len == 0) return false;
+        
+        idx_t pos = 0;
+        bool negative = false;
+        
+        // Handle sign
+        if (data[0] == '-') {
+            negative = true;
+            pos = 1;
+        } else if (data[0] == '+') {
+            pos = 1;
+        }
+        
+        if (pos >= len) return false;
+        
+        int64_t value = 0;
+        for (; pos < len; pos++) {
+            char c = data[pos];
+            if (c < '0' || c > '9') {
+                return !strict; // Allow partial parsing in non-strict mode
+            }
+            
+            // Check for overflow
+            if (value > (INT64_MAX - (c - '0')) / 10) {
+                return false;
+            }
+            
+            value = value * 10 + (c - '0');
+        }
+        
+        result = negative ? -value : value;
+        return true;
+    }
+};
+```
+
+This comprehensive vector type system demonstrates how DuckDB achieves exceptional performance while maintaining full SQL compatibility and type safety. The combination of efficient memory layouts, SIMD optimization, sophisticated NULL handling, and optimized type conversions creates a robust foundation for high-performance analytical processing across all SQL data types.
+
+---
+
+# 3.4 Operator Implementation
+
+## 3.4.1 Join Operator Implementations
+
+### Hash Join Architecture
+
+**High-Performance Hash Join Implementation**
+DuckDB's hash join implementation represents one of the most sophisticated and optimized components of the execution engine, incorporating advanced techniques for both in-memory and out-of-core processing:
+
+```cpp
+class PhysicalHashJoin : public PhysicalOperator {
+public:
+    JoinType join_type;
+    vector<JoinCondition> conditions;
+    BuildSide build_side;
+    bool enable_partitioning;
+    idx_t partition_count;
+    
+    // Performance optimization flags
+    bool enable_bloom_filter;
+    bool enable_perfect_hash;
+    bool enable_runtime_filters;
+    
+    unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) override {
+        return make_unique<HashJoinOperatorState>();
+    }
+    
+    unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) override {
+        auto state = make_unique<HashJoinGlobalState>();
+        
+        // Initialize hash table based on estimated cardinality
+        auto build_cardinality = children[build_side]->estimated_cardinality;
+        state->hash_table = CreateOptimalHashTable(build_cardinality, conditions);
+        
+        // Configure partitioning if needed
+        if (enable_partitioning) {
+            state->partitioner = make_unique<HashTablePartitioner>(partition_count);
+        }
+        
+        return move(state);
+    }
+    
+    OperatorResultType Execute(ExecutionContext &context, DataChunk &input,
+                             DataChunk &chunk, GlobalOperatorState &gstate,
+                             OperatorState &state) override {
+        auto &global_state = static_cast<HashJoinGlobalState&>(gstate);
+        auto &local_state = static_cast<HashJoinOperatorState&>(state);
+        
+        if (global_state.build_phase) {
+            return ExecuteBuildPhase(context, input, global_state, local_state);
+        } else {
+            return ExecuteProbePhase(context, input, chunk, global_state, local_state);
+        }
+    }
+    
+private:
+    struct HashJoinGlobalState : GlobalOperatorState {
+        unique_ptr<HashTable> hash_table;
+        unique_ptr<HashTablePartitioner> partitioner;
+        unique_ptr<BloomFilter> bloom_filter;
+        atomic<bool> build_phase{true};
+        atomic<idx_t> build_threads_completed{0};
+    };
+    
+    struct HashJoinOperatorState : OperatorState {
+        unique_ptr<HashTableProbeState> probe_state;
+        unique_ptr<PartitionBuildState> partition_state;
+        DataChunk build_chunk;
+        DataChunk probe_chunk;
+    };
+    
+    OperatorResultType ExecuteBuildPhase(ExecutionContext &context, DataChunk &input,
+                                       HashJoinGlobalState &global_state,
+                                       HashJoinOperatorState &local_state) {
+        // Build hash table from input data
+        if (enable_partitioning) {
+            return ExecutePartitionedBuild(context, input, global_state, local_state);
+        } else {
+            return ExecuteSimpleBuild(context, input, global_state, local_state);
+        }
+    }
+    
+    OperatorResultType ExecuteSimpleBuild(ExecutionContext &context, DataChunk &input,
+                                        HashJoinGlobalState &global_state,
+                                        HashJoinOperatorState &local_state) {
+        if (input.size() == 0) {
+            // End of build input
+            FinalizeBuildPhase(global_state);
+            return OperatorResultType::NEED_MORE_INPUT;
+        }
+        
+        // Extract join keys
+        vector<Vector> join_keys;
+        ExtractJoinKeys(input, join_keys, conditions);
+        
+        // Insert into hash table
+        global_state.hash_table->Build(join_keys, input);
+        
+        return OperatorResultType::NEED_MORE_INPUT;
+    }
+    
+    void FinalizeBuildPhase(HashJoinGlobalState &global_state) {
+        // Finalize hash table construction
+        global_state.hash_table->Finalize();
+        
+        // Build bloom filter if enabled
+        if (enable_bloom_filter) {
+            global_state.bloom_filter = BuildBloomFilter(*global_state.hash_table);
+        }
+        
+        // Switch to probe phase
+        global_state.build_phase = false;
+    }
+};
+```
+
+**Advanced Hash Table Implementation**
+The hash table uses modern techniques including Robin Hood hashing and optimized memory layouts:
+
+```cpp
+class HashTable {
+public:
+    struct HashTableEntry {
+        hash_t hash_value;
+        idx_t entry_offset;      // Offset into data storage
+        HashTableEntry* next;    // For collision handling
+    };
+    
+private:
+    unique_ptr<HashTableEntry[]> entries;
+    unique_ptr<RowDataBlock[]> data_blocks;
+    idx_t capacity;
+    idx_t count;
+    idx_t data_block_count;
+    
+    // Robin Hood hashing state
+    static const idx_t MAX_PROBE_DISTANCE = 64;
+    
+public:
+    HashTable(idx_t initial_capacity) {
+        capacity = NextPowerOfTwo(initial_capacity * 2); // Load factor ~50%
+        entries = make_unique<HashTableEntry[]>(capacity);
+        InitializeEntries();
+        
+        // Initialize data storage
+        data_block_count = 1;
+        data_blocks = make_unique<RowDataBlock[]>(data_block_count);
+    }
+    
+    void Build(const vector<Vector> &join_keys, const DataChunk &payload) {
+        auto key_count = join_keys[0].count;
+        
+        for (idx_t i = 0; i < key_count; i++) {
+            // Calculate hash value for join keys
+            auto hash_value = CalculateHash(join_keys, i);
+            
+            // Find insertion position using Robin Hood hashing
+            auto position = FindInsertPosition(hash_value);
+            
+            // Store entry data
+            auto entry_offset = StoreRowData(join_keys, payload, i);
+            
+            // Insert into hash table
+            entries[position].hash_value = hash_value;
+            entries[position].entry_offset = entry_offset;
+            
+            count++;
+        }
+        
+        // Check if resize is needed
+        if (count > capacity * 0.7) {
+            Resize();
+        }
+    }
+    
+    void Probe(const vector<Vector> &probe_keys, DataChunk &result,
+              ProbeType probe_type) {
+        auto probe_count = probe_keys[0].count;
+        idx_t result_count = 0;
+        
+        // Selection vector for matches
+        SelectionVector sel_vector(probe_count);
+        
+        for (idx_t i = 0; i < probe_count; i++) {
+            auto hash_value = CalculateHash(probe_keys, i);
+            auto position = FindProbePosition(hash_value, probe_keys, i);
+            
+            if (position != INVALID_INDEX) {
+                // Found match
+                sel_vector.set_index(result_count++, i);
+                
+                if (probe_type == ProbeType::INNER_JOIN) {
+                    CopyMatchedRow(position, result, result_count - 1);
+                }
+            }
+        }
+        
+        result.Slice(sel_vector, result_count);
+    }
+    
+private:
+    idx_t FindInsertPosition(hash_t hash_value) {
+        auto position = hash_value & (capacity - 1);
+        idx_t probe_distance = 0;
+        
+        while (probe_distance < MAX_PROBE_DISTANCE) {
+            if (entries[position].hash_value == 0) {
+                // Empty slot found
+                return position;
+            }
+            
+            // Robin Hood: check if current entry should be displaced
+            auto existing_distance = ProbeDistance(entries[position].hash_value, position);
+            if (probe_distance > existing_distance) {
+                // Displace existing entry
+                return DisplaceEntry(position, hash_value, probe_distance);
+            }
+            
+            position = (position + 1) & (capacity - 1);
+            probe_distance++;
+        }
+        
+        // Table is full or probe distance exceeded - resize needed
+        return INVALID_INDEX;
+    }
+    
+    idx_t FindProbePosition(hash_t hash_value, const vector<Vector> &probe_keys, idx_t probe_idx) {
+        auto position = hash_value & (capacity - 1);
+        idx_t probe_distance = 0;
+        
+        while (probe_distance < MAX_PROBE_DISTANCE) {
+            if (entries[position].hash_value == 0) {
+                // Empty slot - no match
+                return INVALID_INDEX;
+            }
+            
+            if (entries[position].hash_value == hash_value) {
+                // Hash match - verify key equality
+                if (KeysEqual(entries[position].entry_offset, probe_keys, probe_idx)) {
+                    return position;
+                }
+            }
+            
+            // Continue probing
+            position = (position + 1) & (capacity - 1);
+            probe_distance++;
+        }
+        
+        return INVALID_INDEX;
+    }
+    
+    hash_t CalculateHash(const vector<Vector> &keys, idx_t index) {
+        hash_t hash_value = HASH_SEED;
+        
+        for (const auto &key_vector : keys) {
+            auto key_hash = HashValue(key_vector, index);
+            hash_value = CombineHashValues(hash_value, key_hash);
+        }
+        
+        return hash_value;
+    }
+    
+    bool KeysEqual(idx_t stored_offset, const vector<Vector> &probe_keys, idx_t probe_idx) {
+        // Compare stored keys with probe keys
+        auto stored_data = GetStoredRowData(stored_offset);
+        
+        for (idx_t i = 0; i < probe_keys.size(); i++) {
+            if (!CompareValues(stored_data[i], probe_keys[i], probe_idx)) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+};
+```
+
+### Partitioned Hash Join for Large Datasets
+
+**Out-of-Core Hash Join Implementation**
+For datasets larger than memory, DuckDB implements sophisticated partitioning strategies:
+
+```cpp
+class PartitionedHashJoin : public PhysicalHashJoin {
+public:
+    OperatorResultType ExecutePartitionedBuild(ExecutionContext &context, DataChunk &input,
+                                              HashJoinGlobalState &global_state,
+                                              HashJoinOperatorState &local_state) {
+        if (input.size() == 0) {
+            return FinalizeBuildPartitions(global_state);
+        }
+        
+        // Partition build input
+        auto &partitioner = *global_state.partitioner;
+        partitioner.PartitionData(input, build_side);
+        
+        return OperatorResultType::NEED_MORE_INPUT;
+    }
+    
+    OperatorResultType ExecutePartitionedProbe(ExecutionContext &context, DataChunk &input,
+                                              DataChunk &result, HashJoinGlobalState &global_state,
+                                              HashJoinOperatorState &local_state) {
+        auto &partitioner = *global_state.partitioner;
+        
+        // Partition probe input
+        auto partitioned_chunks = partitioner.PartitionData(input, 1 - build_side);
+        
+        idx_t total_matches = 0;
+        
+        // Process each partition
+        for (idx_t p = 0; p < partition_count; p++) {
+            if (partitioned_chunks[p].size() == 0) continue;
+            
+            // Load partition hash table if not in memory
+            if (!partitioner.IsPartitionInMemory(p)) {
+                LoadPartitionToMemory(p, global_state);
+            }
+            
+            // Probe partition
+            auto partition_matches = ProbePartition(p, partitioned_chunks[p], result, global_state);
+            total_matches += partition_matches;
+            
+            // Spill partition if memory pressure
+            if (ShouldSpillPartition(p, context)) {
+                SpillPartitionToDisk(p, global_state);
+            }
+        }
+        
+        result.SetCardinality(total_matches);
+        return total_matches > 0 ? OperatorResultType::HAVE_MORE_OUTPUT : 
+                                 OperatorResultType::NEED_MORE_INPUT;
+    }
+    
+private:
+    class HashTablePartitioner {
+        vector<unique_ptr<PartitionData>> partitions;
+        idx_t partition_count;
+        hash_t partition_mask;
+        
+    public:
+        HashTablePartitioner(idx_t num_partitions) : partition_count(num_partitions) {
+            partition_mask = num_partitions - 1;
+            partitions.resize(partition_count);
+            
+            for (idx_t i = 0; i < partition_count; i++) {
+                partitions[i] = make_unique<PartitionData>();
+            }
+        }
+        
+        vector<DataChunk> PartitionData(const DataChunk &input, idx_t side) {
+            vector<DataChunk> partitioned_chunks(partition_count);
+            vector<SelectionVector> partition_selectors(partition_count);
+            vector<idx_t> partition_counts(partition_count, 0);
+            
+            // Calculate partition for each row
+            for (idx_t i = 0; i < input.size(); i++) {
+                auto hash_value = CalculateRowHash(input, i);
+                auto partition_id = hash_value & partition_mask;
+                
+                partition_selectors[partition_id].set_index(partition_counts[partition_id]++, i);
+            }
+            
+            // Create partitioned chunks
+            for (idx_t p = 0; p < partition_count; p++) {
+                if (partition_counts[p] > 0) {
+                    partitioned_chunks[p].Initialize(input.GetTypes());
+                    partitioned_chunks[p].Slice(input, partition_selectors[p], partition_counts[p]);
+                    
+                    // Store in partition
+                    partitions[p]->Append(partitioned_chunks[p], side);
+                }
+            }
+            
+            return partitioned_chunks;
+        }
+        
+        bool IsPartitionInMemory(idx_t partition_id) {
+            return partitions[partition_id]->in_memory;
+        }
+        
+    private:
+        struct PartitionData {
+            bool in_memory = true;
+            unique_ptr<DataChunk> build_data;
+            unique_ptr<DataChunk> probe_data;
+            string spill_file_path;
+            idx_t spilled_size = 0;
+            
+            void Append(const DataChunk &chunk, idx_t side) {
+                if (side == 0) {
+                    // Build side
+                    if (!build_data) {
+                        build_data = make_unique<DataChunk>();
+                        build_data->Initialize(chunk.GetTypes());
+                    }
+                    build_data->Append(chunk);
+                } else {
+                    // Probe side
+                    if (!probe_data) {
+                        probe_data = make_unique<DataChunk>();
+                        probe_data->Initialize(chunk.GetTypes());
+                    }
+                    probe_data->Append(chunk);
+                }
+            }
+        };
+    };
+};
+```
+
+## 3.4.2 Aggregate Operator Implementation
+
+### Hash-Based Aggregation
+
+**High-Performance Aggregate Implementation**
+DuckDB's aggregation operators are optimized for both grouped and ungrouped aggregations with sophisticated memory management:
+
+```cpp
+class PhysicalHashAggregate : public PhysicalOperator {
+public:
+    vector<unique_ptr<Expression>> groups;
+    vector<unique_ptr<AggregateFunction>> aggregates;
+    bool enable_external_aggregation;
+    idx_t memory_limit;
+    
+    unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) override {
+        auto state = make_unique<HashAggregateGlobalState>();
+        
+        // Initialize aggregate hash table
+        auto estimated_groups = EstimateGroupCount();
+        state->aggregate_ht = CreateAggregateHashTable(estimated_groups);
+        
+        // Initialize aggregate states
+        InitializeAggregateStates(*state);
+        
+        return move(state);
+    }
+    
+    OperatorResultType Execute(ExecutionContext &context, DataChunk &input,
+                             DataChunk &chunk, GlobalOperatorState &gstate,
+                             OperatorState &state) override {
+        auto &global_state = static_cast<HashAggregateGlobalState&>(gstate);
+        auto &local_state = static_cast<HashAggregateOperatorState&>(state);
+        
+        if (input.size() > 0) {
+            return ProcessAggregateInput(context, input, global_state, local_state);
+        } else {
+            return FinalizeAggregates(context, chunk, global_state, local_state);
+        }
+    }
+    
+private:
+    struct HashAggregateGlobalState : GlobalOperatorState {
+        unique_ptr<AggregateHashTable> aggregate_ht;
+        vector<unique_ptr<AggregateState>> aggregate_states;
+        unique_ptr<ExternalAggregator> external_aggregator;
+        bool finalized = false;
+    };
+    
+    struct HashAggregateOperatorState : OperatorState {
+        DataChunk group_chunk;
+        DataChunk aggregate_input_chunk;
+        vector<Vector> group_vectors;
+        vector<Vector> aggregate_vectors;
+    };
+    
+    OperatorResultType ProcessAggregateInput(ExecutionContext &context, DataChunk &input,
+                                           HashAggregateGlobalState &global_state,
+                                           HashAggregateOperatorState &local_state) {
+        // Extract grouping columns
+        ExtractGroupingColumns(input, local_state.group_vectors);
+        
+        // Extract aggregate input columns
+        ExtractAggregateColumns(input, local_state.aggregate_vectors);
+        
+        // Check memory usage
+        if (enable_external_aggregation && 
+            global_state.aggregate_ht->GetMemoryUsage() > memory_limit) {
+            return SpillAndContinue(context, input, global_state, local_state);
+        }
+        
+        // Process aggregation
+        ProcessAggregation(local_state.group_vectors, local_state.aggregate_vectors,
+                          *global_state.aggregate_ht, global_state.aggregate_states);
+        
+        return OperatorResultType::NEED_MORE_INPUT;
+    }
+    
+    void ProcessAggregation(const vector<Vector> &group_vectors,
+                          const vector<Vector> &aggregate_vectors,
+                          AggregateHashTable &hash_table,
+                          vector<unique_ptr<AggregateState>> &states) {
+        auto count = group_vectors.empty() ? aggregate_vectors[0].count : group_vectors[0].count;
+        
+        if (group_vectors.empty()) {
+            // Ungrouped aggregation
+            ProcessUngroupedAggregation(aggregate_vectors, states, count);
+        } else {
+            // Grouped aggregation
+            ProcessGroupedAggregation(group_vectors, aggregate_vectors, hash_table, states, count);
+        }
+    }
+    
+    void ProcessGroupedAggregation(const vector<Vector> &group_vectors,
+                                 const vector<Vector> &aggregate_vectors,
+                                 AggregateHashTable &hash_table,
+                                 vector<unique_ptr<AggregateState>> &states,
+                                 idx_t count) {
+        // Find or create groups
+        auto group_indices = hash_table.FindOrCreateGroups(group_vectors, count);
+        
+        // Update aggregates for each group
+        for (idx_t i = 0; i < count; i++) {
+            auto group_index = group_indices[i];
+            
+            for (idx_t agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
+                auto &aggregate_function = *aggregates[agg_idx];
+                auto aggregate_state = hash_table.GetAggregateState(group_index, agg_idx);
+                
+                // Extract aggregate input value
+                Value input_value;
+                if (aggregate_vectors[agg_idx].validity.RowIsValid(i)) {
+                    input_value = aggregate_vectors[agg_idx].GetValue(i);
+                } else {
+                    input_value = Value(); // NULL
+                }
+                
+                // Update aggregate state
+                aggregate_function.update_function(aggregate_state, input_value);
+            }
+        }
+    }
+    
+    void ProcessUngroupedAggregation(const vector<Vector> &aggregate_vectors,
+                                   vector<unique_ptr<AggregateState>> &states,
+                                   idx_t count) {
+        // Single group aggregation
+        for (idx_t i = 0; i < count; i++) {
+            for (idx_t agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
+                auto &aggregate_function = *aggregates[agg_idx];
+                auto aggregate_state = states[agg_idx].get();
+                
+                Value input_value;
+                if (aggregate_vectors[agg_idx].validity.RowIsValid(i)) {
+                    input_value = aggregate_vectors[agg_idx].GetValue(i);
+                } else {
+                    input_value = Value(); // NULL
+                }
+                
+                aggregate_function.update_function(aggregate_state, input_value);
+            }
+        }
+    }
+};
+```
+
+**Optimized Aggregate Functions**
+DuckDB includes highly optimized implementations for common aggregate functions:
+
+```cpp
+class OptimizedAggregates {
+public:
+    // Vectorized SUM with overflow detection
+    template<typename T>
+    static void VectorizedSum(Vector &input, AggregateState *state, idx_t count) {
+        auto input_data = FlatVector::GetData<T>(input);
+        auto sum_state = reinterpret_cast<SumState<T>*>(state);
+        
+        if constexpr (std::is_integral_v<T>) {
+            // Integer sum with overflow detection
+            VectorizedIntegerSum(input_data, input.validity, sum_state, count);
+        } else {
+            // Floating point sum with Kahan summation for precision
+            VectorizedFloatingSum(input_data, input.validity, sum_state, count);
+        }
+    }
+    
+    // Vectorized COUNT with SIMD optimization
+    static void VectorizedCount(Vector &input, AggregateState *state, idx_t count) {
+        auto count_state = reinterpret_cast<CountState*>(state);
+        
+        if (!input.validity.validity_mask) {
+            // All values valid
+            count_state->count += count;
+        } else {
+            // Count valid entries using population count
+            auto valid_count = VectorizedValidityOperations::CountValidEntries(input.validity, count);
+            count_state->count += valid_count;
+        }
+    }
+    
+    // Vectorized MIN/MAX with SIMD comparison
+    template<typename T>
+    static void VectorizedMinMax(Vector &input, AggregateState *state, idx_t count, bool is_min) {
+        auto input_data = FlatVector::GetData<T>(input);
+        auto minmax_state = reinterpret_cast<MinMaxState<T>*>(state);
+        
+        if (!minmax_state->is_set) {
+            // Find first valid value
+            for (idx_t i = 0; i < count; i++) {
+                if (input.validity.RowIsValid(i)) {
+                    minmax_state->value = input_data[i];
+                    minmax_state->is_set = true;
+                    break;
+                }
+            }
+        }
+        
+        if (minmax_state->is_set) {
+            VectorizedMinMaxComparison<T>(input_data, input.validity, minmax_state, count, is_min);
+        }
+    }
+    
+private:
+    template<typename T>
+    static void VectorizedIntegerSum(const T* input, const ValidityMask &validity,
+                                   SumState<T>* state, idx_t count) {
+        T local_sum = 0;
+        bool overflow = false;
+        
+        for (idx_t i = 0; i < count; i++) {
+            if (validity.RowIsValid(i)) {
+                if (!TryAddWithOverflow(local_sum, input[i], local_sum)) {
+                    overflow = true;
+                    break;
+                }
+            }
+        }
+        
+        if (overflow) {
+            // Promote to larger type or use decimal arithmetic
+            PromoteAndContinueSum(input, validity, state, count);
+        } else {
+            state->sum += local_sum;
+        }
+    }
+    
+    template<typename T>
+    static void VectorizedFloatingSum(const T* input, const ValidityMask &validity,
+                                    SumState<T>* state, idx_t count) {
+        // Kahan summation for better numerical stability
+        T sum = state->sum;
+        T compensation = state->compensation;
+        
+        for (idx_t i = 0; i < count; i++) {
+            if (validity.RowIsValid(i)) {
+                T y = input[i] - compensation;
+                T t = sum + y;
+                compensation = (t - sum) - y;
+                sum = t;
+            }
+        }
+        
+        state->sum = sum;
+        state->compensation = compensation;
+    }
+    
+    template<typename T>
+    static void VectorizedMinMaxComparison(const T* input, const ValidityMask &validity,
+                                         MinMaxState<T>* state, idx_t count, bool is_min) {
+        T current_value = state->value;
+        
+        // Vectorized comparison loop
+        for (idx_t i = 0; i < count; i++) {
+            if (validity.RowIsValid(i)) {
+                if (is_min) {
+                    if (input[i] < current_value) {
+                        current_value = input[i];
+                    }
+                } else {
+                    if (input[i] > current_value) {
+                        current_value = input[i];
+                    }
+                }
+            }
+        }
+        
+        state->value = current_value;
+    }
+};
+```
+
+## 3.4.3 Filter and Projection Operations
+
+### Optimized Filter Implementation
+
+**Vectorized Filter Processing**
+Filter operations receive extensive optimization including predicate pushdown and SIMD acceleration:
+
+```cpp
+class PhysicalFilter : public PhysicalOperator {
+public:
+    unique_ptr<Expression> condition;
+    
+    OperatorResultType Execute(ExecutionContext &context, DataChunk &input,
+                             DataChunk &chunk, GlobalOperatorState &gstate,
+                             OperatorState &state) override {
+        if (input.size() == 0) {
+            return OperatorResultType::FINISHED;
+        }
+        
+        // Evaluate filter condition
+        Vector condition_result(LogicalType::BOOLEAN, input.size());
+        ExpressionExecutor::ExecuteExpression(*condition, input, condition_result, context);
+        
+        // Apply filter with optimized selection
+        auto selected_count = ApplyFilter(input, chunk, condition_result);
+        
+        if (selected_count > 0) {
+            chunk.SetCardinality(selected_count);
+            return OperatorResultType::HAVE_MORE_OUTPUT;
+        } else {
+            return OperatorResultType::NEED_MORE_INPUT;
+        }
+    }
+    
+private:
+    idx_t ApplyFilter(const DataChunk &input, DataChunk &result, Vector &condition) {
+        SelectionVector selection_vector(input.size());
+        idx_t selected_count = 0;
+        
+        // Create selection vector for matching rows
+        if (condition.vector_type == VectorType::CONSTANT_VECTOR) {
+            // Constant condition - optimize
+            return ApplyConstantFilter(input, result, condition);
+        } else {
+            return ApplyVectorizedFilter(input, result, condition, selection_vector);
+        }
+    }
+    
+    idx_t ApplyConstantFilter(const DataChunk &input, DataChunk &result, Vector &condition) {
+        auto constant_value = ConstantVector::GetConstantValue<bool>(condition);
+        
+        if (constant_value && condition.validity.RowIsValid(0)) {
+            // All rows pass filter
+            result.Reference(input);
+            return input.size();
+        } else {
+            // No rows pass filter
+            result.Reset();
+            return 0;
+        }
+    }
+    
+    idx_t ApplyVectorizedFilter(const DataChunk &input, DataChunk &result, Vector &condition,
+                              SelectionVector &selection_vector) {
+        auto condition_data = FlatVector::GetData<bool>(condition);
+        idx_t selected_count = 0;
+        
+        // Vectorized selection with branch prediction optimization
+        for (idx_t i = 0; i < input.size(); i++) {
+            if (condition.validity.RowIsValid(i) && condition_data[i]) {
+                selection_vector.set_index(selected_count++, i);
+            }
+        }
+        
+        if (selected_count > 0) {
+            // Create filtered result chunk
+            result.Initialize(input.GetTypes());
+            result.Slice(input, selection_vector, selected_count);
+        }
+        
+        return selected_count;
+    }
+};
+```
+
+### Advanced Projection Implementation
+
+**Zero-Copy Projection Optimization**
+Projection operations use reference semantics when possible to minimize data copying:
+
+```cpp
+class PhysicalProjection : public PhysicalOperator {
+public:
+    vector<unique_ptr<Expression>> select_list;
+    
+    OperatorResultType Execute(ExecutionContext &context, DataChunk &input,
+                             DataChunk &chunk, GlobalOperatorState &gstate,
+                             OperatorState &state) override {
+        if (input.size() == 0) {
+            return OperatorResultType::FINISHED;
+        }
+        
+        // Execute projection
+        ExecuteProjection(input, chunk, context);
+        
+        return OperatorResultType::HAVE_MORE_OUTPUT;
+    }
+    
+private:
+    void ExecuteProjection(const DataChunk &input, DataChunk &result, 
+                          const ExecutionContext &context) {
+        // Initialize result chunk
+        vector<LogicalType> result_types;
+        for (const auto &expr : select_list) {
+            result_types.push_back(expr->return_type);
+        }
+        
+        result.Initialize(result_types);
+        result.SetCardinality(input.size());
+        
+        // Execute each projection expression
+        for (idx_t i = 0; i < select_list.size(); i++) {
+            auto &expression = *select_list[i];
+            
+            if (expression.type == ExpressionType::BOUND_COLUMN_REF) {
+                // Column reference - use zero-copy reference
+                auto &column_ref = static_cast<BoundColumnRefExpression&>(expression);
+                result.data[i].Reference(input.data[column_ref.binding.column_index]);
+            } else {
+                // Complex expression - evaluate
+                ExpressionExecutor::ExecuteExpression(expression, input, result.data[i], context);
+            }
+        }
+    }
+};
+```
+
+## 3.4.4 Sort and Window Function Operations
+
+### External Sort Implementation
+
+**Memory-Aware Sorting**
+DuckDB implements sophisticated external sorting that adapts to available memory:
+
+```cpp
+class PhysicalSort : public PhysicalOperator {
+public:
+    vector<BoundOrderByNode> orders;
+    bool enable_external_sort;
+    idx_t max_memory_usage;
+    
+    OperatorResultType Execute(ExecutionContext &context, DataChunk &input,
+                             DataChunk &chunk, GlobalOperatorState &gstate,
+                             OperatorState &state) override {
+        auto &global_state = static_cast<SortGlobalState&>(gstate);
+        auto &local_state = static_cast<SortOperatorState&>(state);
+        
+        if (input.size() > 0) {
+            return ProcessSortInput(context, input, global_state, local_state);
+        } else {
+            return ProduceSortedOutput(context, chunk, global_state, local_state);
+        }
+    }
+    
+private:
+    struct SortGlobalState : GlobalOperatorState {
+        unique_ptr<GlobalSortState> sort_state;
+        vector<unique_ptr<LocalSortState>> local_states;
+        bool sorted = false;
+    };
+    
+    OperatorResultType ProcessSortInput(ExecutionContext &context, DataChunk &input,
+                                      SortGlobalState &global_state,
+                                      SortOperatorState &local_state) {
+        // Add input to sort state
+        global_state.sort_state->AddChunk(input);
+        
+        // Check memory usage
+        if (enable_external_sort && 
+            global_state.sort_state->GetMemoryUsage() > max_memory_usage) {
+            // Spill to disk
+            global_state.sort_state->SpillToDisk();
+        }
+        
+        return OperatorResultType::NEED_MORE_INPUT;
+    }
+    
+    OperatorResultType ProduceSortedOutput(ExecutionContext &context, DataChunk &chunk,
+                                         SortGlobalState &global_state,
+                                         SortOperatorState &local_state) {
+        if (!global_state.sorted) {
+            // Perform final sort
+            global_state.sort_state->Sort(orders);
+            global_state.sorted = true;
+        }
+        
+        // Get next sorted chunk
+        if (global_state.sort_state->GetNextChunk(chunk)) {
+            return OperatorResultType::HAVE_MORE_OUTPUT;
+        } else {
+            return OperatorResultType::FINISHED;
+        }
+    }
+};
+
+class GlobalSortState {
+    vector<unique_ptr<SortChunk>> chunks;
+    unique_ptr<ExternalSorter> external_sorter;
+    idx_t memory_usage;
+    
+public:
+    void AddChunk(const DataChunk &input) {
+        auto sort_chunk = make_unique<SortChunk>(input, orders);
+        memory_usage += sort_chunk->GetMemoryUsage();
+        chunks.push_back(move(sort_chunk));
+    }
+    
+    void Sort(const vector<BoundOrderByNode> &orders) {
+        if (external_sorter) {
+            // External sort
+            external_sorter->Sort();
+        } else {
+            // In-memory sort
+            InMemorySort(orders);
+        }
+    }
+    
+private:
+    void InMemorySort(const vector<BoundOrderByNode> &orders) {
+        // Merge all chunks into single sortable structure
+        auto merged_data = MergeChunks();
+        
+        // Perform optimized sort
+        if (orders.size() == 1) {
+            SingleColumnSort(*merged_data, orders[0]);
+        } else {
+            MultiColumnSort(*merged_data, orders);
+        }
+    }
+    
+    void SingleColumnSort(SortedData &data, const BoundOrderByNode &order) {
+        // Use specialized sorting algorithms based on data type and size
+        auto &sort_column = data.columns[order.expression->binding.column_index];
+        
+        if (sort_column.type.id() == LogicalTypeId::INTEGER) {
+            RadixSort(sort_column, data.row_indices, order.type == OrderType::ASCENDING);
+        } else {
+            ComparisonSort(sort_column, data.row_indices, order);
+        }
+    }
+    
+    void RadixSort(const Vector &column, vector<idx_t> &indices, bool ascending) {
+        // High-performance radix sort for integer types
+        auto data = FlatVector::GetData<int32_t>(column);
+        RadixSortImplementation(data, indices, column.count, ascending);
+    }
+};
+```
+
+This comprehensive operator implementation demonstrates how DuckDB achieves exceptional performance through careful algorithm selection, vectorization, memory management, and modern optimization techniques. Each operator is designed to leverage the full capabilities of the vectorized execution engine while maintaining the simplicity and correctness that characterizes DuckDB's approach to analytical query processing.
+
+---
+
+# 4. Storage Engine and Data Management
+
+The storage engine represents one of DuckDB's most innovative components, implementing a columnar storage architecture specifically optimized for analytical workloads while maintaining the operational simplicity that characterizes the entire system. Unlike traditional row-based storage engines, DuckDB's storage layer is designed from the ground up to leverage vectorized processing, advanced compression techniques, and intelligent data organization strategies that deliver exceptional query performance across diverse analytical scenarios.
+
+# 4.1 Storage Architecture
+
+## 4.1.1 Columnar Storage Foundation
+
+### Core Storage Design Principles
+
+**Column-Oriented Data Organization**
+DuckDB implements a pure columnar storage model that optimizes data access patterns for analytical queries. This approach provides fundamental advantages over row-based storage for analytical workloads:
+
+```cpp
+class StorageManager {
+public:
+    // Core storage components
+    unique_ptr<DatabaseInstance> database_instance;
+    unique_ptr<BufferManager> buffer_manager;
+    unique_ptr<Catalog> catalog;
+    unique_ptr<TransactionManager> transaction_manager;
+    
+    // Storage configuration
+    StorageConfiguration config;
+    string database_path;
+    bool in_memory_database;
+    
+    StorageManager(const string &path, StorageConfiguration storage_config) 
+        : database_path(path), config(storage_config) {
+        
+        // Initialize core components
+        buffer_manager = make_unique<BufferManager>(config.buffer_pool_size);
+        transaction_manager = make_unique<TransactionManager>();
+        catalog = make_unique<Catalog>();
+        
+        // Determine storage mode
+        in_memory_database = (path == ":memory:" || path.empty());
+        
+        if (!in_memory_database) {
+            // Initialize persistent storage
+            InitializePersistentStorage();
+        }
+    }
+    
+    // Table management
+    unique_ptr<DataTable> CreateTable(const string &schema_name, 
+                                     const string &table_name,
+                                     const vector<ColumnDefinition> &columns) {
+        // Create table with optimized storage layout
+        auto table = make_unique<DataTable>(columns, config);
+        
+        // Register in catalog
+        catalog->CreateTable(schema_name, table_name, table.get());
+        
+        return table;
+    }
+    
+private:
+    void InitializePersistentStorage() {
+        // Create database file if it doesn't exist
+        if (!FileSystem::FileExists(database_path)) {
+            CreateDatabaseFile();
+        }
+        
+        // Load existing database structure
+        LoadDatabaseStructure();
+    }
+};
+
+struct StorageConfiguration {
+    idx_t buffer_pool_size = 128 * 1024 * 1024;  // 128MB default
+    idx_t block_size = 256 * 1024;               // 256KB blocks
+    idx_t row_group_size = 122880;               // ~120K rows per group
+    CompressionType default_compression = CompressionType::AUTO;
+    bool enable_statistics = true;
+    bool enable_indexes = true;
+};
+```
+
+**Row Group Architecture**
+The fundamental unit of storage in DuckDB is the row group, designed to optimize both memory usage and query performance:
+
+```cpp
+class RowGroup {
+public:
+    static const idx_t ROW_GROUP_SIZE = 122880;  // Optimized for memory and performance
+    
+private:
+    vector<unique_ptr<ColumnSegment>> columns;
+    idx_t row_count;
+    idx_t version_number;
+    
+    // Metadata and statistics
+    unique_ptr<RowGroupStatistics> statistics;
+    unique_ptr<RowGroupMetadata> metadata;
+    
+    // Version control
+    atomic<transaction_t> min_transaction;
+    atomic<transaction_t> max_transaction;
+    
+public:
+    RowGroup(const vector<LogicalType> &types, idx_t initial_capacity = ROW_GROUP_SIZE) 
+        : row_count(0), version_number(0) {
+        
+        // Initialize column segments
+        columns.reserve(types.size());
+        for (idx_t i = 0; i < types.size(); i++) {
+            columns.push_back(CreateColumnSegment(types[i], initial_capacity));
+        }
+        
+        // Initialize metadata
+        statistics = make_unique<RowGroupStatistics>(types);
+        metadata = make_unique<RowGroupMetadata>();
+    }
+    
+    void Append(DataChunk &chunk, transaction_t transaction_id) {
+        D_ASSERT(chunk.size() + row_count <= ROW_GROUP_SIZE);
+        
+        // Append to each column segment
+        for (idx_t i = 0; i < columns.size(); i++) {
+            columns[i]->Append(chunk.data[i], chunk.size());
+        }
+        
+        // Update statistics
+        statistics->Update(chunk);
+        
+        // Update version information
+        UpdateVersionInfo(transaction_id);
+        
+        row_count += chunk.size();
+    }
+    
+    void Scan(ColumnScanState &state, DataChunk &result, 
+             const vector<column_t> &column_ids) {
+        // Initialize result chunk
+        vector<LogicalType> result_types;
+        for (auto column_id : column_ids) {
+            result_types.push_back(columns[column_id]->GetType());
+        }
+        result.Initialize(result_types);
+        
+        // Determine scan range
+        idx_t scan_count = std::min(STANDARD_VECTOR_SIZE, row_count - state.row_index);
+        
+        // Scan each requested column
+        for (idx_t i = 0; i < column_ids.size(); i++) {
+            auto column_id = column_ids[i];
+            columns[column_id]->Scan(state, result.data[i], scan_count);
+        }
+        
+        result.SetCardinality(scan_count);
+        state.row_index += scan_count;
+    }
+    
+    // Storage optimization
+    void Compress() {
+        for (auto &column : columns) {
+            column->Compress();
+        }
+    }
+    
+    void Checkpoint(WriteStream &stream) {
+        // Write row group header
+        stream.Write<uint32_t>(ROWGROUP_VERSION);
+        stream.Write<idx_t>(row_count);
+        stream.Write<idx_t>(columns.size());
+        
+        // Write column segments
+        for (auto &column : columns) {
+            column->Serialize(stream);
+        }
+        
+        // Write statistics
+        statistics->Serialize(stream);
+    }
+    
+private:
+    unique_ptr<ColumnSegment> CreateColumnSegment(const LogicalType &type, idx_t capacity) {
+        switch (type.id()) {
+            case LogicalTypeId::INTEGER:
+                return make_unique<NumericColumnSegment<int32_t>>(capacity);
+            case LogicalTypeId::BIGINT:
+                return make_unique<NumericColumnSegment<int64_t>>(capacity);
+            case LogicalTypeId::VARCHAR:
+                return make_unique<StringColumnSegment>(capacity);
+            case LogicalTypeId::DOUBLE:
+                return make_unique<NumericColumnSegment<double>>(capacity);
+            default:
+                return make_unique<GenericColumnSegment>(type, capacity);
+        }
+    }
+    
+    void UpdateVersionInfo(transaction_t transaction_id) {
+        // Update transaction bounds for MVCC
+        auto current_min = min_transaction.load();
+        while (transaction_id < current_min && 
+               !min_transaction.compare_exchange_weak(current_min, transaction_id)) {
+            // Retry until successful
+        }
+        
+        auto current_max = max_transaction.load();
+        while (transaction_id > current_max && 
+               !max_transaction.compare_exchange_weak(current_max, transaction_id)) {
+            // Retry until successful
+        }
+    }
+};
+```
+
+### Column Segment Implementation
+
+**Adaptive Column Storage**
+Each column within a row group is stored as a segment that adapts its internal representation based on data characteristics:
+
+```cpp
+class ColumnSegment {
+public:
+    LogicalType type;
+    idx_t count;
+    idx_t capacity;
+    
+    // Compression and encoding
+    CompressionType compression_type;
+    unique_ptr<CompressionState> compression_state;
+    
+    // Statistics for query optimization
+    unique_ptr<BaseStatistics> statistics;
+    
+    virtual ~ColumnSegment() = default;
+    
+    virtual void Append(Vector &data, idx_t append_count) = 0;
+    virtual void Scan(ColumnScanState &state, Vector &result, idx_t scan_count) = 0;
+    virtual void Compress() = 0;
+    virtual void Serialize(WriteStream &stream) = 0;
+    virtual unique_ptr<ColumnSegment> Deserialize(ReadStream &stream) = 0;
+    
+    // Filtering and selection
+    virtual void FilterScan(ColumnScanState &state, Vector &result, 
+                          SelectionVector &selection, idx_t &sel_count) = 0;
+    
+    // Statistics-based optimizations
+    virtual bool CanSkipSegment(const TableFilter &filter) = 0;
+    
+protected:
+    void UpdateStatistics(Vector &data, idx_t data_count) {
+        if (!statistics) {
+            statistics = BaseStatistics::CreateEmpty(type);
+        }
+        statistics->Update(data, data_count);
+    }
+};
+
+template<typename T>
+class NumericColumnSegment : public ColumnSegment {
+private:
+    unique_ptr<T[]> data;
+    unique_ptr<ValidityMask> validity;
+    
+    // Compression-specific storage
+    unique_ptr<CompressedColumnSegment> compressed_segment;
+    bool is_compressed = false;
+    
+public:
+    NumericColumnSegment(idx_t initial_capacity) {
+        capacity = initial_capacity;
+        count = 0;
+        type = LogicalType::GetType<T>();
+        
+        // Allocate aligned memory for SIMD operations
+        data = AllocateAligned<T>(capacity);
+        validity = make_unique<ValidityMask>(capacity);
+    }
+    
+    void Append(Vector &input, idx_t append_count) override {
+        D_ASSERT(count + append_count <= capacity);
+        D_ASSERT(!is_compressed); // Can't append to compressed segments
+        
+        // Copy data from vector
+        auto input_data = FlatVector::GetData<T>(input);
+        memcpy(data.get() + count, input_data, append_count * sizeof(T));
+        
+        // Copy validity mask
+        validity->Merge(input.validity, count, append_count);
+        
+        // Update statistics
+        UpdateStatistics(input, append_count);
+        
+        count += append_count;
+    }
+    
+    void Scan(ColumnScanState &state, Vector &result, idx_t scan_count) override {
+        if (is_compressed) {
+            // Decompress on-the-fly
+            compressed_segment->Scan(state, result, scan_count);
+        } else {
+            // Direct memory access
+            ScanUncompressed(state, result, scan_count);
+        }
+    }
+    
+    void Compress() override {
+        if (is_compressed || count == 0) return;
+        
+        // Analyze data patterns to select optimal compression
+        auto compression_type = AnalyzeCompressionOpportunity();
+        
+        if (compression_type != CompressionType::UNCOMPRESSED) {
+            compressed_segment = CreateCompressedSegment(compression_type);
+            
+            // Free uncompressed data
+            data.reset();
+            is_compressed = true;
+        }
+    }
+    
+    bool CanSkipSegment(const TableFilter &filter) override {
+        if (!statistics) return false;
+        
+        // Use statistics to determine if entire segment can be skipped
+        auto &numeric_stats = static_cast<NumericStatistics&>(*statistics);
+        
+        switch (filter.comparison_type) {
+            case ComparisonType::EQUAL_TO:
+                return !numeric_stats.CanHaveValue(filter.constant);
+            case ComparisonType::GREATER_THAN:
+                return numeric_stats.max_value <= filter.constant.GetValue<T>();
+            case ComparisonType::LESS_THAN:
+                return numeric_stats.min_value >= filter.constant.GetValue<T>();
+            default:
+                return false;
+        }
+    }
+    
+private:
+    void ScanUncompressed(ColumnScanState &state, Vector &result, idx_t scan_count) {
+        auto result_data = FlatVector::GetData<T>(result);
+        auto start_idx = state.segment_offset;
+        
+        // Copy data with SIMD optimization when possible
+        memcpy(result_data, data.get() + start_idx, scan_count * sizeof(T));
+        
+        // Copy validity information
+        result.validity.Copy(*validity, start_idx, scan_count);
+        
+        state.segment_offset += scan_count;
+    }
+    
+    CompressionType AnalyzeCompressionOpportunity() {
+        // Analyze data characteristics to select best compression
+        auto &numeric_stats = static_cast<NumericStatistics&>(*statistics);
+        
+        // Check for constant values
+        if (numeric_stats.min_value == numeric_stats.max_value) {
+            return CompressionType::CONSTANT;
+        }
+        
+        // Check for small range (dictionary encoding opportunity)
+        auto value_range = numeric_stats.max_value - numeric_stats.min_value;
+        if (value_range < 256) {
+            return CompressionType::DICTIONARY;
+        }
+        
+        // Check for patterns (RLE opportunity)
+        if (HasRunLengthPatterns()) {
+            return CompressionType::RLE;
+        }
+        
+        // Default to bitpacking for integers
+        if constexpr (std::is_integral_v<T>) {
+            return CompressionType::BITPACKING;
+        }
+        
+        return CompressionType::UNCOMPRESSED;
+    }
+    
+    bool HasRunLengthPatterns() {
+        if (count < 10) return false;
+        
+        idx_t run_count = 1;
+        for (idx_t i = 1; i < count; i++) {
+            if (data[i] != data[i-1]) {
+                run_count++;
+            }
+        }
+        
+        // If we have significantly fewer runs than values, RLE is beneficial
+        return run_count < count / 3;
+    }
+};
+```
+
+## 4.1.2 Data Table Management
+
+### Table Storage Coordination
+
+**DataTable Architecture**
+The DataTable class coordinates storage across multiple row groups and provides the interface for table-level operations:
+
+```cpp
+class DataTable {
+public:
+    // Table metadata
+    string schema_name;
+    string table_name;
+    vector<ColumnDefinition> columns;
+    vector<LogicalType> types;
+    
+    // Storage structure
+    vector<unique_ptr<RowGroup>> row_groups;
+    unique_ptr<RowGroup> active_row_group;
+    
+    // Indexing and constraints
+    vector<unique_ptr<Index>> indexes;
+    vector<unique_ptr<Constraint>> constraints;
+    
+    // Table statistics
+    unique_ptr<TableStatistics> table_statistics;
+    
+    // Concurrency control
+    shared_mutex table_lock;
+    atomic<idx_t> total_rows{0};
+    
+public:
+    DataTable(const vector<ColumnDefinition> &column_definitions,
+             const StorageConfiguration &config) 
+        : columns(column_definitions) {
+        
+        // Extract types
+        for (const auto &col : columns) {
+            types.push_back(col.type);
+        }
+        
+        // Initialize first row group
+        active_row_group = make_unique<RowGroup>(types);
+        
+        // Initialize table statistics
+        table_statistics = make_unique<TableStatistics>(types);
+    }
+    
+    void Append(DataChunk &chunk, transaction_t transaction_id) {
+        unique_lock<shared_mutex> lock(table_lock);
+        
+        idx_t remaining = chunk.size();
+        idx_t chunk_offset = 0;
+        
+        while (remaining > 0) {
+            // Check if current row group has space
+            auto available_space = RowGroup::ROW_GROUP_SIZE - active_row_group->GetRowCount();
+            
+            if (available_space == 0) {
+                // Finalize current row group and create new one
+                FinalizeRowGroup();
+                active_row_group = make_unique<RowGroup>(types);
+                available_space = RowGroup::ROW_GROUP_SIZE;
+            }
+            
+            // Append what we can to current row group
+            auto append_count = std::min(remaining, available_space);
+            
+            DataChunk append_chunk;
+            append_chunk.Initialize(types);
+            append_chunk.Slice(chunk, chunk_offset, append_count);
+            
+            active_row_group->Append(append_chunk, transaction_id);
+            
+            chunk_offset += append_count;
+            remaining -= append_count;
+            total_rows += append_count;
+        }
+        
+        // Update table statistics
+        table_statistics->Update(chunk);
+    }
+    
+    void Scan(TableScanState &state, DataChunk &result,
+             const vector<column_t> &column_ids, TableFilters *filters = nullptr) {
+        shared_lock<shared_mutex> lock(table_lock);
+        
+        while (state.row_group_index < row_groups.size()) {
+            auto &row_group = *row_groups[state.row_group_index];
+            
+            // Check if row group can be skipped using statistics
+            if (filters && CanSkipRowGroup(row_group, *filters)) {
+                state.row_group_index++;
+                state.row_index = 0;
+                continue;
+            }
+            
+            // Scan from current row group
+            ColumnScanState column_state;
+            column_state.row_index = state.row_index;
+            
+            row_group.Scan(column_state, result, column_ids);
+            
+            // Apply filters if provided
+            if (filters) {
+                ApplyFilters(result, *filters);
+            }
+            
+            // Update scan state
+            state.row_index = column_state.row_index;
+            
+            if (result.size() > 0) {
+                return; // Found data to return
+            }
+            
+            // Move to next row group if current is exhausted
+            if (state.row_index >= row_group.GetRowCount()) {
+                state.row_group_index++;
+                state.row_index = 0;
+            }
+        }
+        
+        // No more data
+        result.SetCardinality(0);
+    }
+    
+    // Index management
+    void CreateIndex(const string &index_name, const vector<column_t> &columns,
+                    IndexType index_type) {
+        unique_lock<shared_mutex> lock(table_lock);
+        
+        auto index = CreateIndexInstance(index_name, columns, index_type);
+        
+        // Build index from existing data
+        BuildIndexFromExistingData(*index);
+        
+        indexes.push_back(move(index));
+    }
+    
+    // Transaction support
+    void Delete(const vector<row_t> &row_ids, transaction_t transaction_id) {
+        unique_lock<shared_mutex> lock(table_lock);
+        
+        // Group deletions by row group for efficiency
+        unordered_map<idx_t, vector<row_t>> deletions_by_group;
+        
+        for (auto row_id : row_ids) {
+            auto row_group_idx = row_id / RowGroup::ROW_GROUP_SIZE;
+            auto local_row_id = row_id % RowGroup::ROW_GROUP_SIZE;
+            deletions_by_group[row_group_idx].push_back(local_row_id);
+        }
+        
+        // Apply deletions to each affected row group
+        for (auto &[group_idx, local_row_ids] : deletions_by_group) {
+            if (group_idx < row_groups.size()) {
+                row_groups[group_idx]->Delete(local_row_ids, transaction_id);
+            }
+        }
+    }
+    
+private:
+    void FinalizeRowGroup() {
+        // Compress the row group for optimal storage
+        active_row_group->Compress();
+        
+        // Add to completed row groups
+        row_groups.push_back(move(active_row_group));
+    }
+    
+    bool CanSkipRowGroup(const RowGroup &row_group, const TableFilters &filters) {
+        auto &row_group_stats = row_group.GetStatistics();
+        
+        for (const auto &[column_id, filter] : filters.filters) {
+            auto &column_stats = row_group_stats.GetColumnStatistics(column_id);
+            
+            if (!column_stats.CanSatisfyFilter(*filter)) {
+                return true; // Skip this row group
+            }
+        }
+        
+        return false;
+    }
+    
+    void ApplyFilters(DataChunk &chunk, const TableFilters &filters) {
+        SelectionVector selection(chunk.size());
+        idx_t selected_count = chunk.size();
+        
+        for (const auto &[column_id, filter] : filters.filters) {
+            selected_count = filter->ApplyFilter(chunk.data[column_id], selection, selected_count);
+            
+            if (selected_count == 0) {
+                break; // No rows pass filters
+            }
+        }
+        
+        if (selected_count < chunk.size()) {
+            chunk.Slice(selection, selected_count);
+        }
+    }
+};
+```
+
+### Storage Metadata and Statistics
+
+**Advanced Statistics Collection**
+DuckDB maintains comprehensive statistics at multiple levels to enable aggressive query optimization:
+
+```cpp
+class TableStatistics {
+private:
+    vector<unique_ptr<BaseStatistics>> column_statistics;
+    idx_t estimated_cardinality;
+    
+    // Advanced statistics
+    unique_ptr<HistogramStatistics> histogram_stats;
+    unique_ptr<CorrelationStatistics> correlation_stats;
+    
+public:
+    TableStatistics(const vector<LogicalType> &types) {
+        column_statistics.reserve(types.size());
+        for (const auto &type : types) {
+            column_statistics.push_back(BaseStatistics::CreateEmpty(type));
+        }
+        
+        estimated_cardinality = 0;
+        histogram_stats = make_unique<HistogramStatistics>();
+        correlation_stats = make_unique<CorrelationStatistics>();
+    }
+    
+    void Update(const DataChunk &chunk) {
+        estimated_cardinality += chunk.size();
+        
+        // Update column statistics
+        for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
+            column_statistics[i]->Update(chunk.data[i], chunk.size());
+        }
+        
+        // Update histograms for key columns
+        UpdateHistograms(chunk);
+        
+        // Update correlation statistics
+        UpdateCorrelations(chunk);
+    }
+    
+    const BaseStatistics& GetColumnStatistics(column_t column_id) const {
+        return *column_statistics[column_id];
+    }
+    
+    idx_t GetEstimatedCardinality() const {
+        return estimated_cardinality;
+    }
+    
+    // Query optimization support
+    double EstimateSelectivity(column_t column_id, const Value &value, 
+                             ComparisonType comparison) const {
+        auto &column_stats = *column_statistics[column_id];
+        
+        // Use histograms for better estimates when available
+        if (histogram_stats->HasHistogram(column_id)) {
+            return histogram_stats->EstimateSelectivity(column_id, value, comparison);
+        }
+        
+        // Fallback to basic statistics
+        return column_stats.EstimateSelectivity(value, comparison);
+    }
+    
+private:
+    void UpdateHistograms(const DataChunk &chunk) {
+        // Sample data for histogram construction
+        static const double SAMPLE_RATE = 0.01; // 1% sampling
+        
+        for (idx_t col_idx = 0; col_idx < chunk.ColumnCount(); col_idx++) {
+            if (ShouldMaintainHistogram(col_idx)) {
+                SampleColumnForHistogram(chunk.data[col_idx], col_idx);
+            }
+        }
+    }
+    
+    void UpdateCorrelations(const DataChunk &chunk) {
+        // Update pairwise correlation statistics
+        for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
+            for (idx_t j = i + 1; j < chunk.ColumnCount(); j++) {
+                correlation_stats->Update(chunk.data[i], chunk.data[j], i, j);
+            }
+        }
+    }
+    
+    bool ShouldMaintainHistogram(column_t column_id) {
+        // Maintain histograms for frequently filtered columns
+        // This would be determined by query pattern analysis
+        return true; // Simplified for this example
+    }
+};
+
+class NumericStatistics : public BaseStatistics {
+public:
+    Value min_value;
+    Value max_value;
+    idx_t null_count;
+    idx_t unique_count_estimate;
+    
+    void Update(Vector &data, idx_t count) override {
+        switch (data.type.id()) {
+            case LogicalTypeId::INTEGER:
+                UpdateNumeric<int32_t>(data, count);
+                break;
+            case LogicalTypeId::BIGINT:
+                UpdateNumeric<int64_t>(data, count);
+                break;
+            case LogicalTypeId::DOUBLE:
+                UpdateNumeric<double>(data, count);
+                break;
+        }
+    }
+    
+    bool CanSatisfyFilter(const TableFilter &filter) const override {
+        switch (filter.comparison_type) {
+            case ComparisonType::EQUAL_TO:
+                return CanHaveValue(filter.constant);
+            case ComparisonType::GREATER_THAN:
+                return max_value > filter.constant;
+            case ComparisonType::LESS_THAN:
+                return min_value < filter.constant;
+            case ComparisonType::GREATER_THAN_OR_EQUAL_TO:
+                return max_value >= filter.constant;
+            case ComparisonType::LESS_THAN_OR_EQUAL_TO:
+                return min_value <= filter.constant;
+            default:
+                return true; // Conservative approach
+        }
+    }
+    
+private:
+    template<typename T>
+    void UpdateNumeric(Vector &data, idx_t count) {
+        auto vector_data = FlatVector::GetData<T>(data);
+        
+        for (idx_t i = 0; i < count; i++) {
+            if (!data.validity.RowIsValid(i)) {
+                null_count++;
+                continue;
+            }
+            
+            Value current_value = Value::CreateValue(vector_data[i]);
+            
+            if (min_value.IsNull() || current_value < min_value) {
+                min_value = current_value;
+            }
+            
+            if (max_value.IsNull() || current_value > max_value) {
+                max_value = current_value;
+            }
+        }
+        
+        // Update cardinality estimate using HyperLogLog or similar
+        UpdateCardinalityEstimate(data, count);
+    }
+    
+    bool CanHaveValue(const Value &value) const {
+        return !min_value.IsNull() && !max_value.IsNull() &&
+               value >= min_value && value <= max_value;
+    }
+};
+```
+
+This sophisticated storage architecture provides the foundation for DuckDB's exceptional analytical performance. The combination of columnar organization, adaptive compression, intelligent statistics collection, and optimized data structures enables efficient processing of large analytical workloads while maintaining the operational simplicity that characterizes DuckDB's design philosophy.
+
+---
+
+# 4.2 Compression Techniques
+
+## 4.2.1 Adaptive Compression Framework
+
+### Intelligent Compression Selection
+
+**Automatic Compression Analysis**
+DuckDB implements a sophisticated compression framework that automatically analyzes data characteristics and selects optimal compression algorithms for each column segment. This approach maximizes storage efficiency while maintaining excellent query performance through efficient decompression:
+
+```cpp
+class CompressionAnalyzer {
+public:
+    struct CompressionCandidate {
+        CompressionType type;
+        double compression_ratio;
+        double decompression_speed;
+        double compression_cost;
+        idx_t memory_usage;
+        
+        double GetScore() const {
+            // Weighted scoring function balancing compression ratio, speed, and cost
+            return (compression_ratio * 0.4) + (decompression_speed * 0.4) + 
+                   (1.0 / compression_cost * 0.2);
+        }
+    };
+    
+    static CompressionType SelectOptimalCompression(const Vector &data, 
+                                                  const BaseStatistics &stats) {
+        vector<CompressionCandidate> candidates;
+        
+        // Analyze various compression options
+        AnalyzeConstantCompression(data, stats, candidates);
+        AnalyzeDictionaryCompression(data, stats, candidates);
+        AnalyzeRunLengthEncoding(data, stats, candidates);
+        AnalyzeBitPackingCompression(data, stats, candidates);
+        AnalyzeFrameOfReference(data, stats, candidates);
+        AnalyzeZStandardCompression(data, stats, candidates);
+        
+        // Select best candidate based on scoring
+        auto best_candidate = std::max_element(candidates.begin(), candidates.end(),
+            [](const CompressionCandidate &a, const CompressionCandidate &b) {
+                return a.GetScore() < b.GetScore();
+            });
+        
+        return best_candidate != candidates.end() ? 
+               best_candidate->type : CompressionType::UNCOMPRESSED;
+    }
+    
+private:
+    static void AnalyzeConstantCompression(const Vector &data, const BaseStatistics &stats,
+                                         vector<CompressionCandidate> &candidates) {
+        if (stats.GetType() == StatisticsType::NUMERIC_STATS) {
+            auto &numeric_stats = static_cast<const NumericStatistics&>(stats);
+            
+            if (numeric_stats.min_value == numeric_stats.max_value) {
+                CompressionCandidate candidate;
+                candidate.type = CompressionType::CONSTANT;
+                candidate.compression_ratio = 1000.0; // Extremely high compression
+                candidate.decompression_speed = 1000.0; // Instant decompression
+                candidate.compression_cost = 1.0; // Minimal cost
+                candidate.memory_usage = GetTypeSize(data.type.id());
+                
+                candidates.push_back(candidate);
+            }
+        }
+    }
+    
+    static void AnalyzeDictionaryCompression(const Vector &data, const BaseStatistics &stats,
+                                           vector<CompressionCandidate> &candidates) {
+        auto unique_count = stats.GetApproximateUniqueCount();
+        auto total_count = data.count;
+        
+        if (unique_count < total_count / 2) { // Good candidate for dictionary compression
+            CompressionCandidate candidate;
+            candidate.type = CompressionType::DICTIONARY;
+            
+            // Estimate compression ratio
+            auto value_size = GetTypeSize(data.type.id());
+            auto index_size = CalculateIndexSize(unique_count);
+            auto dictionary_size = unique_count * value_size;
+            auto compressed_size = dictionary_size + (total_count * index_size);
+            auto original_size = total_count * value_size;
+            
+            candidate.compression_ratio = static_cast<double>(original_size) / compressed_size;
+            candidate.decompression_speed = EstimateDictionaryDecompressionSpeed(index_size);
+            candidate.compression_cost = EstimateDictionaryCompressionCost(unique_count, total_count);
+            candidate.memory_usage = compressed_size;
+            
+            candidates.push_back(candidate);
+        }
+    }
+    
+    static void AnalyzeRunLengthEncoding(const Vector &data, const BaseStatistics &stats,
+                                       vector<CompressionCandidate> &candidates) {
+        auto run_count = EstimateRunCount(data);
+        
+        if (run_count < data.count / 3) { // Good RLE opportunity
+            CompressionCandidate candidate;
+            candidate.type = CompressionType::RLE;
+            
+            auto value_size = GetTypeSize(data.type.id());
+            auto run_entry_size = value_size + sizeof(uint32_t); // Value + count
+            auto compressed_size = run_count * run_entry_size;
+            auto original_size = data.count * value_size;
+            
+            candidate.compression_ratio = static_cast<double>(original_size) / compressed_size;
+            candidate.decompression_speed = EstimateRLEDecompressionSpeed(run_count);
+            candidate.compression_cost = EstimateRLECompressionCost(data.count);
+            candidate.memory_usage = compressed_size;
+            
+            candidates.push_back(candidate);
+        }
+    }
+    
+    static void AnalyzeBitPackingCompression(const Vector &data, const BaseStatistics &stats,
+                                           vector<CompressionCandidate> &candidates) {
+        if (data.type.id() == LogicalTypeId::INTEGER || data.type.id() == LogicalTypeId::BIGINT) {
+            auto &numeric_stats = static_cast<const NumericStatistics&>(stats);
+            auto value_range = numeric_stats.max_value.GetValue<int64_t>() - 
+                              numeric_stats.min_value.GetValue<int64_t>();
+            
+            auto required_bits = CalculateRequiredBits(value_range);
+            
+            if (required_bits < 32) { // Beneficial for 32-bit+ integers
+                CompressionCandidate candidate;
+                candidate.type = CompressionType::BITPACKING;
+                
+                auto original_bits = GetTypeSize(data.type.id()) * 8;
+                candidate.compression_ratio = static_cast<double>(original_bits) / required_bits;
+                candidate.decompression_speed = EstimateBitPackingDecompressionSpeed(required_bits);
+                candidate.compression_cost = EstimateBitPackingCompressionCost(data.count);
+                candidate.memory_usage = (data.count * required_bits + 7) / 8;
+                
+                candidates.push_back(candidate);
+            }
+        }
+    }
+};
+```
+
+### Compression Algorithm Implementations
+
+**Dictionary Compression**
+Dictionary compression provides excellent results for columns with low cardinality:
+
+```cpp
+class DictionaryCompression {
+public:
+    struct DictionaryHeader {
+        uint32_t dictionary_size;
+        uint32_t index_width; // 1, 2, or 4 bytes
+        CompressionType value_compression; // Compression for dictionary values
+    };
+    
+    template<typename T>
+    static unique_ptr<CompressedSegment> Compress(const T* data, idx_t count,
+                                                 const ValidityMask &validity) {
+        // Build dictionary
+        unordered_map<T, uint32_t> value_to_index;
+        vector<T> dictionary;
+        vector<uint32_t> indices;
+        indices.reserve(count);
+        
+        // Create dictionary and encode indices
+        for (idx_t i = 0; i < count; i++) {
+            if (!validity.RowIsValid(i)) {
+                indices.push_back(INVALID_INDEX);
+                continue;
+            }
+            
+            auto it = value_to_index.find(data[i]);
+            if (it == value_to_index.end()) {
+                // New unique value
+                uint32_t index = dictionary.size();
+                dictionary.push_back(data[i]);
+                value_to_index[data[i]] = index;
+                indices.push_back(index);
+            } else {
+                indices.push_back(it->second);
+            }
+        }
+        
+        // Determine optimal index width
+        uint8_t index_width = CalculateIndexWidth(dictionary.size());
+        
+        // Create compressed segment
+        auto segment = make_unique<DictionaryCompressedSegment<T>>();
+        segment->dictionary = move(dictionary);
+        segment->indices = CompressIndices(indices, index_width);
+        segment->index_width = index_width;
+        segment->count = count;
+        
+        return move(segment);
+    }
+    
+    template<typename T>
+    static void Decompress(const DictionaryCompressedSegment<T> &segment,
+                          idx_t offset, idx_t scan_count, Vector &result) {
+        auto result_data = FlatVector::GetData<T>(result);
+        
+        // Decompress indices
+        vector<uint32_t> indices;
+        DecompressIndices(segment.indices, segment.index_width, offset, scan_count, indices);
+        
+        // Lookup values in dictionary
+        for (idx_t i = 0; i < scan_count; i++) {
+            auto index = indices[i];
+            if (index == INVALID_INDEX) {
+                result.validity.SetInvalid(i);
+            } else {
+                result_data[i] = segment.dictionary[index];
+                result.validity.SetValid(i);
+            }
+        }
+    }
+    
+private:
+    static uint8_t CalculateIndexWidth(idx_t dictionary_size) {
+        if (dictionary_size <= 256) return 1;
+        if (dictionary_size <= 65536) return 2;
+        return 4;
+    }
+    
+    static vector<uint8_t> CompressIndices(const vector<uint32_t> &indices, uint8_t width) {
+        vector<uint8_t> compressed;
+        compressed.reserve(indices.size() * width);
+        
+        for (auto index : indices) {
+            for (uint8_t byte = 0; byte < width; byte++) {
+                compressed.push_back(static_cast<uint8_t>(index >> (byte * 8)));
+            }
+        }
+        
+        return compressed;
+    }
+    
+    static void DecompressIndices(const vector<uint8_t> &compressed, uint8_t width,
+                                 idx_t offset, idx_t count, vector<uint32_t> &indices) {
+        indices.resize(count);
+        
+        for (idx_t i = 0; i < count; i++) {
+            uint32_t index = 0;
+            idx_t base_offset = (offset + i) * width;
+            
+            for (uint8_t byte = 0; byte < width; byte++) {
+                index |= static_cast<uint32_t>(compressed[base_offset + byte]) << (byte * 8);
+            }
+            
+            indices[i] = index;
+        }
+    }
+};
+```
+
+**Run-Length Encoding (RLE)**
+RLE provides excellent compression for data with repeated values:
+
+```cpp
+class RunLengthEncoding {
+public:
+    template<typename T>
+    struct RLEEntry {
+        T value;
+        uint32_t count;
+        bool is_null;
+    };
+    
+    template<typename T>
+    static unique_ptr<CompressedSegment> Compress(const T* data, idx_t count,
+                                                 const ValidityMask &validity) {
+        vector<RLEEntry<T>> runs;
+        
+        if (count == 0) {
+            return make_unique<RLECompressedSegment<T>>(move(runs), 0);
+        }
+        
+        // Create initial run
+        RLEEntry<T> current_run;
+        current_run.is_null = !validity.RowIsValid(0);
+        current_run.value = current_run.is_null ? T{} : data[0];
+        current_run.count = 1;
+        
+        // Process remaining values
+        for (idx_t i = 1; i < count; i++) {
+            bool is_null = !validity.RowIsValid(i);
+            T value = is_null ? T{} : data[i];
+            
+            if ((is_null == current_run.is_null) &&
+                (is_null || value == current_run.value)) {
+                // Extend current run
+                current_run.count++;
+            } else {
+                // Finalize current run and start new one
+                runs.push_back(current_run);
+                current_run.is_null = is_null;
+                current_run.value = value;
+                current_run.count = 1;
+            }
+        }
+        
+        // Add final run
+        runs.push_back(current_run);
+        
+        return make_unique<RLECompressedSegment<T>>(move(runs), count);
+    }
+    
+    template<typename T>
+    static void Decompress(const RLECompressedSegment<T> &segment,
+                          idx_t offset, idx_t scan_count, Vector &result) {
+        auto result_data = FlatVector::GetData<T>(result);
+        
+        // Find starting run
+        idx_t current_position = 0;
+        idx_t run_index = 0;
+        
+        while (run_index < segment.runs.size() && 
+               current_position + segment.runs[run_index].count <= offset) {
+            current_position += segment.runs[run_index].count;
+            run_index++;
+        }
+        
+        // Decompress data
+        idx_t result_offset = 0;
+        idx_t remaining = scan_count;
+        idx_t position_in_run = offset - current_position;
+        
+        while (remaining > 0 && run_index < segment.runs.size()) {
+            auto &run = segment.runs[run_index];
+            auto available_in_run = run.count - position_in_run;
+            auto copy_count = std::min(remaining, available_in_run);
+            
+            // Fill result with run value
+            if (run.is_null) {
+                for (idx_t i = 0; i < copy_count; i++) {
+                    result.validity.SetInvalid(result_offset + i);
+                }
+            } else {
+                for (idx_t i = 0; i < copy_count; i++) {
+                    result_data[result_offset + i] = run.value;
+                    result.validity.SetValid(result_offset + i);
+                }
+            }
+            
+            result_offset += copy_count;
+            remaining -= copy_count;
+            position_in_run = 0; // Reset for next run
+            run_index++;
+        }
+    }
+};
+```
+
+**Bit Packing Compression**
+Bit packing optimizes storage for integers that don't require their full bit width:
+
+```cpp
+class BitPackingCompression {
+public:
+    static unique_ptr<CompressedSegment> Compress(const int32_t* data, idx_t count,
+                                                 const ValidityMask &validity,
+                                                 int32_t min_value, int32_t max_value) {
+        auto value_range = static_cast<uint64_t>(max_value) - static_cast<uint64_t>(min_value);
+        auto required_bits = CalculateRequiredBits(value_range);
+        
+        // Create bit-packed data
+        auto packed_data = BitPackValues(data, count, validity, min_value, required_bits);
+        
+        auto segment = make_unique<BitPackedSegment>();
+        segment->packed_data = move(packed_data);
+        segment->min_value = min_value;
+        segment->required_bits = required_bits;
+        segment->count = count;
+        
+        return move(segment);
+    }
+    
+    static void Decompress(const BitPackedSegment &segment, idx_t offset, 
+                          idx_t scan_count, Vector &result) {
+        auto result_data = FlatVector::GetData<int32_t>(result);
+        
+        // Unpack values using SIMD when possible
+        if (segment.required_bits == 8) {
+            UnpackValues8Bit(segment, offset, scan_count, result_data);
+        } else if (segment.required_bits == 16) {
+            UnpackValues16Bit(segment, offset, scan_count, result_data);
+        } else {
+            UnpackValuesGeneric(segment, offset, scan_count, result_data);
+        }
+        
+        // Add base value back
+        for (idx_t i = 0; i < scan_count; i++) {
+            result_data[i] += segment.min_value;
+            result.validity.SetValid(i);
+        }
+    }
+    
+private:
+    static vector<uint8_t> BitPackValues(const int32_t* data, idx_t count,
+                                        const ValidityMask &validity,
+                                        int32_t min_value, uint8_t required_bits) {
+        auto total_bits = count * required_bits;
+        auto byte_count = (total_bits + 7) / 8;
+        vector<uint8_t> packed_data(byte_count, 0);
+        
+        for (idx_t i = 0; i < count; i++) {
+            if (!validity.RowIsValid(i)) continue;
+            
+            auto normalized_value = static_cast<uint32_t>(data[i] - min_value);
+            PackBits(packed_data, i * required_bits, normalized_value, required_bits);
+        }
+        
+        return packed_data;
+    }
+    
+    static void PackBits(vector<uint8_t> &data, idx_t bit_offset, 
+                        uint32_t value, uint8_t bit_count) {
+        for (uint8_t bit = 0; bit < bit_count; bit++) {
+            auto target_bit = bit_offset + bit;
+            auto byte_index = target_bit / 8;
+            auto bit_index = target_bit % 8;
+            
+            if (value & (1u << bit)) {
+                data[byte_index] |= (1u << bit_index);
+            }
+        }
+    }
+    
+    static void UnpackValues8Bit(const BitPackedSegment &segment, idx_t offset,
+                                idx_t scan_count, int32_t* result) {
+        // Optimized unpacking for 8-bit values
+        auto data_ptr = segment.packed_data.data() + offset;
+        
+        for (idx_t i = 0; i < scan_count; i++) {
+            result[i] = static_cast<int32_t>(data_ptr[i]);
+        }
+    }
+    
+    static void UnpackValues16Bit(const BitPackedSegment &segment, idx_t offset,
+                                 idx_t scan_count, int32_t* result) {
+        // Optimized unpacking for 16-bit values with SIMD
+        auto data_ptr = reinterpret_cast<const uint16_t*>(segment.packed_data.data()) + offset;
+        
+        // Use SIMD to unpack multiple values at once
+        for (idx_t i = 0; i < scan_count; i++) {
+            result[i] = static_cast<int32_t>(data_ptr[i]);
+        }
+    }
+    
+    static uint8_t CalculateRequiredBits(uint64_t value_range) {
+        if (value_range == 0) return 1;
+        return 64 - __builtin_clzll(value_range);
+    }
+};
+```
+
+## 4.2.2 Frame-of-Reference Compression
+
+**FOR Encoding Implementation**
+Frame-of-Reference (FOR) encoding is particularly effective for sorted or near-sorted integer sequences:
+
+```cpp
+class FrameOfReferenceCompression {
+public:
+    struct FORHeader {
+        int64_t reference_value;
+        uint8_t exception_count;
+        uint8_t bits_per_value;
+        uint32_t block_size;
+    };
+    
+    static unique_ptr<CompressedSegment> Compress(const int64_t* data, idx_t count,
+                                                 const ValidityMask &validity) {
+        constexpr idx_t BLOCK_SIZE = 128; // Process in blocks for better compression
+        
+        vector<FORBlock> blocks;
+        
+        for (idx_t block_start = 0; block_start < count; block_start += BLOCK_SIZE) {
+            idx_t block_end = std::min(block_start + BLOCK_SIZE, count);
+            auto block = CompressBlock(data + block_start, block_end - block_start, 
+                                     validity, block_start);
+            blocks.push_back(move(block));
+        }
+        
+        return make_unique<FORCompressedSegment>(move(blocks), count);
+    }
+    
+    static void Decompress(const FORCompressedSegment &segment, idx_t offset,
+                          idx_t scan_count, Vector &result) {
+        auto result_data = FlatVector::GetData<int64_t>(result);
+        
+        // Find starting block
+        idx_t current_position = 0;
+        idx_t block_index = 0;
+        
+        while (block_index < segment.blocks.size()) {
+            auto &block = segment.blocks[block_index];
+            if (current_position + block.count > offset) {
+                break; // Found starting block
+            }
+            current_position += block.count;
+            block_index++;
+        }
+        
+        // Decompress data
+        idx_t result_offset = 0;
+        idx_t remaining = scan_count;
+        
+        while (remaining > 0 && block_index < segment.blocks.size()) {
+            auto &block = segment.blocks[block_index];
+            auto position_in_block = (block_index == 0) ? offset - current_position : 0;
+            auto available_in_block = block.count - position_in_block;
+            auto copy_count = std::min(remaining, available_in_block);
+            
+            DecompressBlock(block, position_in_block, copy_count, 
+                          result_data + result_offset, result.validity, result_offset);
+            
+            result_offset += copy_count;
+            remaining -= copy_count;
+            current_position += block.count;
+            block_index++;
+        }
+    }
+    
+private:
+    struct FORBlock {
+        int64_t reference_value;
+        vector<uint32_t> deltas;
+        vector<pair<uint8_t, int64_t>> exceptions; // Position, original value
+        uint8_t bits_per_delta;
+        idx_t count;
+    };
+    
+    static FORBlock CompressBlock(const int64_t* data, idx_t count,
+                                 const ValidityMask &validity, idx_t base_offset) {
+        FORBlock block;
+        block.count = count;
+        
+        // Find reference value (minimum for best compression)
+        int64_t min_value = INT64_MAX;
+        for (idx_t i = 0; i < count; i++) {
+            if (validity.RowIsValid(base_offset + i)) {
+                min_value = std::min(min_value, data[i]);
+            }
+        }
+        block.reference_value = min_value;
+        
+        // Calculate deltas and identify exceptions
+        vector<uint64_t> deltas;
+        deltas.reserve(count);
+        
+        uint64_t max_delta = 0;
+        for (idx_t i = 0; i < count; i++) {
+            if (!validity.RowIsValid(base_offset + i)) {
+                deltas.push_back(0); // Placeholder for NULL
+                continue;
+            }
+            
+            auto delta = static_cast<uint64_t>(data[i] - min_value);
+            deltas.push_back(delta);
+            max_delta = std::max(max_delta, delta);
+        }
+        
+        // Determine bits per delta
+        block.bits_per_delta = CalculateRequiredBits(max_delta);
+        
+        // Check for exceptions (values requiring more bits)
+        const uint8_t MAX_BITS_WITHOUT_EXCEPTIONS = 16;
+        if (block.bits_per_delta > MAX_BITS_WITHOUT_EXCEPTIONS) {
+            HandleExceptions(deltas, block, data, validity, base_offset);
+        }
+        
+        // Pack deltas
+        block.deltas = PackDeltas(deltas, block.bits_per_delta);
+        
+        return block;
+    }
+    
+    static void HandleExceptions(vector<uint64_t> &deltas, FORBlock &block,
+                               const int64_t* original_data, const ValidityMask &validity,
+                               idx_t base_offset) {
+        // Find outliers that require many bits
+        uint64_t threshold = (1ULL << 16) - 1; // 16-bit threshold
+        
+        for (idx_t i = 0; i < deltas.size(); i++) {
+            if (deltas[i] > threshold && validity.RowIsValid(base_offset + i)) {
+                // Store as exception
+                block.exceptions.emplace_back(static_cast<uint8_t>(i), original_data[i]);
+                deltas[i] = threshold; // Use max representable value as marker
+            }
+        }
+        
+        block.bits_per_delta = 16; // Fixed size after exception handling
+    }
+    
+    static void DecompressBlock(const FORBlock &block, idx_t offset, idx_t count,
+                              int64_t* result, ValidityMask &validity, idx_t result_base) {
+        // Unpack deltas
+        auto deltas = UnpackDeltas(block.deltas, block.bits_per_delta, offset, count);
+        
+        // Apply reference value and handle exceptions
+        unordered_map<uint8_t, int64_t> exception_map;
+        for (const auto &[pos, value] : block.exceptions) {
+            if (pos >= offset && pos < offset + count) {
+                exception_map[pos - offset] = value;
+            }
+        }
+        
+        for (idx_t i = 0; i < count; i++) {
+            auto it = exception_map.find(static_cast<uint8_t>(i));
+            if (it != exception_map.end()) {
+                result[i] = it->second; // Use exception value
+            } else {
+                result[i] = block.reference_value + static_cast<int64_t>(deltas[i]);
+            }
+            validity.SetValid(result_base + i);
+        }
+    }
+};
+```
+
+## 4.2.3 String Compression
+
+**Advanced String Compression**
+String columns receive specialized compression treatments based on their characteristics:
+
+```cpp
+class StringCompression {
+public:
+    static unique_ptr<CompressedSegment> Compress(const string_t* data, idx_t count,
+                                                 const ValidityMask &validity) {
+        // Analyze string characteristics
+        auto analysis = AnalyzeStringData(data, count, validity);
+        
+        if (analysis.is_sorted && analysis.has_common_prefixes) {
+            return CompressWithPrefixCompression(data, count, validity, analysis);
+        } else if (analysis.unique_count < count / 4) {
+            return CompressWithDictionary(data, count, validity);
+        } else {
+            return CompressWithGeneralPurpose(data, count, validity);
+        }
+    }
+    
+private:
+    struct StringAnalysis {
+        bool is_sorted = false;
+        bool has_common_prefixes = false;
+        idx_t unique_count = 0;
+        idx_t total_length = 0;
+        idx_t max_length = 0;
+        idx_t common_prefix_length = 0;
+    };
+    
+    static StringAnalysis AnalyzeStringData(const string_t* data, idx_t count,
+                                          const ValidityMask &validity) {
+        StringAnalysis analysis;
+        unordered_set<string> unique_strings;
+        
+        string previous_string;
+        bool first_valid = true;
+        
+        for (idx_t i = 0; i < count; i++) {
+            if (!validity.RowIsValid(i)) continue;
+            
+            auto current_string = data[i].GetString();
+            unique_strings.insert(current_string);
+            
+            analysis.total_length += current_string.length();
+            analysis.max_length = std::max(analysis.max_length, current_string.length());
+            
+            if (first_valid) {
+                previous_string = current_string;
+                first_valid = false;
+            } else {
+                if (!analysis.is_sorted && current_string < previous_string) {
+                    // Check if it's sorted
+                }
+                previous_string = current_string;
+            }
+        }
+        
+        analysis.unique_count = unique_strings.size();
+        
+        // Check for common prefixes
+        if (analysis.unique_count > 1) {
+            analysis.common_prefix_length = FindCommonPrefixLength(unique_strings);
+            analysis.has_common_prefixes = analysis.common_prefix_length > 2;
+        }
+        
+        return analysis;
+    }
+    
+    static unique_ptr<CompressedSegment> CompressWithPrefixCompression(
+            const string_t* data, idx_t count, const ValidityMask &validity,
+            const StringAnalysis &analysis) {
+        
+        // Extract common prefix
+        string common_prefix = ExtractCommonPrefix(data, count, validity, 
+                                                 analysis.common_prefix_length);
+        
+        // Compress suffixes
+        vector<string> suffixes;
+        suffixes.reserve(count);
+        
+        for (idx_t i = 0; i < count; i++) {
+            if (!validity.RowIsValid(i)) {
+                suffixes.emplace_back();
+                continue;
+            }
+            
+            auto full_string = data[i].GetString();
+            if (full_string.length() >= common_prefix.length()) {
+                suffixes.push_back(full_string.substr(common_prefix.length()));
+            } else {
+                suffixes.push_back(full_string);
+            }
+        }
+        
+        // Apply secondary compression to suffixes
+        auto compressed_suffixes = CompressSuffixes(suffixes);
+        
+        auto segment = make_unique<PrefixCompressedStringSegment>();
+        segment->common_prefix = move(common_prefix);
+        segment->compressed_suffixes = move(compressed_suffixes);
+        segment->count = count;
+        
+        return move(segment);
+    }
+    
+    static unique_ptr<CompressedSegment> CompressWithDictionary(
+            const string_t* data, idx_t count, const ValidityMask &validity) {
+        
+        // Build dictionary
+        unordered_map<string, uint32_t> string_to_index;
+        vector<string> dictionary;
+        vector<uint32_t> indices;
+        indices.reserve(count);
+        
+        for (idx_t i = 0; i < count; i++) {
+            if (!validity.RowIsValid(i)) {
+                indices.push_back(INVALID_INDEX);
+                continue;
+            }
+            
+            auto str = data[i].GetString();
+            auto it = string_to_index.find(str);
+            
+            if (it == string_to_index.end()) {
+                uint32_t index = dictionary.size();
+                dictionary.push_back(str);
+                string_to_index[str] = index;
+                indices.push_back(index);
+            } else {
+                indices.push_back(it->second);
+            }
+        }
+        
+        // Compress dictionary strings
+        auto compressed_dictionary = CompressStringArray(dictionary);
+        
+        // Determine optimal index width
+        auto index_width = CalculateIndexWidth(dictionary.size());
+        auto compressed_indices = CompressIndices(indices, index_width);
+        
+        auto segment = make_unique<DictionaryStringSegment>();
+        segment->dictionary = move(compressed_dictionary);
+        segment->indices = move(compressed_indices);
+        segment->index_width = index_width;
+        segment->count = count;
+        
+        return move(segment);
+    }
+    
+    static vector<uint8_t> CompressStringArray(const vector<string> &strings) {
+        // Use general purpose compression (LZ4 or ZSTD) for string arrays
+        string concatenated;
+        vector<uint32_t> offsets;
+        offsets.reserve(strings.size() + 1);
+        
+        offsets.push_back(0);
+        for (const auto &str : strings) {
+            concatenated += str;
+            offsets.push_back(concatenated.length());
+        }
+        
+        // Compress the concatenated string
+        auto compressed_data = CompressData(concatenated);
+        auto compressed_offsets = CompressData(reinterpret_cast<const char*>(offsets.data()),
+                                             offsets.size() * sizeof(uint32_t));
+        
+        // Combine compressed data and offsets
+        vector<uint8_t> result;
+        result.reserve(compressed_data.size() + compressed_offsets.size() + 8);
+        
+        // Write sizes
+        uint32_t data_size = compressed_data.size();
+        uint32_t offsets_size = compressed_offsets.size();
+        result.insert(result.end(), reinterpret_cast<uint8_t*>(&data_size),
+                     reinterpret_cast<uint8_t*>(&data_size) + 4);
+        result.insert(result.end(), reinterpret_cast<uint8_t*>(&offsets_size),
+                     reinterpret_cast<uint8_t*>(&offsets_size) + 4);
+        
+        // Write compressed data
+        result.insert(result.end(), compressed_data.begin(), compressed_data.end());
+        result.insert(result.end(), compressed_offsets.begin(), compressed_offsets.end());
+        
+        return result;
+    }
+};
+```
+
+This comprehensive compression framework enables DuckDB to achieve exceptional storage efficiency while maintaining fast decompression speeds essential for analytical query performance. The adaptive selection of compression algorithms ensures optimal results across diverse data patterns and workload characteristics.
+
+---
