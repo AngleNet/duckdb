@@ -16090,6 +16090,659 @@ private:
         indexes.push_back(move(index));
     }
     
+    unique_ptr<Index> CreateIndexInstance(const string &index_name, 
+                                        const vector<column_t> &columns,
+                                        IndexType index_type) {
+        switch (index_type) {
+            case IndexType::BTREE:
+                return make_unique<BTreeIndex>(index_name, columns, types);
+            case IndexType::HASH:
+                return make_unique<HashIndex>(index_name, columns, types);
+            case IndexType::BITMAP:
+                return make_unique<BitmapIndex>(index_name, columns, types);
+            default:
+                throw NotImplementedException("Index type not implemented");
+        }
+    }
+};
+
+---
+
+## B3: Advanced Index Structure Implementation
+
+**Sophisticated Multi-Index Architecture**
+DuckDB implements an advanced indexing system that provides exceptional query performance through intelligent index selection, adaptive optimization, and specialized analytical index structures:
+
+```cpp
+// Comprehensive indexing framework with adaptive optimization and analytical specializations
+class AdvancedIndexingFramework {
+private:
+    // Core index management
+    unique_ptr<IndexManager> index_manager;
+    unique_ptr<IndexOptimizer> index_optimizer;
+    unique_ptr<IndexPerformanceProfiler> index_profiler;
+    
+    // Specialized index types
+    unique_ptr<AdaptiveBTreeIndexEngine> btree_engine;
+    unique_ptr<AdvancedHashIndexEngine> hash_engine;
+    unique_ptr<ColumnStoreIndexEngine> columnstore_engine;
+    
+    // Analytical index structures
+    unique_ptr<ZoneMapIndexManager> zonemap_manager;
+    unique_ptr<BloomFilterIndexEngine> bloomfilter_engine;
+    unique_ptr<BitmapIndexEngine> bitmap_engine;
+    
+    // Performance optimization
+    unique_ptr<IndexCacheManager> cache_manager;
+    unique_ptr<ParallelIndexProcessor> parallel_processor;
+    unique_ptr<AdaptiveIndexTuner> adaptive_tuner;
+    
+    // Configuration and statistics
+    IndexingFrameworkConfig config;
+    atomic<uint64_t> total_index_operations{0};
+    atomic<uint64_t> total_cache_hits{0};
+
+public:
+    AdvancedIndexingFramework() {
+        index_manager = make_unique<IndexManager>();
+        index_optimizer = make_unique<IndexOptimizer>();
+        index_profiler = make_unique<IndexPerformanceProfiler>();
+        btree_engine = make_unique<AdaptiveBTreeIndexEngine>();
+        hash_engine = make_unique<AdvancedHashIndexEngine>();
+        columnstore_engine = make_unique<ColumnStoreIndexEngine>();
+        zonemap_manager = make_unique<ZoneMapIndexManager>();
+        bloomfilter_engine = make_unique<BloomFilterIndexEngine>();
+        bitmap_engine = make_unique<BitmapIndexEngine>();
+        cache_manager = make_unique<IndexCacheManager>();
+        parallel_processor = make_unique<ParallelIndexProcessor>();
+        adaptive_tuner = make_unique<AdaptiveIndexTuner>();
+        
+        InitializeIndexingFramework();
+    }
+    
+    // Primary indexing interface
+    IndexCreationResult CreateOptimalIndex(const IndexCreationRequest &request,
+                                          const AnalyticalContext &context) {
+        auto start_time = chrono::high_resolution_clock::now();
+        
+        try {
+            // Phase 1: Analyze optimal index strategy
+            auto index_analysis = AnalyzeIndexingOpportunity(request, context);
+            
+            // Phase 2: Select optimal index type and configuration
+            auto index_strategy = SelectOptimalIndexStrategy(index_analysis);
+            
+            // Phase 3: Create index with parallel optimization
+            auto index_result = CreateIndexWithOptimization(request, index_strategy, context);
+            
+            // Phase 4: Integrate with query optimization framework
+            auto integration_result = IntegrateWithQueryOptimizer(index_result, context);
+            
+            auto end_time = chrono::high_resolution_clock::now();
+            auto duration = chrono::duration_cast<chrono::microseconds>(end_time - start_time);
+            
+            index_profiler->RecordIndexCreation(request.table_id, request.column_ids,
+                                              index_strategy.index_type, duration.count());
+            
+            return integration_result;
+            
+        } catch (const IndexingException &e) {
+            return HandleIndexingError(e, request, context);
+        }
+    }
+
+private:
+    void InitializeIndexingFramework() {
+        // Configure index management for analytical workloads
+        ConfigureIndexManagement();
+        
+        // Initialize specialized index engines
+        InitializeIndexEngines();
+        
+        // Setup performance optimization
+        SetupIndexOptimization();
+        
+        // Configure adaptive tuning
+        ConfigureAdaptiveTuning();
+    }
+    
+    void ConfigureIndexManagement() {
+        // Configure for analytical query patterns
+        config.default_btree_fanout = 512;      // Larger fanout for analytics
+        config.hash_index_load_factor = 0.75;
+        config.enable_parallel_construction = true;
+        config.enable_adaptive_optimization = true;
+        config.cache_size = 256 * 1024 * 1024;  // 256MB index cache
+        config.enable_zone_maps = true;
+        config.enable_bloom_filters = true;
+        config.enable_bitmap_indexes = true;
+    }
+    
+    IndexAnalysis AnalyzeIndexingOpportunity(const IndexCreationRequest &request,
+                                           const AnalyticalContext &context) {
+        IndexAnalysis analysis;
+        
+        // Analyze data characteristics
+        analysis.data_characteristics = AnalyzeDataCharacteristics(request.table_id, request.column_ids);
+        analysis.cardinality_analysis = AnalyzeCardinality(request.table_id, request.column_ids);
+        analysis.distribution_analysis = AnalyzeDistribution(request.table_id, request.column_ids);
+        
+        // Analyze query patterns
+        analysis.access_patterns = AnalyzeAccessPatterns(request.table_id, request.column_ids, context);
+        analysis.selectivity_patterns = AnalyzeSelectivityPatterns(request.table_id, request.column_ids, context);
+        analysis.join_patterns = AnalyzeJoinPatterns(request.table_id, request.column_ids, context);
+        
+        // Analyze performance requirements
+        analysis.performance_requirements = AnalyzePerformanceRequirements(request, context);
+        analysis.memory_constraints = AnalyzeMemoryConstraints(request, context);
+        
+        // Calculate index benefits
+        analysis.estimated_benefit = EstimateIndexBenefit(analysis, context);
+        
+        return analysis;
+    }
+    
+    IndexStrategy SelectOptimalIndexStrategy(const IndexAnalysis &analysis) {
+        IndexStrategy strategy;
+        
+        // Use sophisticated decision tree for index type selection
+        strategy.primary_index_type = SelectPrimaryIndexType(analysis);
+        strategy.secondary_optimizations = SelectSecondaryOptimizations(analysis);
+        
+        // Configure index-specific parameters
+        strategy = ConfigureIndexParameters(strategy, analysis);
+        
+        // Determine parallel construction strategy
+        strategy.parallel_construction = DetermineParallelConstruction(analysis);
+        
+        return strategy;
+    }
+    
+    IndexType SelectPrimaryIndexType(const IndexAnalysis &analysis) {
+        // Advanced decision logic for index type selection
+        
+        // Factor 1: Data cardinality and distribution
+        auto cardinality_score = CalculateCardinalityScore(analysis.cardinality_analysis);
+        
+        // Factor 2: Access pattern analysis
+        auto access_pattern_score = CalculateAccessPatternScore(analysis.access_patterns);
+        
+        // Factor 3: Query selectivity analysis
+        auto selectivity_score = CalculateSelectivityScore(analysis.selectivity_patterns);
+        
+        // Factor 4: Performance requirements
+        auto performance_score = CalculatePerformanceRequirementsScore(analysis.performance_requirements);
+        
+        // Weighted decision matrix
+        IndexTypeSelector selector;
+        selector.AddFactor(IndexType::ADAPTIVE_BTREE, cardinality_score.btree_suitability * 0.25);
+        selector.AddFactor(IndexType::ADVANCED_HASH, cardinality_score.hash_suitability * 0.25);
+        selector.AddFactor(IndexType::BITMAP_INDEX, cardinality_score.bitmap_suitability * 0.25);
+        selector.AddFactor(IndexType::COLUMNSTORE_INDEX, access_pattern_score.columnar_suitability * 0.25);
+        
+        return selector.SelectOptimalType();
+    }
+    
+    IndexCreationResult CreateIndexWithOptimization(const IndexCreationRequest &request,
+                                                   const IndexStrategy &strategy,
+                                                   const AnalyticalContext &context) {
+        IndexCreationResult result;
+        
+        switch (strategy.primary_index_type) {
+            case IndexType::ADAPTIVE_BTREE:
+                result = CreateAdaptiveBTreeIndex(request, strategy, context);
+                break;
+            case IndexType::ADVANCED_HASH:
+                result = CreateAdvancedHashIndex(request, strategy, context);
+                break;
+            case IndexType::BITMAP_INDEX:
+                result = CreateBitmapIndex(request, strategy, context);
+                break;
+            case IndexType::COLUMNSTORE_INDEX:
+                result = CreateColumnStoreIndex(request, strategy, context);
+                break;
+        }
+        
+        // Apply secondary optimizations
+        result = ApplySecondaryOptimizations(result, strategy, context);
+        
+        return result;
+    }
+};
+
+// Adaptive B-Tree index with analytical optimizations
+class AdaptiveBTreeIndexEngine {
+public:
+    IndexCreationResult CreateAdaptiveBTreeIndex(const IndexCreationRequest &request,
+                                                const IndexStrategy &strategy,
+                                                const AnalyticalContext &context) {
+        IndexCreationResult result;
+        
+        // Analyze optimal B-Tree configuration
+        auto btree_config = AnalyzeOptimalBTreeConfiguration(request, strategy);
+        
+        // Create adaptive B-Tree structure
+        auto btree_index = CreateAdaptiveBTreeStructure(btree_config);
+        
+        // Build index with parallel optimization
+        auto build_result = BuildIndexWithParallelOptimization(btree_index.get(), request, context);
+        
+        // Configure adaptive optimization
+        ConfigureAdaptiveOptimization(btree_index.get(), strategy);
+        
+        result.index = move(btree_index);
+        result.build_statistics = build_result;
+        result.index_type = IndexType::ADAPTIVE_BTREE;
+        
+        return result;
+    }
+
+private:
+    BTreeConfiguration AnalyzeOptimalBTreeConfiguration(const IndexCreationRequest &request,
+                                                       const IndexStrategy &strategy) {
+        BTreeConfiguration config;
+        
+        // Analyze data characteristics for optimal fanout
+        auto data_analysis = AnalyzeIndexData(request.table_id, request.column_ids);
+        
+        // Calculate optimal fanout based on cache efficiency
+        config.fanout = CalculateOptimalFanout(data_analysis);
+        
+        // Configure node splitting strategy
+        config.split_strategy = SelectSplitStrategy(data_analysis, strategy);
+        
+        // Configure cache optimization
+        config.cache_optimization = ConfigureCacheOptimization(data_analysis);
+        
+        // Configure analytical optimizations
+        config.enable_bulk_loading = true;
+        config.enable_parallel_construction = strategy.parallel_construction.enabled;
+        config.enable_compression = ShouldEnableCompression(data_analysis);
+        config.enable_prefix_compression = ShouldEnablePrefixCompression(data_analysis);
+        
+        return config;
+    }
+    
+    unique_ptr<AdaptiveBTreeIndex> CreateAdaptiveBTreeStructure(const BTreeConfiguration &config) {
+        auto btree = make_unique<AdaptiveBTreeIndex>();
+        
+        // Configure adaptive characteristics
+        btree->SetFanout(config.fanout);
+        btree->SetSplitStrategy(config.split_strategy);
+        btree->EnableCacheOptimization(config.cache_optimization);
+        
+        // Configure analytical optimizations
+        if (config.enable_compression) {
+            btree->EnableCompression();
+        }
+        
+        if (config.enable_prefix_compression) {
+            btree->EnablePrefixCompression();
+        }
+        
+        // Configure adaptive behavior
+        btree->EnableAdaptiveRebalancing();
+        btree->EnablePerformanceMonitoring();
+        
+        return btree;
+    }
+    
+    BuildStatistics BuildIndexWithParallelOptimization(AdaptiveBTreeIndex *btree,
+                                                      const IndexCreationRequest &request,
+                                                      const AnalyticalContext &context) {
+        BuildStatistics stats;
+        auto start_time = chrono::high_resolution_clock::now();
+        
+        // Determine parallel construction strategy
+        auto parallel_strategy = DetermineParallelConstructionStrategy(request, context);
+        
+        if (parallel_strategy.use_parallel_construction) {
+            stats = BuildIndexInParallel(btree, request, parallel_strategy);
+        } else {
+            stats = BuildIndexSequentially(btree, request);
+        }
+        
+        auto end_time = chrono::high_resolution_clock::now();
+        stats.total_build_time = chrono::duration_cast<chrono::milliseconds>(end_time - start_time).count();
+        
+        return stats;
+    }
+    
+    idx_t CalculateOptimalFanout(const DataAnalysis &data_analysis) {
+        // Calculate fanout based on cache line size and key size
+        auto cache_line_size = GetCacheLineSize();
+        auto key_size = data_analysis.average_key_size;
+        auto pointer_size = sizeof(void*);
+        
+        // Calculate maximum keys per cache line
+        auto keys_per_cache_line = (cache_line_size - sizeof(BTreeNodeHeader)) / 
+                                  (key_size + pointer_size);
+        
+        // Optimize for analytical workloads (larger fanout)
+        auto analytical_fanout = keys_per_cache_line * 2;
+        
+        // Clamp to reasonable bounds
+        return std::clamp(analytical_fanout, MIN_BTREE_FANOUT, MAX_BTREE_FANOUT);
+    }
+    
+    static const idx_t MIN_BTREE_FANOUT = 64;
+    static const idx_t MAX_BTREE_FANOUT = 1024;
+};
+
+// Advanced Hash Index with intelligent collision handling
+class AdvancedHashIndexEngine {
+public:
+    IndexCreationResult CreateAdvancedHashIndex(const IndexCreationRequest &request,
+                                               const IndexStrategy &strategy,
+                                               const AnalyticalContext &context) {
+        IndexCreationResult result;
+        
+        // Analyze optimal hash configuration
+        auto hash_config = AnalyzeOptimalHashConfiguration(request, strategy);
+        
+        // Create advanced hash index structure
+        auto hash_index = CreateAdvancedHashStructure(hash_config);
+        
+        // Build index with collision optimization
+        auto build_result = BuildHashIndexWithOptimization(hash_index.get(), request, context);
+        
+        // Configure dynamic optimization
+        ConfigureDynamicOptimization(hash_index.get(), strategy);
+        
+        result.index = move(hash_index);
+        result.build_statistics = build_result;
+        result.index_type = IndexType::ADVANCED_HASH;
+        
+        return result;
+    }
+
+private:
+    HashConfiguration AnalyzeOptimalHashConfiguration(const IndexCreationRequest &request,
+                                                     const IndexStrategy &strategy) {
+        HashConfiguration config;
+        
+        // Analyze data distribution for optimal hash function
+        auto distribution_analysis = AnalyzeDataDistribution(request.table_id, request.column_ids);
+        
+        // Select optimal hash function
+        config.hash_function = SelectOptimalHashFunction(distribution_analysis);
+        
+        // Calculate optimal table size
+        config.initial_table_size = CalculateOptimalTableSize(distribution_analysis);
+        
+        // Configure collision handling
+        config.collision_strategy = SelectCollisionStrategy(distribution_analysis);
+        
+        // Configure load factor and resize strategy
+        config.target_load_factor = 0.75;
+        config.resize_strategy = ResizeStrategy::EXPONENTIAL_GROWTH;
+        
+        // Configure analytical optimizations
+        config.enable_robin_hood_hashing = true;
+        config.enable_parallel_lookup = true;
+        config.enable_cache_friendly_layout = true;
+        
+        return config;
+    }
+    
+    unique_ptr<AdvancedHashIndex> CreateAdvancedHashStructure(const HashConfiguration &config) {
+        auto hash_index = make_unique<AdvancedHashIndex>();
+        
+        // Configure hash function
+        hash_index->SetHashFunction(config.hash_function);
+        
+        // Configure table structure
+        hash_index->InitializeTable(config.initial_table_size);
+        hash_index->SetLoadFactor(config.target_load_factor);
+        
+        // Configure collision handling
+        hash_index->SetCollisionStrategy(config.collision_strategy);
+        
+        // Configure analytical optimizations
+        if (config.enable_robin_hood_hashing) {
+            hash_index->EnableRobinHoodHashing();
+        }
+        
+        if (config.enable_cache_friendly_layout) {
+            hash_index->EnableCacheFriendlyLayout();
+        }
+        
+        // Configure performance monitoring
+        hash_index->EnablePerformanceMonitoring();
+        
+        return hash_index;
+    }
+    
+    HashFunction SelectOptimalHashFunction(const DistributionAnalysis &analysis) {
+        // Select hash function based on data characteristics
+        
+        if (analysis.has_string_data) {
+            // Use high-quality string hash function
+            return HashFunction::CITY_HASH_128;
+        } else if (analysis.has_integer_data) {
+            // Use optimized integer hash function
+            return HashFunction::MURMUR_HASH_3;
+        } else {
+            // General-purpose hash function
+            return HashFunction::XX_HASH_64;
+        }
+    }
+    
+    idx_t CalculateOptimalTableSize(const DistributionAnalysis &analysis) {
+        // Calculate table size based on expected cardinality
+        auto expected_entries = analysis.estimated_cardinality;
+        auto target_load_factor = 0.75;
+        
+        // Calculate required table size
+        auto required_size = static_cast<idx_t>(expected_entries / target_load_factor);
+        
+        // Round up to next power of 2 for efficient modulo operations
+        return NextPowerOfTwo(required_size);
+    }
+};
+
+// Bitmap index for low-cardinality columns
+class BitmapIndexEngine {
+public:
+    IndexCreationResult CreateBitmapIndex(const IndexCreationRequest &request,
+                                         const IndexStrategy &strategy,
+                                         const AnalyticalContext &context) {
+        IndexCreationResult result;
+        
+        // Analyze bitmap index suitability
+        auto bitmap_analysis = AnalyzeBitmapIndexSuitability(request, strategy);
+        
+        if (!bitmap_analysis.is_suitable) {
+            result.success = false;
+            result.error_message = "Data not suitable for bitmap indexing";
+            return result;
+        }
+        
+        // Create bitmap index structure
+        auto bitmap_index = CreateBitmapIndexStructure(bitmap_analysis);
+        
+        // Build bitmap index with compression
+        auto build_result = BuildBitmapIndexWithCompression(bitmap_index.get(), request, context);
+        
+        // Configure analytical optimizations
+        ConfigureBitmapOptimizations(bitmap_index.get(), strategy);
+        
+        result.index = move(bitmap_index);
+        result.build_statistics = build_result;
+        result.index_type = IndexType::BITMAP_INDEX;
+        
+        return result;
+    }
+
+private:
+    BitmapAnalysis AnalyzeBitmapIndexSuitability(const IndexCreationRequest &request,
+                                                const IndexStrategy &strategy) {
+        BitmapAnalysis analysis;
+        
+        // Analyze cardinality
+        auto cardinality_analysis = AnalyzeCardinality(request.table_id, request.column_ids);
+        
+        // Bitmap indexes are suitable for low-cardinality data
+        analysis.estimated_cardinality = cardinality_analysis.unique_values;
+        analysis.cardinality_ratio = static_cast<double>(cardinality_analysis.unique_values) / 
+                                   cardinality_analysis.total_values;
+        
+        // Suitability threshold
+        analysis.is_suitable = analysis.cardinality_ratio < BITMAP_CARDINALITY_THRESHOLD;
+        
+        // Analyze compression opportunities
+        if (analysis.is_suitable) {
+            analysis.compression_analysis = AnalyzeBitmapCompression(cardinality_analysis);
+        }
+        
+        return analysis;
+    }
+    
+    unique_ptr<BitmapIndex> CreateBitmapIndexStructure(const BitmapAnalysis &analysis) {
+        auto bitmap_index = make_unique<BitmapIndex>();
+        
+        // Initialize bitmaps for each unique value
+        bitmap_index->InitializeBitmaps(analysis.estimated_cardinality);
+        
+        // Configure compression
+        if (analysis.compression_analysis.should_compress) {
+            bitmap_index->EnableCompression(analysis.compression_analysis.optimal_algorithm);
+        }
+        
+        // Configure analytical optimizations
+        bitmap_index->EnableParallelOperations();
+        bitmap_index->EnableSIMDOptimizations();
+        
+        return bitmap_index;
+    }
+    
+    BuildStatistics BuildBitmapIndexWithCompression(BitmapIndex *bitmap_index,
+                                                   const IndexCreationRequest &request,
+                                                   const AnalyticalContext &context) {
+        BuildStatistics stats;
+        auto start_time = chrono::high_resolution_clock::now();
+        
+        // Scan table data and populate bitmaps
+        auto table_scanner = CreateTableScanner(request.table_id);
+        DataChunk current_chunk;
+        
+        while (table_scanner->Scan(current_chunk)) {
+            bitmap_index->ProcessChunk(current_chunk, request.column_ids);
+            stats.processed_rows += current_chunk.size();
+        }
+        
+        // Apply compression after construction
+        bitmap_index->ApplyCompression();
+        
+        auto end_time = chrono::high_resolution_clock::now();
+        stats.total_build_time = chrono::duration_cast<chrono::milliseconds>(end_time - start_time).count();
+        
+        return stats;
+    }
+    
+    static constexpr double BITMAP_CARDINALITY_THRESHOLD = 0.1; // 10% cardinality threshold
+};
+
+// Zone Map index for range queries and analytical workloads
+class ZoneMapIndexManager {
+public:
+    IndexCreationResult CreateZoneMapIndex(const IndexCreationRequest &request,
+                                          const IndexStrategy &strategy,
+                                          const AnalyticalContext &context) {
+        IndexCreationResult result;
+        
+        // Analyze zone map configuration
+        auto zonemap_config = AnalyzeZoneMapConfiguration(request, strategy);
+        
+        // Create zone map index structure
+        auto zonemap_index = CreateZoneMapStructure(zonemap_config);
+        
+        // Build zone maps with statistical optimization
+        auto build_result = BuildZoneMapsWithOptimization(zonemap_index.get(), request, context);
+        
+        // Configure adaptive maintenance
+        ConfigureAdaptiveMaintenance(zonemap_index.get(), strategy);
+        
+        result.index = move(zonemap_index);
+        result.build_statistics = build_result;
+        result.index_type = IndexType::ZONE_MAP;
+        
+        return result;
+    }
+
+private:
+    ZoneMapConfiguration AnalyzeZoneMapConfiguration(const IndexCreationRequest &request,
+                                                    const IndexStrategy &strategy) {
+        ZoneMapConfiguration config;
+        
+        // Analyze optimal zone size
+        config.zone_size = CalculateOptimalZoneSize(request);
+        
+        // Configure statistics collection
+        config.collect_min_max = true;
+        config.collect_null_count = true;
+        config.collect_distinct_count = true;
+        config.collect_histograms = ShouldCollectHistograms(request);
+        
+        // Configure adaptive optimization
+        config.enable_adaptive_zones = true;
+        config.enable_compression = true;
+        config.enable_parallel_construction = true;
+        
+        return config;
+    }
+    
+    unique_ptr<ZoneMapIndex> CreateZoneMapStructure(const ZoneMapConfiguration &config) {
+        auto zonemap = make_unique<ZoneMapIndex>();
+        
+        // Configure zone characteristics
+        zonemap->SetZoneSize(config.zone_size);
+        
+        // Configure statistics collection
+        zonemap->EnableMinMaxCollection(config.collect_min_max);
+        zonemap->EnableNullCountCollection(config.collect_null_count);
+        zonemap->EnableDistinctCountCollection(config.collect_distinct_count);
+        
+        if (config.collect_histograms) {
+            zonemap->EnableHistogramCollection();
+        }
+        
+        // Configure optimizations
+        if (config.enable_compression) {
+            zonemap->EnableStatisticsCompression();
+        }
+        
+        if (config.enable_adaptive_zones) {
+            zonemap->EnableAdaptiveZoning();
+        }
+        
+        return zonemap;
+    }
+    
+    idx_t CalculateOptimalZoneSize(const IndexCreationRequest &request) {
+        // Calculate zone size based on data characteristics and access patterns
+        
+        // Base zone size on row group size for alignment
+        auto base_zone_size = ROW_GROUP_SIZE;
+        
+        // Adjust based on column characteristics
+        auto column_analysis = AnalyzeColumnCharacteristics(request.table_id, request.column_ids);
+        
+        if (column_analysis.is_highly_selective) {
+            // Smaller zones for highly selective columns
+            return base_zone_size / 4;
+        } else if (column_analysis.is_range_query_heavy) {
+            // Larger zones for range-heavy workloads
+            return base_zone_size * 2;
+        }
+        
+        return base_zone_size;
+    }
+    
+    static const idx_t ROW_GROUP_SIZE = 122880; // Align with storage row groups
+};
+```
+    
     // Transaction support
     void Delete(const vector<row_t> &row_ids, transaction_t transaction_id) {
         unique_lock<shared_mutex> lock(table_lock);
